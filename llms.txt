@@ -1,0 +1,141 @@
+# Claude Agent SDK for Crystal
+
+> An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, and perform complex multi-step workflows.
+
+This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official TypeScript and Python Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
+
+## Key Features
+
+- One-shot queries and interactive sessions
+- V2 streaming interface with send/receive patterns
+- Type-safe JSON Schema builder (Crystal's answer to Zod)
+- Structured outputs with JSON schema validation
+- Custom tool definitions with MCP server support (stdio, HTTP, SSE)
+- In-process SDK MCP servers with control protocol (same as official SDKs)
+- Preset types for system prompt and tools (ToolsPreset, SystemPromptPreset)
+- Subagent definitions for specialized tasks
+- Hooks for intercepting and controlling tool usage (PreToolUse, PostToolUse, etc.)
+- Permission management with callbacks
+- Session management (resume, fork, continue)
+- File checkpointing and rewind
+- Sandbox configuration
+- Extended thinking support
+
+## Documentation
+
+- [README](https://github.com/amscotti/claude-agent-cr/blob/main/README.md): Installation, usage examples, and API overview
+- [CLAUDE.md](https://github.com/amscotti/claude-agent-cr/blob/main/CLAUDE.md): AI assistant context file with project structure
+
+## Core Source Files
+
+- [src/claude-agent-cr.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude-agent-cr.cr): Main module entry point
+- [src/claude_agent/cli_client.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/cli_client.cr): CLI process management and JSON communication
+- [src/claude_agent/agent_client.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/agent_client.cr): High-level agent client API
+- [src/claude_agent/streaming_session.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/streaming_session.cr): V2 streaming interface
+- [src/claude_agent/query.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/query.cr): One-shot query helper
+- [src/claude_agent/schema.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/schema.cr): Type-safe JSON Schema builder
+
+## Type Definitions
+
+- [src/claude_agent/types/messages.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/messages.cr): Message types (AssistantMessage, UserMessage, ResultMessage, etc.)
+- [src/claude_agent/types/content_blocks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/content_blocks.cr): Content block types (TextBlock, ToolUseBlock, etc.)
+- [src/claude_agent/types/options.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/options.cr): AgentOptions and configuration types
+- [src/claude_agent/types/control_messages.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/control_messages.cr): Control protocol types for SDK MCP server communication
+
+## Schema Builder API
+
+The Schema module provides type-safe JSON schema generation (Crystal's answer to Zod):
+
+```crystal
+# Basic types
+Schema.string(description, min_length:, max_length:, pattern:, format:)
+Schema.integer(description, minimum:, maximum:)
+Schema.number(description, minimum:, maximum:)  # floats
+Schema.boolean(description)
+
+# Complex types
+Schema.array(items_schema, description, min_items:, max_items:)
+Schema.object(properties_hash, required:, description:, additional_properties:)
+Schema.enum(["value1", "value2"], description)  # string literals
+
+# Combinators
+Schema.optional(schema)  # union with null
+Schema.union(schema1, schema2, ...)  # oneOf
+
+# Usage with tools
+tool = ClaudeAgent.tool(
+  name: "my_tool",
+  description: "Tool description",
+  schema: Schema.object({
+    "param" => Schema.string("Parameter description"),
+  }, required: ["param"])
+) { |args| ToolResult.text("result") }
+
+# Usage with structured outputs
+options = AgentOptions.new(
+  output_format: OutputFormat.json_schema(schema, name: "Name", description: "...")
+)
+```
+
+## Tools and MCP
+
+- [src/claude_agent/tools/sdk_tool.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/tools/sdk_tool.cr): Custom tool definition helpers
+- [src/claude_agent/tools/sdk_mcp_server.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/tools/sdk_mcp_server.cr): MCP server implementation
+
+### SDK MCP Server Workflow
+
+Create in-process custom tools (same architecture as official TypeScript/Python SDKs):
+
+```crystal
+# 1. Define tools
+tool = ClaudeAgent.tool(name: "name", description: "desc", schema: schema) { |args| ToolResult.text("result") }
+
+# 2. Create SDK MCP server
+server = ClaudeAgent.create_sdk_mcp_server(name: "server-name", tools: [tool])
+
+# 3. Configure agent
+mcp_servers = {} of String => ClaudeAgent::MCPServerConfig
+mcp_servers["server-name"] = server
+
+options = AgentOptions.new(
+  mcp_servers: mcp_servers,
+  allowed_tools: ["mcp__server-name__tool-name"]  # Pattern: mcp__<server>__<tool>
+)
+
+# 4. Query - tools execute in your Crystal process
+ClaudeAgent.query("prompt", options) { |msg| ... }
+```
+
+### External MCP Servers
+
+Connect to external MCP servers:
+
+```crystal
+mcp_servers = {} of String => ClaudeAgent::MCPServerConfig
+mcp_servers["name"] = ExternalMCPServerConfig.stdio("command", ["args"])  # Local process
+mcp_servers["name"] = ExternalMCPServerConfig.http("https://url")         # HTTP
+mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE streaming
+```
+
+## Hooks and Permissions
+
+- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Pre/post tool use hooks
+- [src/claude_agent/permissions.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/permissions.cr): Permission callback system
+
+## Examples
+
+- [examples/01_basic_query.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/01_basic_query.cr): Basic one-shot query
+- [examples/06_sdk_mcp_server.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/06_sdk_mcp_server.cr): In-process SDK MCP server with custom tools
+- [examples/11_custom_tool.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/11_custom_tool.cr): Custom tool definitions with Schema builder
+- [examples/13_hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/13_hooks.cr): Hook usage for tool interception
+- [examples/14_streaming_session.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/14_streaming_session.cr): V2 streaming interface
+- [examples/15_subagents.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/15_subagents.cr): Subagent configuration
+- [examples/16_structured_output.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/16_structured_output.cr): Structured output handling
+- [examples/17_mcp_playwright.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/17_mcp_playwright.cr): External MCP server (Playwright)
+- [examples/18_mcp_github.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/18_mcp_github.cr): GitHub MCP server
+- [examples/19_mcp_remote.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/19_mcp_remote.cr): Remote HTTP MCP server
+
+## Optional
+
+- [spec/](https://github.com/amscotti/claude-agent-cr/tree/main/spec): Test files
+- [shard.yml](https://github.com/amscotti/claude-agent-cr/blob/main/shard.yml): Crystal shard configuration
