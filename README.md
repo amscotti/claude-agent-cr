@@ -310,7 +310,6 @@ options = ClaudeAgent::AgentOptions.new(
 )
 ```
 
-> **Note:** Subagent functionality is currently affected by the [CLI bug](#1-duplicate-tool-use-ids-cli-2119) below.
 
 ### External MCP Servers
 
@@ -344,7 +343,6 @@ options = ClaudeAgent::AgentOptions.new(
 )
 ```
 
-> **Note:** MCP server connections work, but multi-turn tool use is affected by the [CLI bugs](#known-issues) below.
 
 ### Structured Outputs
 
@@ -460,16 +458,18 @@ options = ClaudeAgent::AgentOptions.new(
 
 ## Status
 
+> Tested with Claude Code CLI **v2.1.29**
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | One-shot queries | ✅ Working | Single-turn queries work reliably |
-| Interactive sessions | ⚠️ Limited | Affected by CLI bugs for multi-turn tool use |
+| Interactive sessions | ✅ Working | Multi-turn conversations with tool use |
 | Custom tools (in-process) | ✅ Working | SDK MCP servers via control protocol (same as official SDKs) |
-| External MCP Servers | ⚠️ Limited | Connections work, multi-turn tool use affected by CLI bugs |
+| External MCP Servers | ✅ Working | Stdio, HTTP, and SSE transports |
 | Schema Builder | ✅ Working | Type-safe JSON schema generation |
 | Hooks | ✅ Working | Pre/post tool use, subagent, stop hooks |
 | V2 Streaming | ✅ Working | Send/receive patterns |
-| Subagents | ⚠️ Limited | Affected by CLI bugs |
+| Subagents | ✅ Working | Spawning specialized agents for focused subtasks |
 | Structured Outputs | ✅ Working | JSON schema validation |
 | Session Management | ✅ Working | Resume, fork, continue |
 | File Checkpointing | ✅ Working | Track and rewind file changes |
@@ -478,39 +478,18 @@ options = ClaudeAgent::AgentOptions.new(
 
 ## Known Issues
 
-### 1. Duplicate Tool Use IDs (CLI 2.1.19)
+### Previously Reported CLI Bugs (Resolved in v2.1.29)
 
-> **GitHub Issue:** [anthropics/claude-code#20508](https://github.com/anthropics/claude-code/issues/20508)
+The following issues affected earlier versions of the Claude Code CLI but have been resolved as of **v2.1.29**:
 
-Multi-turn conversations with tool use fail with:
+- **Duplicate Tool Use IDs** ([anthropics/claude-code#20508](https://github.com/anthropics/claude-code/issues/20508)) - Multi-turn conversations with tool use previously failed due to duplicate `tool_use` IDs across turns.
+- **Tool Use Concurrency Issues in Print Mode** ([anthropics/claude-code#8763](https://github.com/anthropics/claude-code/issues/8763)) - Parallel tool calls in `--print` mode previously caused errors.
 
-```
-API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"messages.X.content.Y: `tool_use` ids must be unique"}}
-```
+If you encounter these issues, ensure you are running the latest Claude Code CLI version.
 
-**Root cause:** The CLI generates duplicate `tool_use` IDs across conversation turns.
+### In-Process SDK MCP Servers
 
-**Affected:** Multi-turn tool use, subagents, MCP servers with multiple tool calls.
-
-### 2. Tool Use Concurrency Issues (Print Mode)
-
-> **GitHub Issue:** [anthropics/claude-code#8763](https://github.com/anthropics/claude-code/issues/8763)
-
-Parallel tool calls in print mode fail with:
-
-```
-API Error: 400 due to tool use concurrency issues.
-```
-
-**Root cause:** "tool_use ids were found without tool_result blocks immediately after" - occurs when Claude makes parallel tool calls in `--print` mode.
-
-**Affected:** Any SDK usage (we use `--print` flag), parallel tool operations.
-
-**Note:** This error does NOT occur in interactive CLI mode, only in print/pipeable mode which SDKs use.
-
-### 3. In-Process SDK MCP Servers
-
-In-process MCP servers (`SDKMCPServer` / `create_sdk_mcp_server`) are now **fully integrated** using the same control protocol as the official TypeScript and Python SDKs.
+In-process MCP servers (`SDKMCPServer` / `create_sdk_mcp_server`) are **fully integrated** using the same control protocol as the official TypeScript and Python SDKs.
 
 ```crystal
 # Define custom tools
@@ -542,21 +521,19 @@ options = ClaudeAgent::AgentOptions.new(
 )
 ```
 
-**Note:** Multi-turn tool use may still be affected by the CLI bugs mentioned above.
+### Verified Examples
 
-### Working Scenarios
+The following examples have been tested and verified with CLI v2.1.29:
 
-Despite these limitations, the following work reliably:
-- Single-turn queries without tool use (examples 01, 02, 03)
-- Local SDK features (schema builder, hooks setup, type definitions)
+- One-shot queries and streaming (examples 01, 02, 03)
+- Tool restrictions and permission modes (examples 04, 05)
 - In-process SDK MCP servers with custom tools (example 06)
-- External MCP server connections (tools are recognized, just multi-turn fails)
-
-### Workarounds
-
-- Use single-turn queries for simple tasks
-- Monitor the GitHub issues for CLI updates
-- Native installations auto-update; for Homebrew run `brew upgrade claude-code`
+- Streaming responses with multi-tool use (example 09)
+- Local tool definitions and MCP server testing (examples 11, 12)
+- Hooks for blocking dangerous commands (example 13)
+- V2 streaming sessions (example 14)
+- Subagents with multi-turn tool use (example 15)
+- Structured JSON output (example 16)
 
 ## Contributing
 
