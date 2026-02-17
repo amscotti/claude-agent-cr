@@ -331,4 +331,24 @@ describe ClaudeAgent::ContentBlock do
     thinking.thinking.should eq("Let me consider...")
     thinking.signature.should eq("sig123")
   end
+
+  it "parses RedactedThinkingBlock" do
+    json = %({"type": "redacted_thinking", "data": "encrypted_content_here"})
+    block = ClaudeAgent::ContentBlockConverter.from_json(JSON::PullParser.new(json))
+    block.should be_a(ClaudeAgent::RedactedThinkingBlock)
+
+    redacted = block.as(ClaudeAgent::RedactedThinkingBlock)
+    redacted.data.should eq("encrypted_content_here")
+  end
+
+  it "parses unknown block types as UnknownBlock" do
+    json = %({"type": "future_block", "some_field": "some_value"})
+    block = ClaudeAgent::ContentBlockConverter.from_json(JSON::PullParser.new(json))
+    block.should be_a(ClaudeAgent::UnknownBlock)
+
+    unknown = block.as(ClaudeAgent::UnknownBlock)
+    unknown.type.should eq("future_block")
+    unknown.raw_json.should contain("future_block")
+    unknown.raw_json.should contain("some_value")
+  end
 end

@@ -1,7 +1,7 @@
 require "json"
 
 module ClaudeAgent
-  alias ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock
+  alias ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock | UnknownBlock
 
   struct TextBlock
     include JSON::Serializable
@@ -36,6 +36,24 @@ module ClaudeAgent
     getter signature : String
   end
 
+  struct RedactedThinkingBlock
+    include JSON::Serializable
+
+    getter type : String = "redacted_thinking"
+    getter data : String
+  end
+
+  struct UnknownBlock
+    include JSON::Serializable
+
+    getter type : String
+    @[JSON::Field(ignore: true)]
+    getter raw_json : String = ""
+
+    def initialize(@type : String, @raw_json : String = "")
+    end
+  end
+
   module ContentBlockConverter
     def self.from_json(pull : JSON::PullParser) : ContentBlock
       json = pull.read_raw
@@ -51,8 +69,11 @@ module ClaudeAgent
         ToolResultBlock.from_json(json)
       when "thinking"
         ThinkingBlock.from_json(json)
+      when "redacted_thinking"
+        RedactedThinkingBlock.from_json(json)
       else
-        raise JSON::ParseException.new("Unknown content block type: #{type}", 0, 0)
+        block = UnknownBlock.from_json(json)
+        UnknownBlock.new(type: block.type, raw_json: json)
       end
     end
   end

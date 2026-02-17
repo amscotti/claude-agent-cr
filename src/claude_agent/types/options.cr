@@ -300,7 +300,8 @@ module ClaudeAgent
 
     # Session management
     property? continue_conversation : Bool = false
-    property resume : String? # Session ID to resume
+    property resume : String?            # Session ID to resume
+    property resume_session_at : String? # Message UUID to resume from
     property session_id : String?
     property? fork_session : Bool = false
     property? no_session_persistence : Bool = false
@@ -354,6 +355,7 @@ module ClaudeAgent
       @settings_path : String? = nil,
       @continue_conversation : Bool = false,
       @resume : String? = nil,
+      @resume_session_at : String? = nil,
       @session_id : String? = nil,
       @fork_session : Bool = false,
       @no_session_persistence : Bool = false,

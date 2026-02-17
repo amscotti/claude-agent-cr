@@ -1,6 +1,8 @@
 # Claude Agent SDK for Crystal
 
 > An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, and perform complex multi-step workflows.
+>
+> Tested with Claude Code CLI **v2.1.29**. All features verified working.
 
 This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official TypeScript and Python Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
 
@@ -14,12 +16,13 @@ This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using 
 - In-process SDK MCP servers with control protocol (same as official SDKs)
 - Preset types for system prompt and tools (ToolsPreset, SystemPromptPreset)
 - Subagent definitions for specialized tasks
-- Hooks for intercepting and controlling tool usage (PreToolUse, PostToolUse, etc.)
+- Full hook support (PreToolUse, PostToolUse, PreCompact, Notification, etc.)
 - Permission management with callbacks
-- Session management (resume, fork, continue)
+- Session management (resume, fork, continue, resume_session_at)
 - File checkpointing and rewind
 - Sandbox configuration
 - Extended thinking support
+- Graceful handling of unknown content block types (forward-compatible)
 
 ## Documentation
 
@@ -119,8 +122,29 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 
 ## Hooks and Permissions
 
-- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Pre/post tool use hooks
+- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Hook system with all events (PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd)
 - [src/claude_agent/permissions.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/permissions.cr): Permission callback system
+
+### Hook Events
+
+| Event | Description |
+|-------|-------------|
+| PreToolUse | Before tool execution (can block/modify) |
+| PostToolUse | After successful tool execution |
+| PostToolUseFailure | After tool execution failure |
+| PreCompact | Before conversation compaction |
+| Notification | Agent status notifications |
+| UserPromptSubmit | When user submits prompt |
+| Stop | When agent stops |
+| SubagentStart/Stop | Subagent lifecycle |
+| SessionStart/End | Session lifecycle |
+
+### HookInput Fields
+
+- `tool_name`, `tool_input`, `tool_result` - Tool-related fields
+- `user_prompt` - For UserPromptSubmit
+- `notification_message`, `notification_title` - For Notification hook
+- `trigger`, `custom_instructions` - For PreCompact hook
 
 ## Examples
 
@@ -139,3 +163,8 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 
 - [spec/](https://github.com/amscotti/claude-agent-cr/tree/main/spec): Test files
 - [shard.yml](https://github.com/amscotti/claude-agent-cr/blob/main/shard.yml): Crystal shard configuration
+
+## Version Notes
+
+- **0.2.0**: Added UnknownBlock, Notification hook, resume_session_at, PreCompact hook fields, fixed hook callback dispatch
+- Tested with Claude Code CLI v2.1.29

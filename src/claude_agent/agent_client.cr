@@ -338,6 +338,8 @@ module ClaudeAgent
         handle_initialize_request(request.request_id, req)
       when ControlPermissionRequest
         handle_control_permission_request(request.request_id, req)
+      when ControlHookCallbackRequest
+        handle_hook_callback_request(request.request_id, req)
       else
         # Unknown control request subtype - send error response
         send_control_error(request.request_id, "Unknown control request subtype")
@@ -416,10 +418,78 @@ module ClaudeAgent
       end
     end
 
+    # Handle hook callback request from CLI (e.g. PreCompact)
+    private def handle_hook_callback_request(request_id : String, req : ControlHookCallbackRequest)
+      hooks = @options.try(&.hooks)
+
+      unless hooks
+        response = ControlResponse.success(request_id)
+        @cli_client.send_control_response(response)
+        return
+      end
+
+      callbacks = get_callbacks_for_hook(hooks, req.hook)
+
+      if callbacks
+        input = build_hook_input(req)
+        ctx = HookContext.new(session_id: session_id || "unknown")
+
+        callbacks.each do |callback|
+          callback.call(input, request_id, ctx)
+        end
+      end
+
+      response = ControlResponse.success(request_id)
+      @cli_client.send_control_response(response)
+    end
+
+    # pre_tool_use and post_tool_use are intentionally excluded: they are handled
+    # via PermissionRequest and AssistantMessage respectively, not via callbacks here.
+    private def get_callbacks_for_hook(hooks : HookConfig, hook_name : String) : Array(HookCallback)?
+      case hook_name
+      when "pre_compact"        then hooks.pre_compact
+      when "user_prompt_submit" then hooks.user_prompt_submit
+      when "stop"               then hooks.stop
+      when "session_start"      then hooks.session_start
+      when "session_end"        then hooks.session_end
+      when "subagent_start"     then hooks.subagent_start
+      when "subagent_stop"      then hooks.subagent_stop
+      when "notification"       then hooks.notification
+      end
+    end
+
     # Send control error response
     private def send_control_error(request_id : String, error_message : String)
       response = ControlResponse.error(request_id, error_message)
       @cli_client.send_control_response(response)
+    end
+
+    # Build HookInput with appropriate fields based on hook type
+    private def build_hook_input(req : ControlHookCallbackRequest) : HookInput
+      tool_input = req.input
+
+      case req.hook
+      when "notification"
+        # Extract notification-specific fields
+        message = tool_input.try(&.["message"]?.try(&.as_s?))
+        title = tool_input.try(&.["title"]?.try(&.as_s?))
+        HookInput.new(
+          notification_message: message,
+          notification_title: title,
+          tool_input: tool_input
+        )
+      when "pre_compact"
+        # Extract pre_compact-specific fields
+        trigger = tool_input.try(&.["trigger"]?.try(&.as_s?))
+        custom_instructions = tool_input.try(&.["custom_instructions"]?.try(&.as_s?))
+        HookInput.new(
+          trigger: trigger,
+          custom_instructions: custom_instructions,
+          tool_input: tool_input
+        )
+      else
+        HookInput.new(tool_input: tool_input)
+      end
     end
   end
 end

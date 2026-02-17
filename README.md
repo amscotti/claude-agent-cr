@@ -18,13 +18,13 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **Type-Safe Schemas**: Crystal's answer to Zod - generate JSON schemas from types.
 *   **Structured Outputs**: Get validated JSON responses matching your schema.
 *   **Subagents**: Define specialized agents that can be spawned for focused subtasks.
-*   **Hooks & Permissions**: Granular control over what the agent is allowed to do.
-*   **Session Management**: Resume, fork, and continue conversations.
+*   **Hooks & Permissions**: Granular control over what the agent is allowed to do with full hook support (PreToolUse, PostToolUse, PreCompact, Notification, etc.).
+*   **Session Management**: Resume, fork, and continue conversations with precise message-level resume.
 *   **File Checkpointing**: Track and rewind file changes.
 *   **Sandbox Support**: Configure sandboxed execution environments.
 *   **Extended Thinking**: Control thinking tokens for complex reasoning.
 *   **Streaming**: Real-time message streaming using Crystal's native fibers.
-*   **Type Safety**: Fully typed message and event structures.
+*   **Type Safety**: Fully typed message and event structures with graceful handling of unknown content types.
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.1.0
+        version: ~> 0.2.0
     ```
 
 2.  Run `shards install`
@@ -265,7 +265,17 @@ end
 
 ### Hooks
 
-Intercept tool usage to block or modify actions.
+Intercept tool usage to block or modify actions. The SDK supports all hook events from the official SDKs:
+
+- **PreToolUse**: Before tool execution (can block/modify)
+- **PostToolUse**: After successful tool execution
+- **PostToolUseFailure**: After tool execution failure
+- **PreCompact**: Before conversation compaction
+- **Notification**: Agent status notifications (for Slack, dashboards, etc.)
+- **UserPromptSubmit**: When user submits a prompt
+- **Stop**: When agent stops
+- **SubagentStart/Stop**: When subagents start/complete
+- **SessionStart/End**: Session lifecycle events
 
 ```crystal
 # Block 'rm' commands
@@ -277,8 +287,26 @@ block_rm = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::Ho
   end
 }
 
+# Handle PreCompact hook (before conversation compaction)
+pre_compact_handler = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::HookContext) {
+  # input.trigger is "manual" or "auto"
+  # input.custom_instructions contains any custom instructions
+  puts "Compacting conversation (trigger: #{input.trigger})"
+  ClaudeAgent::HookResult.allow
+}
+
+# Handle Notification hook (forward status to external services)
+notification_handler = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::HookContext) {
+  # input.notification_message contains the status message
+  # input.notification_title contains optional title
+  puts "[Notification] #{input.notification_title}: #{input.notification_message}"
+  ClaudeAgent::HookResult.allow
+}
+
 hooks = ClaudeAgent::HookConfig.new(
-  pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_rm])]
+  pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_rm])],
+  pre_compact: [pre_compact_handler],
+  notification: [notification_handler]
 )
 
 options = ClaudeAgent::AgentOptions.new(hooks: hooks)
@@ -390,6 +418,12 @@ options = ClaudeAgent::AgentOptions.new(
   resume: "session-uuid-here"
 )
 
+# Resume at a specific message (precise resume point)
+options = ClaudeAgent::AgentOptions.new(
+  resume: "session-uuid-here",
+  resume_session_at: "message-uuid-here"
+)
+
 # Fork a session (create a branch)
 options = ClaudeAgent::AgentOptions.new(
   resume: "session-uuid-here",
@@ -467,61 +501,28 @@ options = ClaudeAgent::AgentOptions.new(
 | Custom tools (in-process) | ✅ Working | SDK MCP servers via control protocol (same as official SDKs) |
 | External MCP Servers | ✅ Working | Stdio, HTTP, and SSE transports |
 | Schema Builder | ✅ Working | Type-safe JSON schema generation |
-| Hooks | ✅ Working | Pre/post tool use, subagent, stop hooks |
+| Hooks | ✅ Working | All hook events: PreToolUse, PostToolUse, PreCompact, Notification, etc. |
 | V2 Streaming | ✅ Working | Send/receive patterns |
 | Subagents | ✅ Working | Spawning specialized agents for focused subtasks |
 | Structured Outputs | ✅ Working | JSON schema validation |
-| Session Management | ✅ Working | Resume, fork, continue |
+| Session Management | ✅ Working | Resume, fork, continue, resume_session_at |
 | File Checkpointing | ✅ Working | Track and rewind file changes |
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
 | Extended Thinking | ✅ Working | max_thinking_tokens support |
+| Unknown Content Types | ✅ Working | Graceful handling of future content block types |
 
-## Known Issues
+## Changelog
 
-### Previously Reported CLI Bugs (Resolved in v2.1.29)
+### 0.2.0
 
-The following issues affected earlier versions of the Claude Code CLI but have been resolved as of **v2.1.29**:
+- **New**: `UnknownBlock` for graceful handling of unknown content block types (forward-compatible)
+- **New**: `Notification` hook for agent status updates (forward to Slack, dashboards, etc.)
+- **New**: `resume_session_at` option for precise message-level session resumption
+- **New**: `HookInput` fields for PreCompact (`trigger`, `custom_instructions`) and Notification (`notification_message`, `notification_title`)
+- **Fix**: ControlHookCallbackRequest now properly dispatched (PreCompact and other hooks now work)
+- **Fix**: Hook callback routing improved with proper input field extraction
 
-- **Duplicate Tool Use IDs** ([anthropics/claude-code#20508](https://github.com/anthropics/claude-code/issues/20508)) - Multi-turn conversations with tool use previously failed due to duplicate `tool_use` IDs across turns.
-- **Tool Use Concurrency Issues in Print Mode** ([anthropics/claude-code#8763](https://github.com/anthropics/claude-code/issues/8763)) - Parallel tool calls in `--print` mode previously caused errors.
-
-If you encounter these issues, ensure you are running the latest Claude Code CLI version.
-
-### In-Process SDK MCP Servers
-
-In-process MCP servers (`SDKMCPServer` / `create_sdk_mcp_server`) are **fully integrated** using the same control protocol as the official TypeScript and Python SDKs.
-
-```crystal
-# Define custom tools
-weather_tool = ClaudeAgent::SDKTool.new(
-  name: "get_weather",
-  description: "Get current weather for a city",
-  input_schema: ClaudeAgent::Schema.object(
-    {"city" => ClaudeAgent::Schema.string("City name")}
-  ).to_h,
-  handler: ->(args : Hash(String, JSON::Any)) {
-    city = args["city"]?.try(&.as_s?) || "Unknown"
-    ClaudeAgent::ToolResult.text("Weather in #{city}: 72°F, sunny")
-  }
-)
-
-# Create SDK MCP server
-server = ClaudeAgent.create_sdk_mcp_server(
-  name: "my-tools",
-  tools: [weather_tool]
-)
-
-# Use in options
-mcp_config = {} of String => ClaudeAgent::MCPServerConfig
-mcp_config["my-tools"] = server
-
-options = ClaudeAgent::AgentOptions.new(
-  mcp_servers: mcp_config,
-  allowed_tools: ["mcp__my-tools__get_weather"]
-)
-```
-
-### Verified Examples
+## Verified Examples
 
 The following examples have been tested and verified with CLI v2.1.29:
 
