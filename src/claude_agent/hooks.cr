@@ -5,14 +5,15 @@ module ClaudeAgent
   enum HookEvent
     PreToolUse         # Before tool execution (can block/modify)
     PostToolUse        # After successful tool execution
-    PostToolUseFailure # After tool execution failure (TypeScript SDK)
+    PostToolUseFailure # After tool execution failure
     UserPromptSubmit   # When user submits prompt
     Stop               # When agent stops
-    SubagentStart      # When subagent initializes (TypeScript SDK)
+    SubagentStart      # When subagent initializes
     SubagentStop       # When subagent completes
     PreCompact         # Before conversation compaction
     SessionStart       # Session initialization
     SessionEnd         # Session termination
+    Notification       # Agent status notifications
   end
 
   # Forward declaration for types used in callback
@@ -44,14 +45,15 @@ module ClaudeAgent
   struct HookConfig
     property pre_tool_use : Array(HookMatcher)?
     property post_tool_use : Array(HookMatcher)?
-    property post_tool_use_failure : Array(HookMatcher)? # TypeScript SDK
+    property post_tool_use_failure : Array(HookMatcher)?
     property user_prompt_submit : Array(HookCallback)?
     property stop : Array(HookCallback)?
-    property subagent_start : Array(HookCallback)? # TypeScript SDK
+    property subagent_start : Array(HookCallback)?
     property subagent_stop : Array(HookCallback)?
     property pre_compact : Array(HookCallback)?
     property session_start : Array(HookCallback)?
     property session_end : Array(HookCallback)?
+    property notification : Array(HookCallback)?
 
     def initialize(
       @pre_tool_use : Array(HookMatcher)? = nil,
@@ -64,6 +66,7 @@ module ClaudeAgent
       @pre_compact : Array(HookCallback)? = nil,
       @session_start : Array(HookCallback)? = nil,
       @session_end : Array(HookCallback)? = nil,
+      @notification : Array(HookCallback)? = nil,
     )
     end
   end
@@ -74,12 +77,22 @@ module ClaudeAgent
     property tool_input : Hash(String, JSON::Any)?
     property tool_result : String? # For PostToolUse
     property user_prompt : String? # For UserPromptSubmit
+    # Notification hook fields
+    property notification_message : String? # The notification message
+    property notification_title : String?   # Optional notification title
+    # PreCompact hook fields
+    property trigger : String? # "manual" | "auto"
+    property custom_instructions : String?
 
     def initialize(
       @tool_name : String? = nil,
       @tool_input : Hash(String, JSON::Any)? = nil,
       @tool_result : String? = nil,
       @user_prompt : String? = nil,
+      @notification_message : String? = nil,
+      @notification_title : String? = nil,
+      @trigger : String? = nil,
+      @custom_instructions : String? = nil,
     )
     end
   end
@@ -97,8 +110,8 @@ module ClaudeAgent
     property hook_event_name : String
     property permission_decision : String? # "allow" | "deny" | "ask"
     property permission_decision_reason : String?
-    property updated_input : Hash(String, JSON::Any)? # Modified tool input (TypeScript SDK)
-    property additional_context : String?             # Additional context for Claude (TypeScript SDK)
+    property updated_input : Hash(String, JSON::Any)? # Modified tool input
+    property additional_context : String?             # Additional context for Claude
 
     def initialize(
       @hook_event_name : String,

@@ -342,6 +342,7 @@ module ClaudeAgent
 
       # --resume takes a session ID, not just a flag
       opts.resume.try { |id| args << "--resume" << id }
+      opts.resume_session_at.try { |uuid| args << "--resume-session-at" << uuid }
       args << "--fork-session" if opts.fork_session?
       opts.session_id.try { |id| args << "--session-id" << id }
 

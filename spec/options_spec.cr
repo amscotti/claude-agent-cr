@@ -7,6 +7,7 @@ describe ClaudeAgent::AgentOptions do
     options.include_partial_messages?.should be_false
     options.continue_conversation?.should be_false
     options.resume.should be_nil
+    options.resume_session_at.should be_nil
     options.fork_session?.should be_false
     options.enable_file_checkpointing?.should be_false
   end
@@ -26,6 +27,7 @@ describe ClaudeAgent::AgentOptions do
       cwd: "/working/dir",
       session_id: "sess-123",
       resume: "session-abc-123",
+      resume_session_at: "msg-uuid-456",
       fork_session: true,
       enable_file_checkpointing: true,
       setting_sources: ["project", "user"]
@@ -44,6 +46,7 @@ describe ClaudeAgent::AgentOptions do
     options.cwd.should eq("/working/dir")
     options.session_id.should eq("sess-123")
     options.resume.should eq("session-abc-123")
+    options.resume_session_at.should eq("msg-uuid-456")
     options.fork_session?.should be_true
     options.enable_file_checkpointing?.should be_true
     options.setting_sources.should eq(["project", "user"])
