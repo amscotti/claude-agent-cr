@@ -1,6 +1,8 @@
 # Claude Agent SDK for Crystal
 
 > An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, and perform complex multi-step workflows.
+>
+> Tested with Claude Code CLI **v2.1.29**. All features verified working.
 
 This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official TypeScript and Python Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
 

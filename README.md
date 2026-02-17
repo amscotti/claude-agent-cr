@@ -476,52 +476,7 @@ options = ClaudeAgent::AgentOptions.new(
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
 | Extended Thinking | ✅ Working | max_thinking_tokens support |
 
-## Known Issues
-
-### Previously Reported CLI Bugs (Resolved in v2.1.29)
-
-The following issues affected earlier versions of the Claude Code CLI but have been resolved as of **v2.1.29**:
-
-- **Duplicate Tool Use IDs** ([anthropics/claude-code#20508](https://github.com/anthropics/claude-code/issues/20508)) - Multi-turn conversations with tool use previously failed due to duplicate `tool_use` IDs across turns.
-- **Tool Use Concurrency Issues in Print Mode** ([anthropics/claude-code#8763](https://github.com/anthropics/claude-code/issues/8763)) - Parallel tool calls in `--print` mode previously caused errors.
-
-If you encounter these issues, ensure you are running the latest Claude Code CLI version.
-
-### In-Process SDK MCP Servers
-
-In-process MCP servers (`SDKMCPServer` / `create_sdk_mcp_server`) are **fully integrated** using the same control protocol as the official TypeScript and Python SDKs.
-
-```crystal
-# Define custom tools
-weather_tool = ClaudeAgent::SDKTool.new(
-  name: "get_weather",
-  description: "Get current weather for a city",
-  input_schema: ClaudeAgent::Schema.object(
-    {"city" => ClaudeAgent::Schema.string("City name")}
-  ).to_h,
-  handler: ->(args : Hash(String, JSON::Any)) {
-    city = args["city"]?.try(&.as_s?) || "Unknown"
-    ClaudeAgent::ToolResult.text("Weather in #{city}: 72°F, sunny")
-  }
-)
-
-# Create SDK MCP server
-server = ClaudeAgent.create_sdk_mcp_server(
-  name: "my-tools",
-  tools: [weather_tool]
-)
-
-# Use in options
-mcp_config = {} of String => ClaudeAgent::MCPServerConfig
-mcp_config["my-tools"] = server
-
-options = ClaudeAgent::AgentOptions.new(
-  mcp_servers: mcp_config,
-  allowed_tools: ["mcp__my-tools__get_weather"]
-)
-```
-
-### Verified Examples
+## Verified Examples
 
 The following examples have been tested and verified with CLI v2.1.29:
 
