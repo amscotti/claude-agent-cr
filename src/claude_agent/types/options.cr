@@ -312,7 +312,7 @@ module ClaudeAgent
     # Sandbox configuration
     property sandbox : SandboxSettings?
 
-    # User identifier (Python SDK)
+    # User identifier
     property user : String?
 
     # Stderr callback

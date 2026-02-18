@@ -14,6 +14,7 @@ module ClaudeAgent
     SessionStart       # Session initialization
     SessionEnd         # Session termination
     Notification       # Agent status notifications
+    PermissionRequest  # When permission dialog would appear
   end
 
   # Forward declaration for types used in callback
@@ -46,6 +47,7 @@ module ClaudeAgent
     property pre_tool_use : Array(HookMatcher)?
     property post_tool_use : Array(HookMatcher)?
     property post_tool_use_failure : Array(HookMatcher)?
+    property permission_request : Array(HookMatcher)?
     property user_prompt_submit : Array(HookCallback)?
     property stop : Array(HookCallback)?
     property subagent_start : Array(HookCallback)?
@@ -59,6 +61,7 @@ module ClaudeAgent
       @pre_tool_use : Array(HookMatcher)? = nil,
       @post_tool_use : Array(HookMatcher)? = nil,
       @post_tool_use_failure : Array(HookMatcher)? = nil,
+      @permission_request : Array(HookMatcher)? = nil,
       @user_prompt_submit : Array(HookCallback)? = nil,
       @stop : Array(HookCallback)? = nil,
       @subagent_start : Array(HookCallback)? = nil,
@@ -73,26 +76,71 @@ module ClaudeAgent
 
   struct HookInput
     include JSON::Serializable
+    # Common context fields for all hook events
+    property session_id : String?
+    property transcript_path : String?
+    property cwd : String?
+    property permission_mode : String?
+    property hook_event_name : String?
+    # Tool-related fields (PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest)
     property tool_name : String?
     property tool_input : Hash(String, JSON::Any)?
-    property tool_result : String? # For PostToolUse
-    property user_prompt : String? # For UserPromptSubmit
+    property tool_use_id : String?
+    property tool_result : String?   # PostToolUse tool response
+    property tool_response : String? # Alias for tool_result
+    # PostToolUseFailure fields
+    property error : String?
+    @[JSON::Field(key: "is_interrupt")]
+    property is_interrupt : Bool?
+    # UserPromptSubmit fields
+    property user_prompt : String?
+    # Stop / SubagentStop fields
+    @[JSON::Field(key: "stop_hook_active")]
+    property stop_hook_active : Bool?
+    # SubagentStart / SubagentStop fields
+    property agent_id : String?
+    property agent_type : String?
+    property agent_transcript_path : String?
     # Notification hook fields
-    property notification_message : String? # The notification message
-    property notification_title : String?   # Optional notification title
+    property notification_message : String?
+    property notification_title : String?
+    property notification_type : String?
     # PreCompact hook fields
     property trigger : String? # "manual" | "auto"
     property custom_instructions : String?
+    # SessionStart fields
+    property source : String? # "startup" | "resume" | "clear" | "compact"
+    # SessionEnd fields
+    property session_end_reason : String? # "clear" | "logout" | "prompt_input_exit" | etc.
+    # PermissionRequest fields
+    property permission_suggestions : Array(JSON::Any)?
 
     def initialize(
+      @session_id : String? = nil,
+      @transcript_path : String? = nil,
+      @cwd : String? = nil,
+      @permission_mode : String? = nil,
+      @hook_event_name : String? = nil,
       @tool_name : String? = nil,
       @tool_input : Hash(String, JSON::Any)? = nil,
+      @tool_use_id : String? = nil,
       @tool_result : String? = nil,
+      @tool_response : String? = nil,
+      @error : String? = nil,
+      @is_interrupt : Bool? = nil,
       @user_prompt : String? = nil,
+      @stop_hook_active : Bool? = nil,
+      @agent_id : String? = nil,
+      @agent_type : String? = nil,
+      @agent_transcript_path : String? = nil,
       @notification_message : String? = nil,
       @notification_title : String? = nil,
+      @notification_type : String? = nil,
       @trigger : String? = nil,
       @custom_instructions : String? = nil,
+      @source : String? = nil,
+      @session_end_reason : String? = nil,
+      @permission_suggestions : Array(JSON::Any)? = nil,
     )
     end
   end

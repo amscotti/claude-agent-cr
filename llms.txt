@@ -4,7 +4,7 @@
 >
 > Tested with Claude Code CLI **v2.1.29**. All features verified working.
 
-This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official TypeScript and Python Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
+This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official Claude Code Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
 
 ## Key Features
 
@@ -87,7 +87,7 @@ options = AgentOptions.new(
 
 ### SDK MCP Server Workflow
 
-Create in-process custom tools (same architecture as official TypeScript/Python SDKs):
+Create in-process custom tools (same architecture as official Claude Code SDKs):
 
 ```crystal
 # 1. Define tools
@@ -122,29 +122,93 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 
 ## Hooks and Permissions
 
-- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Hook system with all events (PreToolUse, PostToolUse, PostToolUseFailure, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd)
+- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Hook system with all events (PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd)
 - [src/claude_agent/permissions.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/permissions.cr): Permission callback system
 
 ### Hook Events
 
-| Event | Description |
-|-------|-------------|
-| PreToolUse | Before tool execution (can block/modify) |
-| PostToolUse | After successful tool execution |
-| PostToolUseFailure | After tool execution failure |
-| PreCompact | Before conversation compaction |
-| Notification | Agent status notifications |
-| UserPromptSubmit | When user submits prompt |
-| Stop | When agent stops |
-| SubagentStart/Stop | Subagent lifecycle |
-| SessionStart/End | Session lifecycle |
+| Event | Description | Event-Specific Fields |
+|-------|-------------|----------------------|
+| PreToolUse | Before tool execution (can block/modify) | `tool_name`, `tool_input`, `tool_use_id` |
+| PostToolUse | After successful tool execution | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response` |
+| PostToolUseFailure | After tool execution failure | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt` |
+| PermissionRequest | When permission dialog appears | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions` |
+| PreCompact | Before conversation compaction | `trigger`, `custom_instructions` |
+| Notification | Agent status notifications | `notification_message`, `notification_title`, `notification_type` |
+| UserPromptSubmit | When user submits prompt | `user_prompt` |
+| Stop | When agent stops | `stop_hook_active` |
+| SubagentStart | Subagent initialization | `agent_id`, `agent_type` |
+| SubagentStop | Subagent completion | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
+| SessionStart | Session initialization | `source` |
+| SessionEnd | Session termination | `session_end_reason` |
+
+### Compact Boundary Detection
+
+When the CLI compacts a session, it emits a `CompactBoundaryMessage`:
+
+```crystal
+when ClaudeAgent::CompactBoundaryMessage
+  puts "Compacted: #{message.compact_metadata.trigger}"
+  puts "Pre-tokens: #{message.compact_metadata.pre_tokens}"
+end
+```
+
+### Tool Use ID Access
+
+Tool use IDs are available on `ToolUseBlock`:
+
+```crystal
+when ClaudeAgent::AssistantMessage
+  message.content.each do |block|
+    if block.is_a?(ClaudeAgent::ToolUseBlock)
+      puts "Tool: #{block.name}, ID: #{block.id}"
+    end
+  end
+end
+```
+
+### Interrupt/Cancellation
+
+```crystal
+client.interrupt  # Signal CLI to stop current operation
+```
+
+### Thinking Content Access
+
+```crystal
+when ClaudeAgent::AssistantMessage
+  message.content.each do |block|
+    case block
+    when ClaudeAgent::ThinkingBlock
+      puts block.thinking
+    when ClaudeAgent::RedactedThinkingBlock
+      puts "Redacted: #{block.signature}"
+    end
+  end
+end
+```
 
 ### HookInput Fields
 
-- `tool_name`, `tool_input`, `tool_result` - Tool-related fields
+Common context fields (available on all hook events):
+- `session_id` - Current session identifier
+- `transcript_path` - Path to the JSONL transcript file
+- `cwd` - Current working directory
+- `permission_mode` - Permission mode (e.g., "Default", "BypassPermissions")
+- `hook_event_name` - Hook event name (e.g., "PreToolUse", "PreCompact", "Stop")
+
+Event-specific fields:
+- `tool_name`, `tool_input`, `tool_use_id` - Tool-related fields
+- `tool_result`, `tool_response` - Tool execution results
+- `error`, `is_interrupt` - PostToolUseFailure fields
 - `user_prompt` - For UserPromptSubmit
-- `notification_message`, `notification_title` - For Notification hook
+- `notification_message`, `notification_title`, `notification_type` - For Notification hook
 - `trigger`, `custom_instructions` - For PreCompact hook
+- `stop_hook_active` - For Stop/SubagentStop hooks
+- `agent_id`, `agent_type`, `agent_transcript_path` - For subagent hooks
+- `source` - For SessionStart
+- `session_end_reason` - For SessionEnd
+- `permission_suggestions` - For PermissionRequest
 
 ## Examples
 
@@ -157,7 +221,12 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 - [examples/16_structured_output.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/16_structured_output.cr): Structured output handling
 - [examples/17_mcp_playwright.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/17_mcp_playwright.cr): External MCP server (Playwright)
 - [examples/18_mcp_github.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/18_mcp_github.cr): GitHub MCP server
-- [examples/19_mcp_remote.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/19_mcp_remote.cr): Remote HTTP MCP server
+- [examples/19_mcp_remote.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/19_mcp_remote.cr): Remote SSE MCP server (Context7)
+- [examples/20_hook_lifecycle.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/20_hook_lifecycle.cr): Hook lifecycle (SessionStart/End, Stop, UserPromptSubmit)
+- [examples/21_hook_tool_audit.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/21_hook_tool_audit.cr): PostToolUse/PostToolUseFailure auditing
+- [examples/22_hook_precompact.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/22_hook_precompact.cr): PreCompact transcript archiving
+- [examples/23_hook_permission_request.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/23_hook_permission_request.cr): PermissionRequest hook event
+- [examples/24_thinking_interrupt_tool_ids.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/24_thinking_interrupt_tool_ids.cr): Thinking blocks, interrupts, tool ID correlation
 
 ## Optional
 
@@ -166,5 +235,6 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 
 ## Version Notes
 
+- **0.3.0**: Full hook parity, CompactBoundaryMessage for session compaction detection, all event-specific fields, PermissionRequest hook event
 - **0.2.0**: Added UnknownBlock, Notification hook, resume_session_at, PreCompact hook fields, fixed hook callback dispatch
 - Tested with Claude Code CLI v2.1.29

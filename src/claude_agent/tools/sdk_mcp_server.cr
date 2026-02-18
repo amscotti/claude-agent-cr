@@ -6,7 +6,7 @@ require "../types/control_messages"
 module ClaudeAgent
   # SDK MCP Server - defines tools that run in-process
   #
-  # This implements the control protocol used by the official TypeScript and Python SDKs.
+  # This implements the control protocol used by the official Claude Code SDKs.
   # When the CLI needs to execute a tool, it sends a `control_request` with `mcp_message`
   # subtype containing a JSON-RPC request. The SDK routes this to the appropriate server
   # instance and returns the result via `control_response`.
@@ -45,7 +45,7 @@ module ClaudeAgent
     getter tools : Array(SDKTool)
 
     # MCP protocol version we support
-    # Updated to 2025-03-26 to match official TypeScript/Python SDKs
+    # Updated to 2025-03-26 to match official Claude Code SDKs
     # See: https://github.com/modelcontextprotocol/typescript-sdk/issues/378
     PROTOCOL_VERSION = "2025-03-26"
 

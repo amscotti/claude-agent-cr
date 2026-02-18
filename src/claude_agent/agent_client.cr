@@ -50,7 +50,7 @@ module ClaudeAgent
       @cli_client.send_prompt(prompt)
     end
 
-    # Interrupt a streaming query (TypeScript/Python SDK feature)
+    # Interrupt a streaming query
     def interrupt
       return if @interrupted
       @interrupted = true
@@ -61,7 +61,7 @@ module ClaudeAgent
       })
     end
 
-    # Rewind files to a checkpoint (TypeScript/Python SDK feature)
+    # Rewind files to a checkpoint
     # Requires enable_file_checkpointing: true and replay_user_messages: true
     def rewind_files(user_message_uuid : String)
       @cli_client.send_message({
@@ -162,9 +162,26 @@ module ClaudeAgent
       end
     end
 
+    # Common context fields for all hook inputs
+    private def hook_common_fields(hook_event_name : String)
+      {
+        session_id:      session_id || "unknown",
+        cwd:             @options.try(&.cwd),
+        permission_mode: @options.try(&.permission_mode).try(&.to_s),
+        hook_event_name: hook_event_name,
+      }
+    end
+
     private def trigger_hook(event : Symbol, data : String? = nil)
       hooks = @options.try(&.hooks)
       return unless hooks
+
+      event_name = case event
+                   when :session_start      then "SessionStart"
+                   when :session_end        then "SessionEnd"
+                   when :user_prompt_submit then "UserPromptSubmit"
+                   else                          return
+                   end
 
       callbacks = case event
                   when :session_start      then hooks.session_start
@@ -175,8 +192,15 @@ module ClaudeAgent
 
       return unless callbacks
 
-      input = HookInput.new(user_prompt: data)
-      ctx = HookContext.new(session_id: session_id || "unknown")
+      common = hook_common_fields(event_name)
+      input = HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        user_prompt: data,
+      )
+      ctx = HookContext.new(session_id: common[:session_id])
 
       callbacks.each do |callback|
         callback.call(input, "", ctx)
@@ -184,14 +208,24 @@ module ClaudeAgent
     end
 
     private def handle_permission_request(request : PermissionRequest)
+      all_hooks = @options.try(&.hooks)
+
       # 1. Run PreToolUse hooks
-      if hooks = @options.try(&.hooks).try(&.pre_tool_use)
+      if hooks = all_hooks.try(&.pre_tool_use)
         hooks.each do |hook_matcher|
           if hook_matcher.matches?(request.tool_name)
-            # Prepare hook input
-            input = HookInput.new(tool_name: request.tool_name, tool_input: request.tool_input)
+            common = hook_common_fields("PreToolUse")
+            input = HookInput.new(
+              session_id: common[:session_id],
+              cwd: common[:cwd],
+              permission_mode: common[:permission_mode],
+              hook_event_name: common[:hook_event_name],
+              tool_name: request.tool_name,
+              tool_input: request.tool_input,
+              tool_use_id: request.tool_use_id,
+            )
 
-            ctx = HookContext.new(session_id: session_id || "unknown")
+            ctx = HookContext.new(session_id: common[:session_id])
 
             hook_matcher.hooks.each do |callback|
               res = callback.call(input, request.tool_use_id, ctx)
@@ -208,7 +242,27 @@ module ClaudeAgent
         end
       end
 
-      # 2. Run User Callback if present
+      # 2. Run PermissionRequest hooks
+      if hooks = all_hooks.try(&.permission_request)
+        hooks.each do |hook_matcher|
+          if hook_matcher.matches?(request.tool_name)
+            common = hook_common_fields("PermissionRequest")
+            input = HookInput.new(
+              session_id: common[:session_id],
+              cwd: common[:cwd],
+              permission_mode: common[:permission_mode],
+              hook_event_name: common[:hook_event_name],
+              tool_name: request.tool_name,
+              tool_input: request.tool_input,
+              tool_use_id: request.tool_use_id,
+            )
+            ctx = HookContext.new(session_id: common[:session_id])
+            hook_matcher.hooks.each(&.call(input, request.tool_use_id, ctx))
+          end
+        end
+      end
+
+      # 3. Run User Callback if present
       if callback = @options.try(&.can_use_tool)
         context = PermissionContext.new(
           tool_name: request.tool_name,
@@ -250,11 +304,23 @@ module ClaudeAgent
                            else             ""
                            end
 
+          hook_event = is_error ? "PostToolUseFailure" : "PostToolUse"
+          common = hook_common_fields(hook_event)
+          # Find the original tool_input from the ToolUseBlock
+          original_tool_input = find_tool_input_for_result(message, block.tool_use_id)
           input = HookInput.new(
+            session_id: common[:session_id],
+            cwd: common[:cwd],
+            permission_mode: common[:permission_mode],
+            hook_event_name: common[:hook_event_name],
             tool_name: tool_name,
-            tool_result: result_content
+            tool_input: original_tool_input,
+            tool_use_id: block.tool_use_id,
+            tool_result: result_content,
+            tool_response: result_content,
+            error: is_error ? result_content : nil,
           )
-          ctx = HookContext.new(session_id: session_id || "unknown")
+          ctx = HookContext.new(session_id: common[:session_id])
 
           hook_matcher.hooks.each do |callback|
             callback.call(input, block.tool_use_id, ctx)
@@ -268,6 +334,16 @@ module ClaudeAgent
       message.content.each do |block|
         if block.is_a?(ToolUseBlock) && block.id == tool_use_id
           return block.name
+        end
+      end
+      nil
+    end
+
+    # Find tool input from a ToolUseBlock matching the tool_use_id
+    private def find_tool_input_for_result(message : AssistantMessage, tool_use_id : String) : Hash(String, JSON::Any)?
+      message.content.each do |block|
+        if block.is_a?(ToolUseBlock) && block.id == tool_use_id
+          return block.input
         end
       end
       nil
@@ -293,8 +369,16 @@ module ClaudeAgent
       callbacks = hooks.subagent_start
       return unless callbacks
 
-      input = HookInput.new(tool_name: "Task", tool_input: block.input)
-      ctx = HookContext.new(session_id: session_id || "unknown")
+      common = hook_common_fields("SubagentStart")
+      input = HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        tool_name: "Task",
+        tool_input: block.input,
+      )
+      ctx = HookContext.new(session_id: common[:session_id])
       callbacks.each(&.call(input, block.id, ctx))
     end
 
@@ -309,8 +393,16 @@ module ClaudeAgent
                        when Array  then content.to_json
                        else             ""
                        end
-      input = HookInput.new(tool_name: "Task", tool_result: result_content)
-      ctx = HookContext.new(session_id: session_id || "unknown")
+      common = hook_common_fields("SubagentStop")
+      input = HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        tool_name: "Task",
+        tool_result: result_content,
+      )
+      ctx = HookContext.new(session_id: common[:session_id])
       callbacks.each(&.call(input, block.tool_use_id, ctx))
     end
 
@@ -322,8 +414,14 @@ module ClaudeAgent
       callbacks = hooks.stop
       return unless callbacks
 
-      input = HookInput.new
-      ctx = HookContext.new(session_id: session_id || "unknown")
+      common = hook_common_fields("Stop")
+      input = HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+      )
+      ctx = HookContext.new(session_id: common[:session_id])
       callbacks.each(&.call(input, result.uuid, ctx))
     end
 
@@ -432,7 +530,7 @@ module ClaudeAgent
 
       if callbacks
         input = build_hook_input(req)
-        ctx = HookContext.new(session_id: session_id || "unknown")
+        ctx = HookContext.new(session_id: input.session_id || "unknown")
 
         callbacks.each do |callback|
           callback.call(input, request_id, ctx)
@@ -443,8 +541,8 @@ module ClaudeAgent
       @cli_client.send_control_response(response)
     end
 
-    # pre_tool_use and post_tool_use are intentionally excluded: they are handled
-    # via PermissionRequest and AssistantMessage respectively, not via callbacks here.
+    # pre_tool_use and post_tool_use are handled via PermissionRequest
+    # and AssistantMessage respectively, not via control callbacks here.
     private def get_callbacks_for_hook(hooks : HookConfig, hook_name : String) : Array(HookCallback)?
       case hook_name
       when "pre_compact"        then hooks.pre_compact
@@ -464,32 +562,83 @@ module ClaudeAgent
       @cli_client.send_control_response(response)
     end
 
+    # Map hook name to PascalCase event name
+    private def hook_event_name_for(hook_name : String) : String
+      case hook_name
+      when "pre_compact"        then "PreCompact"
+      when "notification"       then "Notification"
+      when "user_prompt_submit" then "UserPromptSubmit"
+      when "stop"               then "Stop"
+      when "session_start"      then "SessionStart"
+      when "session_end"        then "SessionEnd"
+      when "subagent_start"     then "SubagentStart"
+      when "subagent_stop"      then "SubagentStop"
+      when "permission_request" then "PermissionRequest"
+      else                           hook_name
+      end
+    end
+
+    # Extract a string field from a hash
+    private def extract_string(input : Hash(String, JSON::Any)?, key : String) : String?
+      input.try(&.[key]?.try(&.as_s?))
+    end
+
+    # Extract a bool field from a hash
+    private def extract_bool(input : Hash(String, JSON::Any)?, key : String) : Bool?
+      input.try(&.[key]?.try(&.as_bool?))
+    end
+
+    # Build base HookInput with common context fields populated
+    private def build_base_hook_input(req : ControlHookCallbackRequest) : HookInput
+      tool_input = req.input
+      common = hook_common_fields(hook_event_name_for(req.hook))
+
+      HookInput.new(
+        session_id: extract_string(tool_input, "session_id") || common[:session_id],
+        transcript_path: extract_string(tool_input, "transcript_path"),
+        cwd: extract_string(tool_input, "cwd") || common[:cwd],
+        permission_mode: extract_string(tool_input, "permission_mode") || common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        tool_input: tool_input,
+      )
+    end
+
     # Build HookInput with appropriate fields based on hook type
     private def build_hook_input(req : ControlHookCallbackRequest) : HookInput
+      input = build_base_hook_input(req)
       tool_input = req.input
 
       case req.hook
       when "notification"
-        # Extract notification-specific fields
-        message = tool_input.try(&.["message"]?.try(&.as_s?))
-        title = tool_input.try(&.["title"]?.try(&.as_s?))
-        HookInput.new(
-          notification_message: message,
-          notification_title: title,
-          tool_input: tool_input
-        )
+        input.notification_message = extract_string(tool_input, "message")
+        input.notification_title = extract_string(tool_input, "title")
+        input.notification_type = extract_string(tool_input, "notification_type")
       when "pre_compact"
-        # Extract pre_compact-specific fields
-        trigger = tool_input.try(&.["trigger"]?.try(&.as_s?))
-        custom_instructions = tool_input.try(&.["custom_instructions"]?.try(&.as_s?))
-        HookInput.new(
-          trigger: trigger,
-          custom_instructions: custom_instructions,
-          tool_input: tool_input
-        )
-      else
-        HookInput.new(tool_input: tool_input)
+        input.trigger = extract_string(tool_input, "trigger")
+        input.custom_instructions = extract_string(tool_input, "custom_instructions")
+      when "stop"
+        input.stop_hook_active = extract_bool(tool_input, "stop_hook_active")
+      when "session_start"
+        input.source = extract_string(tool_input, "source")
+      when "session_end"
+        input.session_end_reason = extract_string(tool_input, "reason")
+      when "subagent_start"
+        input.agent_id = extract_string(tool_input, "agent_id")
+        input.agent_type = extract_string(tool_input, "agent_type")
+      when "subagent_stop"
+        input.agent_id = extract_string(tool_input, "agent_id")
+        input.agent_type = extract_string(tool_input, "agent_type")
+        input.agent_transcript_path = extract_string(tool_input, "agent_transcript_path")
+        input.stop_hook_active = extract_bool(tool_input, "stop_hook_active")
+      when "pre_tool_use", "post_tool_use", "post_tool_use_failure"
+        input.tool_name = extract_string(tool_input, "tool_name")
+        input.tool_use_id = extract_string(tool_input, "tool_use_id")
+      when "permission_request"
+        input.tool_name = extract_string(tool_input, "tool_name")
+        input.tool_use_id = extract_string(tool_input, "tool_use_id")
       end
+
+      input
     end
   end
 end
