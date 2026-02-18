@@ -2,7 +2,7 @@
 #
 # This example demonstrates how to create custom tools that run in-process
 # using the SDK MCP server architecture. This is the same approach used by
-# the official TypeScript and Python SDKs.
+# the official Claude Code SDKs.
 #
 # **How it works:**
 # 1. Define tools using ClaudeAgent.tool() or SDKTool.new()

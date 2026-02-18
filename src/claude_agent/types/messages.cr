@@ -15,7 +15,7 @@ module ClaudeAgent
       when "user"
         UserMessage.from_json(json)
       when "system"
-        SystemMessage.from_json(json)
+        parse_system_message(json, data)
       when "result"
         ResultMessage.from_json(json)
       when "permission_request"
@@ -31,6 +31,15 @@ module ClaudeAgent
         ControlResponseMessage.from_json(json)
       else
         raise Error.new("Unknown message type: #{type}")
+      end
+    end
+
+    private def self.parse_system_message(json : String, data : JSON::Any) : Message
+      subtype = data["subtype"]?.try(&.as_s)
+      if subtype == "compact_boundary"
+        CompactBoundaryMessage.from_json(json)
+      else
+        SystemMessage.from_json(json)
       end
     end
   end
@@ -155,6 +164,25 @@ module ClaudeAgent
     getter type : String = "system"
     getter subtype : String
     getter session_id : String
+  end
+
+  # Compact boundary message - emitted when CLI compacts the session
+  struct CompactBoundaryMessage < Message
+    include JSON::Serializable
+
+    getter type : String = "system"
+    getter subtype : String = "compact_boundary"
+    getter uuid : String
+    getter session_id : String
+
+    # Metadata about the compaction event
+    struct CompactMetadata
+      include JSON::Serializable
+      getter trigger : String # "manual" or "auto"
+      getter pre_tokens : Int64
+    end
+
+    getter compact_metadata : CompactMetadata
   end
 
   # Final result message

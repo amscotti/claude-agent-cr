@@ -91,7 +91,7 @@ module ClaudeAgent
         base_env["MAX_THINKING_TOKENS"] = max_thinking.to_s
       end
 
-      # User identifier for tracking (Python SDK feature)
+      # User identifier for tracking
       if user = @options.try(&.user)
         base_env["CLAUDE_CODE_USER"] = user
       end

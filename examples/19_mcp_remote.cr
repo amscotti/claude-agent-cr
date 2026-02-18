@@ -1,40 +1,42 @@
-# Example 19: Remote MCP Server (HTTP)
+# Example 19: Remote MCP Server (SSE)
 #
 # This example demonstrates connecting to a remote MCP server
-# over HTTP. Remote servers are useful for cloud-hosted services
-# and don't require local installation.
+# using Server-Sent Events (SSE) transport. SSE is used by many
+# hosted MCP servers including Context7 for documentation search.
 #
-# This example uses the Claude Code documentation MCP server.
+# The Context7 MCP server provides access to library documentation
+# and code examples for many popular programming languages and frameworks.
 #
 
 require "../src/claude-agent-cr"
 
-puts "Remote HTTP MCP Server Example"
+puts "Remote SSE MCP Server Example"
 puts "=" * 50
 puts
 
-# Configure a remote HTTP MCP server
-# No local installation required - connects over HTTP
-docs_server = ClaudeAgent::ExternalMCPServerConfig.http(
-  url: "https://code.claude.com/docs/mcp"
+# Context7 MCP server - provides documentation search for libraries
+# Uses SSE (Server-Sent Events) transport
+context7_server = ClaudeAgent::ExternalMCPServerConfig.sse(
+  url: "https://mcp.context7.com/mcp"
 )
 
 options = ClaudeAgent::AgentOptions.new(
   mcp_servers: {
-    "claude-code-docs" => docs_server.as(ClaudeAgent::MCPServerConfig),
+    "context7" => context7_server.as(ClaudeAgent::MCPServerConfig),
   } of String => ClaudeAgent::MCPServerConfig,
   # Allow all tools from this server
-  allowed_tools: ["mcp__claude-code-docs__*"],
+  allowed_tools: ["mcp__context7__*"],
   permission_mode: ClaudeAgent::PermissionMode::Default,
   max_turns: 5
 )
 
-puts "Connecting to Claude Code docs MCP server..."
+puts "Connecting to Context7 MCP server..."
+puts "(Provides documentation search for libraries)"
 puts
 
 begin
   ClaudeAgent.query(
-    "Use the docs MCP server to explain what hooks are in Claude Code",
+    "Search Context7 for information about React hooks and explain the useEffect hook",
     options
   ) do |message|
     case message
@@ -55,4 +57,7 @@ begin
   end
 rescue ex
   puts "Error: #{ex.message}"
+  puts
+  puts "Note: The Context7 server requires SSE transport support."
+  puts "Make sure your network allows SSE connections."
 end

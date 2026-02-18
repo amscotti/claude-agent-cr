@@ -41,7 +41,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.2.0
+        version: ~> 0.3.0
     ```
 
 2.  Run `shards install`
@@ -146,7 +146,7 @@ options = ClaudeAgent::AgentOptions.new(
 
 ### Custom Tools (SDK MCP Servers)
 
-Define custom tools that run in-process using the SDK MCP server architecture (same as official TypeScript/Python SDKs).
+Define custom tools that run in-process using the SDK MCP server architecture.
 
 ```crystal
 # 1. Define tools using Schema builder
@@ -265,48 +265,53 @@ end
 
 ### Hooks
 
-Intercept tool usage to block or modify actions. The SDK supports all hook events from the official SDKs:
+Intercept tool usage to block or modify actions. All hook inputs include common context fields (`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`) plus event-specific fields. The SDK supports all hook events:
 
-- **PreToolUse**: Before tool execution (can block/modify)
-- **PostToolUse**: After successful tool execution
-- **PostToolUseFailure**: After tool execution failure
-- **PreCompact**: Before conversation compaction
-- **Notification**: Agent status notifications (for Slack, dashboards, etc.)
-- **UserPromptSubmit**: When user submits a prompt
-- **Stop**: When agent stops
-- **SubagentStart/Stop**: When subagents start/complete
-- **SessionStart/End**: Session lifecycle events
+| Event | Event-Specific Fields |
+|-------|----------------------|
+| **PreToolUse** | `tool_name`, `tool_input`, `tool_use_id` |
+| **PostToolUse** | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response` |
+| **PostToolUseFailure** | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt` |
+| **PermissionRequest** | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions` |
+| **PreCompact** | `trigger`, `custom_instructions` |
+| **Notification** | `notification_message`, `notification_title`, `notification_type` |
+| **UserPromptSubmit** | `user_prompt` |
+| **Stop** | `stop_hook_active` |
+| **SubagentStart** | `agent_id`, `agent_type` |
+| **SubagentStop** | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
+| **SessionStart** | `source` ("startup", "resume", "clear", "compact") |
+| **SessionEnd** | `session_end_reason` ("clear", "logout", etc.) |
 
 ```crystal
-# Block 'rm' commands
+# Block 'rm' commands (PreToolUse with tool_use_id)
 block_rm = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::HookContext) {
-  if input.tool_name == "Bash" && input.tool_input["command"].as_s.includes?("rm")
+  if input.tool_name == "Bash" && input.tool_input.try(&.["command"]?.try(&.as_s.includes?("rm")))
     ClaudeAgent::HookResult.deny("Deletion blocked by policy.")
   else
     ClaudeAgent::HookResult.allow
   end
 }
 
-# Handle PreCompact hook (before conversation compaction)
-pre_compact_handler = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::HookContext) {
-  # input.trigger is "manual" or "auto"
-  # input.custom_instructions contains any custom instructions
-  puts "Compacting conversation (trigger: #{input.trigger})"
+# Audit tool executions (PostToolUse with tool_response and tool_input)
+audit_hook = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+  puts "Tool: #{input.tool_name} (#{input.tool_use_id})"
+  puts "Result: #{input.tool_result}"
   ClaudeAgent::HookResult.allow
 }
 
-# Handle Notification hook (forward status to external services)
-notification_handler = ->(input : ClaudeAgent::HookInput, id : String, ctx : ClaudeAgent::HookContext) {
-  # input.notification_message contains the status message
-  # input.notification_title contains optional title
-  puts "[Notification] #{input.notification_title}: #{input.notification_message}"
+# Archive transcript before compaction (PreCompact with transcript_path)
+pre_compact_handler = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+  if path = input.transcript_path
+    puts "Archiving transcript: #{path}"
+    # File.copy(path, "/backups/#{input.session_id}.jsonl")
+  end
   ClaudeAgent::HookResult.allow
 }
 
 hooks = ClaudeAgent::HookConfig.new(
   pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_rm])],
+  post_tool_use: [ClaudeAgent::HookMatcher.new(hooks: [audit_hook])],
   pre_compact: [pre_compact_handler],
-  notification: [notification_handler]
 )
 
 options = ClaudeAgent::AgentOptions.new(hooks: hooks)
@@ -510,8 +515,76 @@ options = ClaudeAgent::AgentOptions.new(
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
 | Extended Thinking | ✅ Working | max_thinking_tokens support |
 | Unknown Content Types | ✅ Working | Graceful handling of future content block types |
+| Compact Boundary | ✅ Working | Detect when CLI compacts session history |
+
+### Handling Compact Boundaries
+
+When the CLI compacts a session, it emits a `CompactBoundaryMessage`:
+
+```crystal
+client.each_response do |message|
+  case message
+  when ClaudeAgent::CompactBoundaryMessage
+    puts "Session compacted: #{message.compact_metadata.trigger}"
+    puts "Pre-compaction tokens: #{message.compact_metadata.pre_tokens}"
+  end
+end
+```
+
+### Tool Use ID Access
+
+Tool use IDs are available on `ToolUseBlock` within `AssistantMessage.content`:
+
+```crystal
+when ClaudeAgent::AssistantMessage
+  message.content.each do |block|
+    if block.is_a?(ClaudeAgent::ToolUseBlock)
+      puts "Tool: #{block.name}, ID: #{block.id}"
+    end
+  end
+end
+```
+
+### Interrupt/Cancellation
+
+Interrupt an ongoing agent run:
+
+```crystal
+client.interrupt  # Signal the CLI to stop current operation
+```
+
+### Thinking Content Access
+
+For extended thinking models:
+
+```crystal
+when ClaudeAgent::AssistantMessage
+  message.content.each do |block|
+    case block
+    when ClaudeAgent::ThinkingBlock
+      puts "Thinking: #{block.thinking}"
+    when ClaudeAgent::RedactedThinkingBlock
+      puts "Redacted thinking (signature present)"
+    end
+  end
+end
+```
 
 ## Changelog
+
+### 0.3.0
+
+- **New**: Common context fields on all `HookInput` events: `session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`
+- **New**: Event-specific fields matching official SDKs: `tool_use_id`, `tool_response`, `error`, `is_interrupt`, `stop_hook_active`, `agent_id`, `agent_type`, `agent_transcript_path`, `notification_type`, `source`, `session_end_reason`, `permission_suggestions`
+- **New**: `PermissionRequest` hook event for visibility into permission dialogs
+- **New**: `CompactBoundaryMessage` type for detecting session compaction (TypeScript SDK feature)
+- **New**: Examples for hook lifecycle (20), tool auditing (21), PreCompact archiving (22), and PermissionRequest (23)
+- For control protocol hooks, CLI-provided values (e.g., `transcript_path`) take precedence over locally-derived values
+
+**Notes on requested features vs official SDKs:**
+- `error_type`/`error_code` fields in ResultMessage: **Not in official SDKs** - use `subtype` and `is_error` instead
+- `SessionInfo` with `message_count`/`current_tokens`: **Not in official SDKs** - use `num_turns` and `usage` on ResultMessage
+- `AssistantMessage.tool_use_id`: **Not in official SDKs** - access via `ToolUseBlock.id` in content blocks
 
 ### 0.2.0
 
