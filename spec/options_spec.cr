@@ -10,6 +10,10 @@ describe ClaudeAgent::AgentOptions do
     options.resume_session_at.should be_nil
     options.fork_session?.should be_false
     options.enable_file_checkpointing?.should be_false
+    options.thinking.should be_nil
+    options.effort.should be_nil
+    options.prompt_suggestions?.should be_false
+    options.agent_progress_summaries?.should be_false
   end
 
   it "accepts all configuration options" do
@@ -24,8 +28,13 @@ describe ClaudeAgent::AgentOptions do
       betas: ["beta-feature"],
       add_dirs: ["/extra/dir"],
       max_turns: 10,
+      max_thinking_tokens: 4096,
+      thinking: ClaudeAgent::ThinkingConfig.enabled(8192),
+      effort: ClaudeAgent::Effort::High,
       cwd: "/working/dir",
       session_id: "sess-123",
+      prompt_suggestions: true,
+      agent_progress_summaries: true,
       resume: "session-abc-123",
       resume_session_at: "msg-uuid-456",
       fork_session: true,
@@ -43,8 +52,14 @@ describe ClaudeAgent::AgentOptions do
     options.betas.should eq(["beta-feature"])
     options.add_dirs.should eq(["/extra/dir"])
     options.max_turns.should eq(10)
+    options.max_thinking_tokens.should eq(4096)
+    options.thinking.should be_a(ClaudeAgent::ThinkingConfigEnabled)
+    options.thinking.try(&.budget_tokens).should eq(8192)
+    options.effort.should eq(ClaudeAgent::Effort::High)
     options.cwd.should eq("/working/dir")
     options.session_id.should eq("sess-123")
+    options.prompt_suggestions?.should be_true
+    options.agent_progress_summaries?.should be_true
     options.resume.should eq("session-abc-123")
     options.resume_session_at.should eq("msg-uuid-456")
     options.fork_session?.should be_true
@@ -135,6 +150,14 @@ describe ClaudeAgent::AgentOptions do
       fmt.type.should eq("json_schema")
     end
   end
+
+  it "supports adaptive and disabled thinking configs" do
+    adaptive = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.adaptive)
+    adaptive.thinking.should be_a(ClaudeAgent::ThinkingConfigAdaptive)
+
+    disabled = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.disabled)
+    disabled.thinking.should be_a(ClaudeAgent::ThinkingConfigDisabled)
+  end
 end
 
 describe ClaudeAgent::PermissionMode do
@@ -143,6 +166,15 @@ describe ClaudeAgent::PermissionMode do
     ClaudeAgent::PermissionMode::AcceptEdits.to_s.should eq("AcceptEdits")
     ClaudeAgent::PermissionMode::Plan.to_s.should eq("Plan")
     ClaudeAgent::PermissionMode::BypassPermissions.to_s.should eq("BypassPermissions")
+  end
+end
+
+describe ClaudeAgent::Effort do
+  it "has all expected levels" do
+    ClaudeAgent::Effort::Low.to_s.should eq("Low")
+    ClaudeAgent::Effort::Medium.to_s.should eq("Medium")
+    ClaudeAgent::Effort::High.to_s.should eq("High")
+    ClaudeAgent::Effort::Max.to_s.should eq("Max")
   end
 end
 

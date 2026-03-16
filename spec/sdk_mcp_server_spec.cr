@@ -400,7 +400,8 @@ describe "Control Message Parsing" do
       "request_id": "req-hook-001",
       "request": {
         "subtype": "hook_callback",
-        "hook": "pre_tool_use",
+        "callback_id": "hook_123",
+        "tool_use_id": "tool_123",
         "input": {"tool_name": "Bash", "command": "ls"}
       }
     }
@@ -413,7 +414,8 @@ describe "Control Message Parsing" do
       message.request.should be_a(ClaudeAgent::ControlHookCallbackRequest)
 
       if req = message.request.as?(ClaudeAgent::ControlHookCallbackRequest)
-        req.hook.should eq("pre_tool_use")
+        req.callback_id.should eq("hook_123")
+        req.tool_use_id.should eq("tool_123")
         req.input.should_not be_nil
         if input = req.input
           input["tool_name"].as_s.should eq("Bash")

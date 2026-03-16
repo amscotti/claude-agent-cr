@@ -1,10 +1,13 @@
 require "../src/claude-agent-cr"
 
 begin
-  # Define a hook to block "rm" command
+  # Define a hook to block a specific Bash command pattern.
   block_rm_hook = ->(input : ClaudeAgent::HookInput, _tool_use_id : String, _ctx : ClaudeAgent::HookContext) {
-    if input.tool_name == "Bash" && input.tool_input.try(&.["command"]?.try(&.as_s.includes?("rm")))
-      ClaudeAgent::HookResult.deny("Removing files is not allowed via Bash.")
+    command = input.tool_input.try(&.["command"]?.try(&.as_s)) || ""
+
+    if input.tool_name == "Bash" && command.includes?("./foo.sh")
+      puts "[PreToolUse] BLOCKED: #{command}"
+      ClaudeAgent::HookResult.deny("Running ./foo.sh is blocked by the SDK hook.")
     else
       ClaudeAgent::HookResult.allow
     end
@@ -27,8 +30,8 @@ begin
   )
 
   ClaudeAgent::AgentClient.open(options) do |client|
-    puts "Asking to remove a file..."
-    client.query("Please run 'rm -rf /tmp/test'")
+    puts "Asking to run a blocked Bash command..."
+    client.query("Run the bash command: ./foo.sh --help")
 
     client.each_response do |message|
       if message.is_a?(ClaudeAgent::AssistantMessage)

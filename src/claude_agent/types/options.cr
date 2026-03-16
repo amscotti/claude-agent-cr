@@ -10,6 +10,16 @@ module ClaudeAgent
     AcceptEdits       # Auto-approve file edits
     Plan              # Planning mode, no execution
     BypassPermissions # Bypass all permission checks (requires explicit opt-in)
+
+    def to_cli_value : String
+      case self
+      when Default           then "default"
+      when AcceptEdits       then "acceptEdits"
+      when Plan              then "plan"
+      when BypassPermissions then "bypassPermissions"
+      else                        "default"
+      end
+    end
   end
 
   struct AgentDefinition
@@ -228,6 +238,97 @@ module ClaudeAgent
   # Callback type for stderr output
   alias StderrCallback = Proc(String, Nil)
 
+  struct ElicitationRequest
+    getter server_name : String
+    getter message : String
+    getter mode : String?
+    getter url : String?
+    getter elicitation_id : String?
+    getter requested_schema : Hash(String, JSON::Any)?
+
+    def initialize(
+      @server_name : String,
+      @message : String,
+      @mode : String? = nil,
+      @url : String? = nil,
+      @elicitation_id : String? = nil,
+      @requested_schema : Hash(String, JSON::Any)? = nil,
+    )
+    end
+  end
+
+  struct ElicitationResponse
+    getter action : String
+    getter content : Hash(String, JSON::Any)?
+
+    def initialize(@action : String, @content : Hash(String, JSON::Any)? = nil)
+    end
+
+    def self.accept(content : Hash(String, JSON::Any)? = nil) : ElicitationResponse
+      new("accept", content)
+    end
+
+    def self.decline : ElicitationResponse
+      new("decline")
+    end
+
+    def self.cancel : ElicitationResponse
+      new("cancel")
+    end
+  end
+
+  alias ElicitationCallback = Proc(ElicitationRequest, ElicitationResponse)
+
+  abstract struct ThinkingConfig
+    getter type : String
+
+    def initialize(@type : String)
+    end
+
+    def budget_tokens : Int32?
+      nil
+    end
+
+    def self.adaptive : ThinkingConfigAdaptive
+      ThinkingConfigAdaptive.new
+    end
+
+    def self.enabled(budget_tokens : Int32) : ThinkingConfigEnabled
+      ThinkingConfigEnabled.new(budget_tokens)
+    end
+
+    def self.disabled : ThinkingConfigDisabled
+      ThinkingConfigDisabled.new
+    end
+  end
+
+  struct ThinkingConfigAdaptive < ThinkingConfig
+    def initialize
+      super("adaptive")
+    end
+  end
+
+  struct ThinkingConfigEnabled < ThinkingConfig
+    getter budget_tokens : Int32
+
+    def initialize(@budget_tokens : Int32)
+      super("enabled")
+    end
+  end
+
+  struct ThinkingConfigDisabled < ThinkingConfig
+    def initialize
+      super("disabled")
+    end
+  end
+
+  enum Effort
+    Low
+    Medium
+    High
+    Max
+  end
+
   struct AgentOptions
     include JSON::Serializable
 
@@ -252,6 +353,8 @@ module ClaudeAgent
     property max_budget_usd : Float64?
     property max_turns : Int32?
     property max_thinking_tokens : Int32? # Extended thinking control
+    property thinking : ThinkingConfig?
+    property effort : Effort?
 
     # Beta features
     property betas : Array(String)?
@@ -273,10 +376,14 @@ module ClaudeAgent
     # Agent definitions for subagents
     property agents : Hash(String, AgentDefinition)?
     property agent : String? # Active agent to use
+    property? prompt_suggestions : Bool = false
+    property? agent_progress_summaries : Bool = false
 
     # Hooks
     @[JSON::Field(ignore: true)]
     property hooks : HookConfig?
+    @[JSON::Field(ignore: true)]
+    property on_elicitation : ElicitationCallback?
 
     # Permission callback
     @[JSON::Field(ignore: true)]
@@ -335,6 +442,8 @@ module ClaudeAgent
       @max_budget_usd : Float64? = nil,
       @max_turns : Int32? = nil,
       @max_thinking_tokens : Int32? = nil,
+      @thinking : ThinkingConfig? = nil,
+      @effort : Effort? = nil,
       @betas : Array(String)? = nil,
       @add_dirs : Array(String)? = nil,
       @plugins : Array(String)? = nil,
@@ -343,7 +452,10 @@ module ClaudeAgent
       @strict_mcp_config : Bool = false,
       @agents : Hash(String, AgentDefinition)? = nil,
       @agent : String? = nil,
+      @prompt_suggestions : Bool = false,
+      @agent_progress_summaries : Bool = false,
       @hooks : HookConfig? = nil,
+      @on_elicitation : ElicitationCallback? = nil,
       @can_use_tool : PermissionCallback? = nil,
       @permission_prompt_tool_name : String? = nil,
       @include_partial_messages : Bool = false,

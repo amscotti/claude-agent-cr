@@ -21,15 +21,19 @@ module ClaudeAgent
   #
   class StreamingSession
     @cli_client : CLIClient
-    @input_channel : Channel(String)
+    private record PendingUserMessage, content : String, uuid : String?
+
+    @input_channel : Channel(PendingUserMessage)
     @output_channel : Channel(Message)
+    @done_channel : Channel(Nil)
     @running : Bool = false
     @session_id : String?
 
     def initialize(@options : AgentOptions? = nil)
       @cli_client = CLIClient.new(@options)
-      @input_channel = Channel(String).new(10)
+      @input_channel = Channel(PendingUserMessage).new(10)
       @output_channel = Channel(Message).new(100)
+      @done_channel = Channel(Nil).new(2)
     end
 
     def session_id : String?
@@ -51,13 +55,21 @@ module ClaudeAgent
       @running = false
       @input_channel.close
       @cli_client.stop
-      @output_channel.close
+      @output_channel.close unless @output_channel.closed?
+
+      # Wait for processor fibers to finish (with timeout)
+      2.times do
+        select
+        when @done_channel.receive?
+        when timeout(2.seconds)
+        end
+      end
     end
 
     # Send a message to the agent
-    def send(content : String)
+    def send(content : String, *, uuid : String? = nil)
       raise Error.new("Session not started") unless @running
-      @input_channel.send(content)
+      @input_channel.send(PendingUserMessage.new(content, uuid))
     end
 
     # Receive the next message (blocking)
@@ -113,21 +125,20 @@ module ClaudeAgent
       spawn do
         is_first = true
         while @running
-          content = @input_channel.receive?
-          break unless content
+          pending = @input_channel.receive?
+          break unless pending
 
           if is_first
-            @cli_client.send_prompt(content)
+            @cli_client.send_prompt(pending.content, uuid: pending.uuid)
             is_first = false
           else
-            @cli_client.send_message({
-              "type"    => "user",
-              "message" => {"role" => "user", "content" => content},
-            })
+            @cli_client.send_user_message(pending.content, uuid: pending.uuid)
           end
         end
       rescue Channel::ClosedError
         # Expected when closing
+      ensure
+        @done_channel.send(nil) unless @done_channel.closed?
       end
     end
 
@@ -150,6 +161,7 @@ module ClaudeAgent
         # Expected when closing
       ensure
         @output_channel.close unless @output_channel.closed?
+        @done_channel.send(nil) unless @done_channel.closed?
       end
     end
   end

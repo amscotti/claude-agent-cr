@@ -10,10 +10,10 @@
 # 3. Pass the server to AgentOptions.mcp_servers
 # 4. The CLI routes tool calls back to your Crystal process via control protocol
 #
-# **Known Limitation:**
-# As of January 2025, there are known issues with SDK MCP server integration
-# in the Claude Code CLI (GitHub Issue #7279). Tool discovery may work but
-# execution routing may fail in some CLI versions.
+# **Compatibility Note:**
+# SDK MCP server behavior has evolved across Claude Code CLI versions.
+# If tool discovery works but execution routing does not, upgrade the CLI
+# and re-run this example.
 #
 # **Tool Naming Convention:**
 # SDK MCP tools are named: mcp__<server_name>__<tool_name>
@@ -77,7 +77,7 @@ puts "Registered tools:"
 puts "  - mcp__calc__greet: Greet a user by name"
 puts "  - mcp__calc__add: Add two numbers"
 puts ""
-puts "Note: Due to CLI bug #7279, tool execution may not work in all CLI versions."
+puts "Note: If SDK MCP execution does not work, upgrade Claude Code CLI and retry."
 puts ""
 
 # Run a query that should trigger our tools

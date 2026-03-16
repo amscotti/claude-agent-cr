@@ -13,22 +13,28 @@ describe ClaudeAgent::HookMatcher do
     matcher.matches?("BashCommand").should be_true
     matcher.matches?("Read").should be_false
   end
+
+  it "stores timeout for control protocol hooks" do
+    matcher = ClaudeAgent::HookMatcher.new(matcher: "Bash", timeout: 12.5)
+    matcher.timeout.should eq(12.5)
+  end
 end
 
 describe ClaudeAgent::ControlHookCallbackRequest do
   it "parses hook_callback control request" do
-    json = %({"subtype": "hook_callback", "hook": "pre_compact", "input": {"key": "value"}})
+    json = %({"subtype": "hook_callback", "callback_id": "hook_1", "tool_use_id": "tool-1", "input": {"key": "value"}})
     req = ClaudeAgent::ControlHookCallbackRequest.from_json(json)
     req.subtype.should eq("hook_callback")
-    req.hook.should eq("pre_compact")
+    req.callback_id.should eq("hook_1")
+    req.tool_use_id.should eq("tool-1")
     req.input.should_not be_nil
     req.input.try(&.["key"].as_s.should eq("value"))
   end
 
   it "parses hook_callback without input" do
-    json = %({"subtype": "hook_callback", "hook": "pre_compact"})
+    json = %({"subtype": "hook_callback", "callback_id": "hook_2"})
     req = ClaudeAgent::ControlHookCallbackRequest.from_json(json)
-    req.hook.should eq("pre_compact")
+    req.callback_id.should eq("hook_2")
     req.input.should be_nil
   end
 end
@@ -47,6 +53,31 @@ describe ClaudeAgent::HookResult do
       output.permission_decision.should eq("deny")
       output.permission_decision_reason.should eq("Bad tool")
     end
+  end
+
+  it "creates permission_request result" do
+    res = ClaudeAgent::HookResult.permission_request({"type" => JSON::Any.new("allow")})
+    output = res.hook_specific_output
+    output.should_not be_nil
+    output.try(&.decision).should_not be_nil
+    output.try(&.decision.try(&.["type"].as_s)).should eq("allow")
+  end
+
+  it "creates elicitation result" do
+    res = ClaudeAgent::HookResult.elicitation("accept", {"token" => JSON::Any.new("abc")})
+    output = res.hook_specific_output
+    output.should_not be_nil
+    output.try(&.hook_event_name).should eq("Elicitation")
+    output.try(&.action).should eq("accept")
+    output.try(&.content.try(&.["token"].as_s)).should eq("abc")
+  end
+
+  it "creates elicitation_result override" do
+    res = ClaudeAgent::HookResult.elicitation_result("cancel")
+    output = res.hook_specific_output
+    output.should_not be_nil
+    output.try(&.hook_event_name).should eq("ElicitationResult")
+    output.try(&.action).should eq("cancel")
   end
 end
 
@@ -81,6 +112,20 @@ describe ClaudeAgent::HookConfig do
     )
     config.permission_request.should_not be_nil
     config.permission_request.try(&.size).should eq(1)
+  end
+
+  it "supports elicitation hooks" do
+    callback = ->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+      ClaudeAgent::HookResult.elicitation("decline")
+    }
+
+    config = ClaudeAgent::HookConfig.new(
+      elicitation: [callback],
+      elicitation_result: [callback],
+    )
+
+    config.elicitation.should_not be_nil
+    config.elicitation_result.should_not be_nil
   end
 end
 
@@ -254,6 +299,37 @@ describe ClaudeAgent::HookInput do
     )
     input.tool_name.should eq("Write")
     input.permission_suggestions.try(&.size).should eq(1)
+  end
+
+  it "supports Elicitation fields" do
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "Elicitation",
+      mcp_server_name: "auth-server",
+      elicitation_message: "Authenticate to continue",
+      elicitation_mode: "url",
+      elicitation_url: "https://example.com/auth",
+      elicitation_id: "oauth-1",
+      requested_schema: {"type" => JSON::Any.new("object")},
+    )
+
+    input.mcp_server_name.should eq("auth-server")
+    input.elicitation_message.should eq("Authenticate to continue")
+    input.elicitation_mode.should eq("url")
+    input.elicitation_url.should eq("https://example.com/auth")
+    input.elicitation_id.should eq("oauth-1")
+    input.requested_schema.try(&.["type"].as_s).should eq("object")
+  end
+
+  it "supports ElicitationResult fields" do
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "ElicitationResult",
+      mcp_server_name: "auth-server",
+      elicitation_action: "accept",
+      elicitation_content: {"code" => JSON::Any.new("123456")},
+    )
+
+    input.elicitation_action.should eq("accept")
+    input.elicitation_content.try(&.["code"].as_s).should eq("123456")
   end
 
   it "deserializes PostToolUseFailure from JSON" do

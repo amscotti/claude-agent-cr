@@ -75,6 +75,7 @@ module ClaudeAgent
         @output = process.output
         @error = process.error
         @running = true
+        start_stderr_drain
       rescue ex : File::NotFoundError
         raise CLINotFoundError.new("Claude Code CLI not found at '#{cli_path}'", cli_path)
       end
@@ -82,13 +83,12 @@ module ClaudeAgent
 
     private def build_env : Hash(String, String)?
       base_env = @options.try(&.env) || {} of String => String
+
       # Set SDK entrypoint identifier (matches official SDK behavior)
       base_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cr"
 
-      # Max thinking tokens is set via environment variable
-      # See: https://github.com/anthropics/claude-code/issues/5257
-      if max_thinking = @options.try(&.max_thinking_tokens)
-        base_env["MAX_THINKING_TOKENS"] = max_thinking.to_s
+      if @options.try(&.include_partial_messages?)
+        base_env["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
       end
 
       # User identifier for tracking
@@ -107,13 +107,23 @@ module ClaudeAgent
       @running = false
     end
 
-    def send_prompt(prompt : String, parent_tool_use_id : String? = nil)
+    def send_prompt(prompt : String, parent_tool_use_id : String? = nil, *, uuid : String? = nil)
       message = Hash(String, String | Hash(String, String) | Nil).new
       message["type"] = "user"
       message["message"] = {"role" => "user", "content" => prompt}
-      message["parent_tool_use_id"] = parent_tool_use_id
+      message["parent_tool_use_id"] = parent_tool_use_id if parent_tool_use_id
+      message["uuid"] = uuid if uuid
 
       send_json(message)
+    end
+
+    def send_user_message(
+      content : String,
+      parent_tool_use_id : String? = nil,
+      *,
+      uuid : String? = nil,
+    )
+      send_prompt(content, parent_tool_use_id, uuid: uuid)
     end
 
     def send_json(message)
@@ -184,6 +194,24 @@ module ClaudeAgent
       end
     end
 
+    private def start_stderr_drain
+      stderr = @error
+      return unless stderr
+
+      stderr_callback = @options.try(&.stderr)
+
+      spawn do
+        begin
+          stderr.each_line do |line|
+            if cb = stderr_callback
+              cb.call(line)
+            end
+          end
+        rescue IO::Error
+        end
+      end
+    end
+
     private def find_cli_path : String
       @options.try(&.cli_path) || "claude"
     end
@@ -206,11 +234,13 @@ module ClaudeAgent
       opts.model.try { |model| args << "--model" << model }
       opts.fallback_model.try { |model| args << "--fallback-model" << model }
 
-      args << "--permission-mode" << permission_mode_value(opts.permission_mode)
+      args << "--permission-mode" << opts.permission_mode.to_cli_value
       args << "--allow-dangerously-skip-permissions" if opts.allow_dangerously_skip_permissions?
 
       add_system_prompt_args(args, opts)
+      add_thinking_args(args, opts)
 
+      opts.max_turns.try { |turns| args << "--max-turns" << turns.to_s }
       opts.max_budget_usd.try { |budget| args << "--max-budget-usd" << budget.to_s }
       opts.betas.try { |betas| args << "--betas" << betas.join(" ") }
     end
@@ -227,14 +257,47 @@ module ClaudeAgent
       opts.append_system_prompt.try { |append| args << "--append-system-prompt" << append }
     end
 
+    # Delegated to PermissionMode#to_cli_value for shared use
     private def permission_mode_value(mode : PermissionMode) : String
-      case mode
-      when PermissionMode::Default           then "default"
-      when PermissionMode::AcceptEdits       then "acceptEdits"
-      when PermissionMode::Plan              then "plan"
-      when PermissionMode::BypassPermissions then "bypassPermissions"
-      else                                        "default"
+      mode.to_cli_value
+    end
+
+    private def effort_value(effort : Effort) : String
+      case effort
+      when Effort::Low    then "low"
+      when Effort::Medium then "medium"
+      when Effort::High   then "high"
+      when Effort::Max    then "max"
+      else                     "medium"
       end
+    end
+
+    private def add_thinking_args(args : Array(String), opts : AgentOptions)
+      resolved_max_thinking_tokens = resolve_max_thinking_tokens(opts)
+      resolved_max_thinking_tokens.try do |tokens|
+        args << "--max-thinking-tokens" << tokens.to_s
+      end
+
+      opts.effort.try do |effort|
+        args << "--effort" << effort_value(effort)
+      end
+    end
+
+    private def resolve_max_thinking_tokens(opts : AgentOptions) : Int32?
+      resolved = opts.max_thinking_tokens
+
+      if thinking = opts.thinking
+        case thinking
+        when ThinkingConfigAdaptive
+          resolved ||= 32_000
+        when ThinkingConfigEnabled
+          resolved = thinking.budget_tokens
+        when ThinkingConfigDisabled
+          resolved = 0
+        end
+      end
+
+      resolved
     end
 
     private def add_tool_args(args : Array(String), opts : AgentOptions)
@@ -408,6 +471,8 @@ module ClaudeAgent
       # Streaming options
       args << "--include-partial-messages" if opts.include_partial_messages?
       args << "--replay-user-messages" if opts.replay_user_messages?
+      args << "--enable-file-checkpointing" if opts.enable_file_checkpointing?
+      opts.permission_prompt_tool_name.try { |name| args << "--permission-prompt-tool-name" << name }
 
       # Structured output via JSON schema
       add_output_format_args(args, opts)
