@@ -7,21 +7,17 @@
 require "../src/claude-agent-cr"
 
 begin
-  # PreToolUse hook - block dangerous commands
-  block_dangerous = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
-    if input.tool_name == "Bash"
-      command = input.tool_input.try(&.["command"]?.try(&.as_s)) || ""
-      if command.includes?("rm") || command.includes?("sudo")
-        puts "[PreToolUse] BLOCKED: #{command}"
-        puts "  tool_use_id: #{input.tool_use_id}"
-        return ClaudeAgent::HookResult.deny("Dangerous command blocked by policy.")
-      end
-    end
-    ClaudeAgent::HookResult.allow
-  }
+  demo_file = File.join(Dir.current, "permission_request_demo.txt")
+  hook_hits = [] of Bool
+
+  puts "PermissionRequest hook demo"
+  puts "=" * 50
+  puts "If your Claude permissions already auto-approve this action, the hook may not fire."
+  puts
 
   # PermissionRequest hook - log permission events
   log_permissions = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+    hook_hits << true
     puts "[PermissionRequest] Tool: #{input.tool_name}"
     puts "  tool_use_id: #{input.tool_use_id}"
     puts "  session_id: #{input.session_id}"
@@ -29,13 +25,12 @@ begin
     if suggestions = input.permission_suggestions
       puts "  suggestions: #{suggestions.map(&.to_json).join(", ")}"
     end
-    ClaudeAgent::HookResult.allow
+    ClaudeAgent::HookResult.permission_request({
+      "type" => JSON::Any.new("allow"),
+    })
   }
 
   hooks = ClaudeAgent::HookConfig.new(
-    pre_tool_use: [
-      ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_dangerous]),
-    ],
     permission_request: [
       ClaudeAgent::HookMatcher.new(hooks: [log_permissions]),
     ],
@@ -44,10 +39,11 @@ begin
   options = ClaudeAgent::AgentOptions.new(
     hooks: hooks,
     permission_mode: ClaudeAgent::PermissionMode::Default,
+    allowed_tools: ["Write"],
   )
 
   ClaudeAgent::AgentClient.open(options) do |client|
-    client.query("Run 'echo hello world' in the terminal")
+    client.query("Write the text 'permission hook demo' to permission_request_demo.txt and then say done.")
 
     client.each_response do |message|
       case message
@@ -58,6 +54,14 @@ begin
       end
     end
   end
+
+  if hook_hits.empty?
+    puts
+    puts "PermissionRequest did not fire in this run."
+    puts "Your current Claude permission settings likely auto-approved the action before a prompt was needed."
+  end
 rescue ex
   puts "Error: #{ex.message}"
+ensure
+  File.delete(demo_file) if demo_file && File.exists?(demo_file)
 end

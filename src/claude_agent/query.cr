@@ -19,7 +19,7 @@ module ClaudeAgent
         block.call(message)
         if message.is_a?(ResultMessage)
           result = message
-          break
+          break unless options.try(&.prompt_suggestions?)
         end
       end
 
@@ -64,6 +64,12 @@ module ClaudeAgent
       else
         stop
       end
+    end
+
+    # Stop the iterator and underlying CLI process early
+    def close
+      @client.stop
+      @channel.close unless @channel.closed?
     end
 
     private def start_if_needed

@@ -23,6 +23,28 @@ describe ClaudeAgent::StreamingSession do
     end
   end
 
-  # Note: Integration tests requiring actual CLI would go here,
-  # but are skipped in unit tests to avoid external dependencies
+  it "does not raise when close is called without start" do
+    session = ClaudeAgent::StreamingSession.new
+    session.close
+    session.running?.should be_false
+  end
+
+  it "does not raise when close is called twice" do
+    session = ClaudeAgent::StreamingSession.new
+    session.close
+    session.close
+    session.running?.should be_false
+  end
+end
+
+describe ClaudeAgent::QueryIterator do
+  it "initializes without starting" do
+    iterator = ClaudeAgent::QueryIterator.new("hello", nil)
+    iterator.should be_a(Iterator(ClaudeAgent::Message))
+  end
+
+  it "can be closed before starting" do
+    iterator = ClaudeAgent::QueryIterator.new("hello", nil)
+    iterator.close
+  end
 end

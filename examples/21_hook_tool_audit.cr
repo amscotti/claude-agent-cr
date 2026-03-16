@@ -1,8 +1,8 @@
 # Hook Tool Audit Example
 #
 # Demonstrates PostToolUse and PostToolUseFailure hooks for
-# auditing tool executions. Shows the new event-specific fields:
-# tool_use_id, tool_input, tool_response, error, is_interrupt.
+# auditing tool executions. Shows event-specific fields such as
+# tool_use_id, tool_input, error, and is_interrupt.
 
 require "../src/claude-agent-cr"
 
@@ -14,7 +14,8 @@ begin
     if tool_input = input.tool_input
       puts "  input: #{tool_input.to_json}"
     end
-    # tool_result and tool_response are both available (same value)
+    # Some tools return textual output directly; when that happens,
+    # tool_result/tool_response can be inspected here.
     if result = input.tool_result
       preview = result.size > 100 ? "#{result[0..100]}..." : result
       puts "  result: #{preview}"

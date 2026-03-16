@@ -17,9 +17,12 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **Preset Types**: Type-safe presets for system prompts and tools to prevent typos.
 *   **Type-Safe Schemas**: Crystal's answer to Zod - generate JSON schemas from types.
 *   **Structured Outputs**: Get validated JSON responses matching your schema.
+*   **Dynamic Controls**: Change model and permission mode live, inspect MCP status, and stop tasks.
+*   **Server Info**: Access CLI initialization metadata like commands and output styles.
 *   **Subagents**: Define specialized agents that can be spawned for focused subtasks.
 *   **Hooks & Permissions**: Granular control over what the agent is allowed to do with full hook support (PreToolUse, PostToolUse, PreCompact, Notification, etc.).
 *   **Session Management**: Resume, fork, and continue conversations with precise message-level resume.
+*   **Session History**: List saved sessions and inspect transcript messages.
 *   **File Checkpointing**: Track and rewind file changes.
 *   **Sandbox Support**: Configure sandboxed execution environments.
 *   **Extended Thinking**: Control thinking tokens for complex reasoning.
@@ -41,7 +44,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.3.0
+        version: ~> 0.4.0
     ```
 
 2.  Run `shards install`
@@ -95,6 +98,142 @@ ClaudeAgent::AgentClient.open do |client|
   client.each_response do |message|
     # ... handle responses
   end
+end
+```
+
+### Dynamic Controls
+
+Change live session settings while an `AgentClient` is connected.
+
+```crystal
+ClaudeAgent::AgentClient.open do |client|
+  client.query("Review this repository")
+  client.each_response { |message| puts message }
+
+  client.set_permission_mode(ClaudeAgent::PermissionMode::Plan)
+  client.set_model("claude-sonnet-4-5")
+
+  status = client.get_mcp_status
+  puts "Configured MCP servers: #{status.mcp_servers.size}"
+
+  # Apply flag settings, generate a title, toggle proactive mode
+  client.apply_flag_settings({"verbose" => JSON::Any.new(true)})
+  title = client.generate_session_title("Repository review session", persist: true)
+  puts "Generated title: #{title}"
+  client.set_proactive(true)
+  client.enable_remote_control(true)
+end
+```
+
+### Rich Event Messages
+
+Streaming clients can react to typed init, task, rate-limit, prompt-suggestion,
+elicitation-complete, and fallback event messages.
+
+```crystal
+ClaudeAgent::AgentClient.open do |client|
+  client.query("Inspect this repository and suggest one test improvement")
+
+  client.each_response do |message|
+    case message
+    when ClaudeAgent::InitMessage
+      puts "Output style: #{message.output_style}"
+      puts "Slash commands: #{message.slash_commands.join(", ")}"
+    when ClaudeAgent::TaskStartedMessage
+      puts "Task started: #{message.description}"
+    when ClaudeAgent::TaskProgressMessage
+      puts "Task tokens: #{message.usage.total_tokens}"
+    when ClaudeAgent::TaskNotificationMessage
+      puts "Task status: #{message.status}"
+    when ClaudeAgent::RateLimitEvent
+      puts "Rate limit status: #{message.rate_limit_info.status}"
+    when ClaudeAgent::ElicitationCompleteMessage
+      puts "Elicitation complete for #{message.mcp_server_name}"
+    when ClaudeAgent::PromptSuggestionMessage
+      puts "Suggestion: #{message.suggestion}"
+    when ClaudeAgent::UnknownMessage
+      puts "Unknown event type: #{message.type}"
+    end
+  end
+end
+```
+
+### Server Info
+
+Inspect the Claude CLI initialization metadata for available commands and output styles.
+`get_server_info` returns a typed `ClaudeAgent::ServerInfo` wrapper.
+`AgentClient#supported_agents` and `AgentClient#supported_commands` provide
+small convenience helpers over that metadata.
+
+```crystal
+ClaudeAgent::AgentClient.open do |client|
+  if info = client.get_server_info
+    puts "Commands available: #{info.commands.size}"
+    puts "Output style: #{info.output_style || "default"}"
+    puts "Supported agents: #{client.supported_agents.map(&.name).join(", ")}"
+  end
+end
+```
+
+### Settings And Async Message Controls
+
+Inspect effective settings, receive prompt suggestions, and cancel a queued user message.
+
+```crystal
+ClaudeAgent::AgentClient.open(ClaudeAgent::AgentOptions.new(prompt_suggestions: true)) do |client|
+  settings = client.settings
+  applied = settings["applied"]?.try(&.as_h?)
+  puts "Model: #{applied.try(&.["model"]?.try(&.as_s?)) || "(unknown)"}"
+
+  queued_uuid = UUID.random.to_s
+  client.query("Answer with exactly: FIRST")
+  client.send_user_message("Queued follow-up", uuid: queued_uuid)
+  puts "Cancelled: #{client.cancel_async_message(queued_uuid)}"
+end
+```
+
+### MCP Elicitation
+
+Handle MCP user-input requests programmatically when a server requires form or URL-based auth.
+
+```crystal
+hooks = ClaudeAgent::HookConfig.new(
+  elicitation: [->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+    puts "Elicitation from #{input.mcp_server_name}: #{input.elicitation_message}"
+    ClaudeAgent::HookResult.elicitation("decline")
+  }],
+)
+
+options = ClaudeAgent::AgentOptions.new(
+  hooks: hooks,
+  on_elicitation: ->(request : ClaudeAgent::ElicitationRequest) {
+    request.mode == "url" ? ClaudeAgent::ElicitationResponse.decline : ClaudeAgent::ElicitationResponse.accept
+  },
+)
+```
+
+### Hook And Permission Overrides
+
+Hooks and permission callbacks can now return runtime modifications that the CLI honors.
+
+```crystal
+rewrite_bash = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+  if input.tool_name == "Bash"
+    ClaudeAgent::HookResult.allow_with_input({
+      "command" => JSON::Any.new("pwd"),
+    })
+  else
+    ClaudeAgent::HookResult.allow
+  end
+}
+
+hooks = ClaudeAgent::HookConfig.new(
+  pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [rewrite_bash])],
+)
+
+ClaudeAgent::AgentClient.open(ClaudeAgent::AgentOptions.new(hooks: hooks)) do |client|
+  client.query("Use Bash to run ls -la")
+  client.each_response { |message| puts message }
 end
 ```
 
@@ -273,6 +412,8 @@ Intercept tool usage to block or modify actions. All hook inputs include common 
 | **PostToolUse** | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response` |
 | **PostToolUseFailure** | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt` |
 | **PermissionRequest** | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions` |
+| **Elicitation** | `mcp_server_name`, `elicitation_message`, `elicitation_mode`, `elicitation_url`, `elicitation_id`, `requested_schema` |
+| **ElicitationResult** | `mcp_server_name`, `elicitation_action`, `elicitation_content`, `elicitation_id` |
 | **PreCompact** | `trigger`, `custom_instructions` |
 | **Notification** | `notification_message`, `notification_title`, `notification_type` |
 | **UserPromptSubmit** | `user_prompt` |
@@ -281,6 +422,11 @@ Intercept tool usage to block or modify actions. All hook inputs include common 
 | **SubagentStop** | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
 | **SessionStart** | `source` ("startup", "resume", "clear", "compact") |
 | **SessionEnd** | `session_end_reason` ("clear", "logout", etc.) |
+
+For local hook callbacks, `permission_mode` is normalized to the CLI-style values such as
+`default`, `acceptEdits`, `plan`, and `bypassPermissions`.
+
+`HookMatcher` also supports an optional `timeout` value in seconds for control-protocol hook registrations.
 
 ```crystal
 # Block 'rm' commands (PreToolUse with tool_use_id)
@@ -309,7 +455,7 @@ pre_compact_handler = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : Cl
 }
 
 hooks = ClaudeAgent::HookConfig.new(
-  pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_rm])],
+  pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [block_rm], timeout: 15.0)],
   post_tool_use: [ClaudeAgent::HookMatcher.new(hooks: [audit_hook])],
   pre_compact: [pre_compact_handler],
 )
@@ -436,6 +582,42 @@ options = ClaudeAgent::AgentOptions.new(
 )
 ```
 
+### Session History
+
+List saved sessions and read the top-level user/assistant messages from a transcript.
+You can also look up a single session and mutate session metadata.
+
+```crystal
+# List recent sessions for the current project
+sessions = ClaudeAgent.list_sessions(directory: Dir.current, limit: 10)
+sessions.each do |session|
+  puts "#{session.summary} (#{session.session_id})"
+end
+
+# Read messages from a specific session transcript
+messages = ClaudeAgent.get_session_messages(
+  "session-uuid-here",
+  directory: Dir.current,
+  limit: 20,
+  offset: 0
+)
+
+messages.each do |message|
+  puts "#{message.type}: #{message.message[\"content\"]?}"
+end
+
+# Look up one session directly
+info = ClaudeAgent.get_session_info("session-uuid-here", directory: Dir.current)
+puts info.try(&.summary)
+
+# Rename or tag a session
+ClaudeAgent.rename_session("session-uuid-here", "Refactor investigation", directory: Dir.current)
+ClaudeAgent.tag_session("session-uuid-here", "experiment", directory: Dir.current)
+
+# Clear a tag
+ClaudeAgent.tag_session("session-uuid-here", nil, directory: Dir.current)
+```
+
 ### File Checkpointing
 
 Track and rewind file changes.
@@ -485,19 +667,25 @@ options = ClaudeAgent::AgentOptions.new(
 
 ### Extended Thinking
 
-Control thinking tokens for complex reasoning tasks.
+Control extended thinking behavior with either the legacy `max_thinking_tokens`
+option or the newer typed `thinking` config plus `effort`.
 
 ```crystal
 options = ClaudeAgent::AgentOptions.new(
   model: "claude-sonnet-4-5-20250929",
-  max_thinking_tokens: 10000,  # Minimum 1024
-  betas: ["extended-thinking-2025-01-24"]
+  thinking: ClaudeAgent::ThinkingConfig.enabled(10_000),
+  effort: ClaudeAgent::Effort::High,
+)
+
+# Legacy fallback still works
+legacy = ClaudeAgent::AgentOptions.new(
+  max_thinking_tokens: 10_000,
 )
 ```
 
 ## Status
 
-> Tested with Claude Code CLI **v2.1.29**
+> Tested with Claude Code CLI **v2.1.71**
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -511,9 +699,15 @@ options = ClaudeAgent::AgentOptions.new(
 | Subagents | ✅ Working | Spawning specialized agents for focused subtasks |
 | Structured Outputs | ✅ Working | JSON schema validation |
 | Session Management | ✅ Working | Resume, fork, continue, resume_session_at |
+| Dynamic Controls | ✅ Working | Model, permissions, MCP status, flag settings, remote control, proactive mode, session titles |
+| Server Info | ✅ Working | Access initialization metadata like commands and output styles |
+| Rich Event Messages | ✅ Working | Typed init/task/rate-limit/prompt-suggestion/elicitation events plus unknown-message fallback |
+| Hook Propagation | ✅ Working | Hook callbacks can modify inputs and return CLI hook outputs |
+| Permission Propagation | ✅ Working | Permission callbacks can update input, permissions, and interrupt |
+| Session History | ✅ Working | List, inspect, rename, and tag local sessions |
 | File Checkpointing | ✅ Working | Track and rewind file changes |
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
-| Extended Thinking | ✅ Working | max_thinking_tokens support |
+| Extended Thinking | ✅ Working | `thinking`, `effort`, and `max_thinking_tokens` support |
 | Unknown Content Types | ✅ Working | Graceful handling of future content block types |
 | Compact Boundary | ✅ Working | Detect when CLI compacts session history |
 
@@ -555,7 +749,8 @@ client.interrupt  # Signal the CLI to stop current operation
 
 ### Thinking Content Access
 
-For extended thinking models:
+For extended thinking models, `ResultMessage.stop_reason` is also available
+to inspect why the turn ended.
 
 ```crystal
 when ClaudeAgent::AssistantMessage
@@ -567,10 +762,33 @@ when ClaudeAgent::AssistantMessage
       puts "Redacted thinking (signature present)"
     end
   end
+when ClaudeAgent::ResultMessage
+  puts "Stop reason: #{message.stop_reason}"
 end
 ```
 
+When `include_partial_messages` is enabled, the SDK also opts into
+fine-grained tool streaming so `StreamEvent` payloads can include incremental
+delta events such as `content_block_delta` and `input_json_delta` when the CLI
+emits them.
+
 ## Changelog
+
+### 0.4.0
+
+- **New**: Session history helpers: `ClaudeAgent.list_sessions`, `ClaudeAgent.get_session_info`, and `ClaudeAgent.get_session_messages`
+- **New**: Session metadata mutation helpers: `ClaudeAgent.rename_session` and `ClaudeAgent.tag_session`
+- **New**: Dynamic control APIs: `set_permission_mode`, `set_model`, `get_mcp_status`, `reconnect_mcp_server`, `toggle_mcp_server`, `stop_task`, `apply_flag_settings`, `enable_remote_control`, `set_proactive`, `generate_session_title`
+- **New**: `get_server_info` for initialization metadata like commands and output styles
+- **New**: Richer system/event message typing: `InitMessage`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage`, `UnknownMessage`
+- **New**: Typed `RateLimitEvent` and `RateLimitInfo`
+- **Improved**: `include_partial_messages` now enables fine-grained tool streaming for richer `StreamEvent` deltas
+- **New**: TypeScript-parity `prompt_suggestions`, `PromptSuggestionMessage`, `settings`, and `cancel_async_message`
+- **New**: TypeScript-parity MCP elicitation callbacks, hook events, and `ElicitationCompleteMessage`
+- **New**: Typed thinking config support (`thinking`, `effort`) and `ResultMessage.stop_reason`
+- **New**: Optional live E2E specs covering dynamic controls, session history, hook overrides, task events, structured output, and typed init metadata
+- **Improved**: Hook matcher timeout support and initialization payload parity for hooks and agents
+- **Improved**: Hook and permission callbacks now propagate runtime updates through the CLI control protocol
 
 ### 0.3.0
 
@@ -597,17 +815,48 @@ end
 
 ## Verified Examples
 
-The following examples have been tested and verified with CLI v2.1.29:
+The following examples have been tested and verified with CLI v2.1.71:
 
 - One-shot queries and streaming (examples 01, 02, 03)
 - Tool restrictions and permission modes (examples 04, 05)
-- In-process SDK MCP servers with custom tools (example 06)
-- Streaming responses with multi-tool use (example 09)
+- Permission callbacks and SDK MCP servers (examples `06_permission_callback`, `06_sdk_mcp_server`)
+- Interactive sessions, permission handling, and chat flows (examples 07, 08, 09, 10)
 - Local tool definitions and MCP server testing (examples 11, 12)
-- Hooks for blocking dangerous commands (example 13)
+- Hooks, audit hooks, and lifecycle hooks (examples 13, 20, 21, 22, 28)
 - V2 streaming sessions (example 14)
-- Subagents with multi-turn tool use (example 15)
+- Subagents and rich task events (examples 15, 27)
 - Structured JSON output (example 16)
+- Playwright MCP integration (example 17)
+- Session history, dynamic controls, and server info (examples 25, 26, 29)
+- Session mutation APIs (example 30)
+- Prompt suggestions and async message controls (example 31)
+- MCP elicitation callback surface (example 32)
+
+Examples with environment-dependent behavior:
+
+- `examples/18_mcp_github.cr` requires `GITHUB_TOKEN`
+- `examples/19_mcp_remote.cr` depends on remote MCP availability
+- `examples/23_hook_permission_request.cr` only shows the hook when Claude would actually prompt for permission in the current environment
+- `examples/32_elicitation_support.cr` requires `ELICITATION_MCP_URL` and a compatible MCP server that actually requests user input
+
+Quick guide:
+
+- Best local/default examples: `01`, `02`, `07`, `14`, `16`, `25`, `26`, `27`, `28`, `29`, `31`
+- Best hook-focused examples: `13`, `20`, `21`, `22`, `23`, `28`
+- Best MCP-focused examples: `06_sdk_mcp_server`, `12`, `17`, `18`, `19`
+
+## Optional Live E2E Specs
+
+The main spec suite is deterministic and does not require a live Claude connection.
+For parity-critical live checks against the real Claude CLI, run:
+
+```bash
+CLAUDE_AGENT_RUN_E2E=1 crystal spec spec/e2e_spec.cr
+```
+
+These optional E2E specs cover live initialization metadata, dynamic controls,
+session history, hook-based tool input overrides, rich task events,
+structured outputs, and typed init-message metadata.
 
 ## Contributing
 

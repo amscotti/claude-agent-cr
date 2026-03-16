@@ -15,6 +15,8 @@ module ClaudeAgent
     SessionEnd         # Session termination
     Notification       # Agent status notifications
     PermissionRequest  # When permission dialog would appear
+    Elicitation        # When an MCP server asks for user input
+    ElicitationResult  # After the user responds to an MCP elicitation
   end
 
   # Forward declaration for types used in callback
@@ -30,13 +32,20 @@ module ClaudeAgent
   struct HookMatcher
     property matcher : String? # Regex pattern for tool names
     property hooks : Array(HookCallback)
+    property timeout : Float64?
+    @compiled_matcher : Regex?
 
-    def initialize(@matcher : String? = nil, @hooks : Array(HookCallback) = [] of HookCallback)
+    def initialize(
+      @matcher : String? = nil,
+      @hooks : Array(HookCallback) = [] of HookCallback,
+      @timeout : Float64? = nil,
+    )
+      @compiled_matcher = @matcher.try { |pattern| Regex.new(pattern) }
     end
 
     def matches?(tool_name : String) : Bool
-      if matcher = @matcher
-        Regex.new(matcher).matches?(tool_name)
+      if matcher = @compiled_matcher
+        matcher.matches?(tool_name)
       else
         true
       end
@@ -48,6 +57,8 @@ module ClaudeAgent
     property post_tool_use : Array(HookMatcher)?
     property post_tool_use_failure : Array(HookMatcher)?
     property permission_request : Array(HookMatcher)?
+    property elicitation : Array(HookCallback)?
+    property elicitation_result : Array(HookCallback)?
     property user_prompt_submit : Array(HookCallback)?
     property stop : Array(HookCallback)?
     property subagent_start : Array(HookCallback)?
@@ -62,6 +73,8 @@ module ClaudeAgent
       @post_tool_use : Array(HookMatcher)? = nil,
       @post_tool_use_failure : Array(HookMatcher)? = nil,
       @permission_request : Array(HookMatcher)? = nil,
+      @elicitation : Array(HookCallback)? = nil,
+      @elicitation_result : Array(HookCallback)? = nil,
       @user_prompt_submit : Array(HookCallback)? = nil,
       @stop : Array(HookCallback)? = nil,
       @subagent_start : Array(HookCallback)? = nil,
@@ -114,6 +127,15 @@ module ClaudeAgent
     property session_end_reason : String? # "clear" | "logout" | "prompt_input_exit" | etc.
     # PermissionRequest fields
     property permission_suggestions : Array(JSON::Any)?
+    # Elicitation / ElicitationResult fields
+    property mcp_server_name : String?
+    property elicitation_message : String?
+    property elicitation_mode : String?
+    property elicitation_url : String?
+    property elicitation_id : String?
+    property requested_schema : Hash(String, JSON::Any)?
+    property elicitation_action : String?
+    property elicitation_content : Hash(String, JSON::Any)?
 
     def initialize(
       @session_id : String? = nil,
@@ -141,6 +163,14 @@ module ClaudeAgent
       @source : String? = nil,
       @session_end_reason : String? = nil,
       @permission_suggestions : Array(JSON::Any)? = nil,
+      @mcp_server_name : String? = nil,
+      @elicitation_message : String? = nil,
+      @elicitation_mode : String? = nil,
+      @elicitation_url : String? = nil,
+      @elicitation_id : String? = nil,
+      @requested_schema : Hash(String, JSON::Any)? = nil,
+      @elicitation_action : String? = nil,
+      @elicitation_content : Hash(String, JSON::Any)? = nil,
     )
     end
   end
@@ -158,15 +188,23 @@ module ClaudeAgent
     property hook_event_name : String
     property permission_decision : String? # "allow" | "deny" | "ask"
     property permission_decision_reason : String?
+    property decision : Hash(String, JSON::Any)?      # PermissionRequest decision payload
     property updated_input : Hash(String, JSON::Any)? # Modified tool input
     property additional_context : String?             # Additional context for Claude
+    property updated_mcp_tool_output : JSON::Any?
+    property action : String?
+    property content : Hash(String, JSON::Any)?
 
     def initialize(
       @hook_event_name : String,
       @permission_decision : String? = nil,
       @permission_decision_reason : String? = nil,
+      @decision : Hash(String, JSON::Any)? = nil,
       @updated_input : Hash(String, JSON::Any)? = nil,
       @additional_context : String? = nil,
+      @updated_mcp_tool_output : JSON::Any? = nil,
+      @action : String? = nil,
+      @content : Hash(String, JSON::Any)? = nil,
     )
     end
   end
@@ -194,6 +232,7 @@ module ClaudeAgent
       new
     end
 
+    # Deny tool execution. Intended for PreToolUse hooks.
     def self.deny(reason : String) : HookResult
       new(
         continue: false,
@@ -207,7 +246,7 @@ module ClaudeAgent
       )
     end
 
-    # Allow with modified input
+    # Allow with modified input. Intended for PreToolUse hooks.
     def self.allow_with_input(updated_input : Hash(String, JSON::Any)) : HookResult
       new(
         hook_specific_output: HookSpecificOutput.new(
@@ -218,13 +257,42 @@ module ClaudeAgent
       )
     end
 
-    # Allow with additional context for Claude
+    # Allow with additional context for Claude. Intended for PreToolUse hooks.
     def self.allow_with_context(context : String) : HookResult
       new(
         hook_specific_output: HookSpecificOutput.new(
           hook_event_name: "PreToolUse",
           permission_decision: "allow",
           additional_context: context
+        )
+      )
+    end
+
+    def self.permission_request(decision : Hash(String, JSON::Any)) : HookResult
+      new(
+        hook_specific_output: HookSpecificOutput.new(
+          hook_event_name: "PermissionRequest",
+          decision: decision,
+        )
+      )
+    end
+
+    def self.elicitation(action : String, content : Hash(String, JSON::Any)? = nil) : HookResult
+      new(
+        hook_specific_output: HookSpecificOutput.new(
+          hook_event_name: "Elicitation",
+          action: action,
+          content: content,
+        )
+      )
+    end
+
+    def self.elicitation_result(action : String, content : Hash(String, JSON::Any)? = nil) : HookResult
+      new(
+        hook_specific_output: HookSpecificOutput.new(
+          hook_event_name: "ElicitationResult",
+          action: action,
+          content: content,
         )
       )
     end

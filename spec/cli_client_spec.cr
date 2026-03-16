@@ -18,6 +18,22 @@ class TestableCLIClient < ClaudeAgent::CLIClient
   def test_build_settings_json(opts : ClaudeAgent::AgentOptions) : String?
     build_settings_json(opts)
   end
+
+  def test_build_env : Hash(String, String)?
+    build_env
+  end
+
+  def test_build_cli_args : Array(String)
+    build_cli_args
+  end
+
+  def test_effort_value(effort : ClaudeAgent::Effort) : String
+    effort_value(effort)
+  end
+
+  def test_resolve_max_thinking_tokens(opts : ClaudeAgent::AgentOptions) : Int32?
+    resolve_max_thinking_tokens(opts)
+  end
 end
 
 describe ClaudeAgent::CLIClient do
@@ -109,6 +125,110 @@ describe TestableCLIClient do
     it "converts BypassPermissions to 'bypassPermissions'" do
       client = TestableCLIClient.new
       client.test_permission_mode_value(ClaudeAgent::PermissionMode::BypassPermissions).should eq("bypassPermissions")
+    end
+  end
+
+  describe "#effort_value" do
+    it "converts effort levels to CLI strings" do
+      client = TestableCLIClient.new
+      client.test_effort_value(ClaudeAgent::Effort::Low).should eq("low")
+      client.test_effort_value(ClaudeAgent::Effort::Medium).should eq("medium")
+      client.test_effort_value(ClaudeAgent::Effort::High).should eq("high")
+      client.test_effort_value(ClaudeAgent::Effort::Max).should eq("max")
+    end
+  end
+
+  describe "#resolve_max_thinking_tokens" do
+    it "uses max_thinking_tokens when no thinking config is set" do
+      opts = ClaudeAgent::AgentOptions.new(max_thinking_tokens: 4096)
+      client = TestableCLIClient.new
+      client.test_resolve_max_thinking_tokens(opts).should eq(4096)
+    end
+
+    it "uses adaptive thinking default when no explicit budget is set" do
+      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.adaptive)
+      client = TestableCLIClient.new
+      client.test_resolve_max_thinking_tokens(opts).should eq(32_000)
+    end
+
+    it "preserves explicit max_thinking_tokens for adaptive thinking" do
+      opts = ClaudeAgent::AgentOptions.new(
+        max_thinking_tokens: 16_000,
+        thinking: ClaudeAgent::ThinkingConfig.adaptive,
+      )
+      client = TestableCLIClient.new
+      client.test_resolve_max_thinking_tokens(opts).should eq(16_000)
+    end
+
+    it "uses enabled thinking budget tokens" do
+      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.enabled(12_000))
+      client = TestableCLIClient.new
+      client.test_resolve_max_thinking_tokens(opts).should eq(12_000)
+    end
+
+    it "uses zero tokens when thinking is disabled" do
+      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.disabled)
+      client = TestableCLIClient.new
+      client.test_resolve_max_thinking_tokens(opts).should eq(0)
+    end
+  end
+
+  describe "#build_cli_args" do
+    it "adds max-thinking-tokens and effort flags" do
+      options = ClaudeAgent::AgentOptions.new(
+        thinking: ClaudeAgent::ThinkingConfig.enabled(8192),
+        effort: ClaudeAgent::Effort::High,
+      )
+      client = TestableCLIClient.new(options)
+
+      args = client.test_build_cli_args
+      args.should contain("--max-thinking-tokens")
+      args.should contain("8192")
+      args.should contain("--effort")
+      args.should contain("high")
+    end
+  end
+
+  describe "#build_cli_args with max_turns" do
+    it "adds --max-turns flag" do
+      options = ClaudeAgent::AgentOptions.new(max_turns: 5)
+      client = TestableCLIClient.new(options)
+
+      args = client.test_build_cli_args
+      args.should contain("--max-turns")
+      args.should contain("5")
+    end
+
+    it "adds --enable-file-checkpointing and --permission-prompt-tool-name flags" do
+      options = ClaudeAgent::AgentOptions.new(
+        enable_file_checkpointing: true,
+        permission_prompt_tool_name: "AskUser",
+      )
+      client = TestableCLIClient.new(options)
+
+      args = client.test_build_cli_args
+      args.should contain("--enable-file-checkpointing")
+      args.should contain("--permission-prompt-tool-name")
+      args.should contain("AskUser")
+    end
+  end
+
+  describe "#build_env" do
+    it "sets fine-grained tool streaming env var when partial messages are enabled" do
+      options = ClaudeAgent::AgentOptions.new(include_partial_messages: true)
+      client = TestableCLIClient.new(options)
+
+      env = client.test_build_env
+      env.should_not be_nil
+      env.try(&.["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"]?).try(&.should eq("1"))
+    end
+
+    it "does not set fine-grained tool streaming env var by default" do
+      client = TestableCLIClient.new(ClaudeAgent::AgentOptions.new)
+
+      env = client.test_build_env
+      env.should_not be_nil
+      env.try(&.["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"]?).should be_nil
     end
   end
 

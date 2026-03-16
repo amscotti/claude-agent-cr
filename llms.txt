@@ -1,8 +1,8 @@
 # Claude Agent SDK for Crystal
 
-> An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, and perform complex multi-step workflows.
+> An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, stream events, manage sessions, and perform complex multi-step workflows.
 >
-> Tested with Claude Code CLI **v2.1.29**. All features verified working.
+> Tested with Claude Code CLI **v2.1.71**. Core features, examples, and optional live E2E coverage are up to date.
 
 This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official Claude Code Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
 
@@ -12,22 +12,33 @@ This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using 
 - V2 streaming interface with send/receive patterns
 - Type-safe JSON Schema builder (Crystal's answer to Zod)
 - Structured outputs with JSON schema validation
+- Dynamic controls (`set_permission_mode`, `set_model`, `get_mcp_status`, `reconnect_mcp_server`, `toggle_mcp_server`, `stop_task`, `apply_flag_settings`, `enable_remote_control`, `set_proactive`, `generate_session_title`)
+- Server initialization metadata via `get_server_info`
+- Convenience helpers for supported agents/commands from initialization metadata
 - Custom tool definitions with MCP server support (stdio, HTTP, SSE)
 - In-process SDK MCP servers with control protocol (same as official SDKs)
 - Preset types for system prompt and tools (ToolsPreset, SystemPromptPreset)
 - Subagent definitions for specialized tasks
+- Rich event messages (`InitMessage`, task lifecycle messages, `RateLimitEvent`, compact boundary, unknown-message fallback)
 - Full hook support (PreToolUse, PostToolUse, PreCompact, Notification, etc.)
-- Permission management with callbacks
+- Permission management with callbacks and control-protocol propagation
 - Session management (resume, fork, continue, resume_session_at)
+- Session history (`list_sessions`, `get_session_info`, `get_session_messages`)
+- Session metadata mutation (`rename_session`, `tag_session`)
+- Prompt suggestions and async message controls (`prompt_suggestions`, `PromptSuggestionMessage`, `settings`, `cancel_async_message`)
+- MCP elicitation callback surface (`on_elicitation`, Elicitation hooks, `ElicitationCompleteMessage`)
 - File checkpointing and rewind
 - Sandbox configuration
-- Extended thinking support
+- Extended thinking support (`thinking`, `effort`, `max_thinking_tokens`)
+- Fine-grained partial streaming when `include_partial_messages` is enabled
 - Graceful handling of unknown content block types (forward-compatible)
+- Optional live E2E coverage for parity-critical flows
 
 ## Documentation
 
 - [README](https://github.com/amscotti/claude-agent-cr/blob/main/README.md): Installation, usage examples, and API overview
 - [CLAUDE.md](https://github.com/amscotti/claude-agent-cr/blob/main/CLAUDE.md): AI assistant context file with project structure
+- [AGENTS.md](https://github.com/amscotti/claude-agent-cr/blob/main/AGENTS.md): Repo guide for coding agents working in this codebase
 
 ## Core Source Files
 
@@ -36,11 +47,13 @@ This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using 
 - [src/claude_agent/agent_client.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/agent_client.cr): High-level agent client API
 - [src/claude_agent/streaming_session.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/streaming_session.cr): V2 streaming interface
 - [src/claude_agent/query.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/query.cr): One-shot query helper
+- [src/claude_agent/sessions.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/sessions.cr): Session history helpers, metadata mutation, and transcript parsing
 - [src/claude_agent/schema.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/schema.cr): Type-safe JSON Schema builder
 
 ## Type Definitions
 
-- [src/claude_agent/types/messages.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/messages.cr): Message types (AssistantMessage, UserMessage, ResultMessage, etc.)
+- [src/claude_agent/types/messages.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/messages.cr): Message types (AssistantMessage, UserMessage, ResultMessage, InitMessage, task events, etc.)
+- [src/claude_agent/types/server_info.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/server_info.cr): Typed server/init metadata wrappers (`ServerInfo`, commands, models, account)
 - [src/claude_agent/types/content_blocks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/content_blocks.cr): Content block types (TextBlock, ToolUseBlock, etc.)
 - [src/claude_agent/types/options.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/options.cr): AgentOptions and configuration types
 - [src/claude_agent/types/control_messages.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/types/control_messages.cr): Control protocol types for SDK MCP server communication
@@ -142,6 +155,8 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 | SessionStart | Session initialization | `source` |
 | SessionEnd | Session termination | `session_end_reason` |
 
+`HookMatcher` also supports an optional `timeout` value in seconds for control-protocol hook registrations.
+
 ### Compact Boundary Detection
 
 When the CLI compacts a session, it emits a `CompactBoundaryMessage`:
@@ -194,7 +209,7 @@ Common context fields (available on all hook events):
 - `session_id` - Current session identifier
 - `transcript_path` - Path to the JSONL transcript file
 - `cwd` - Current working directory
-- `permission_mode` - Permission mode (e.g., "Default", "BypassPermissions")
+- `permission_mode` - Permission mode (e.g., `default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `hook_event_name` - Hook event name (e.g., "PreToolUse", "PreCompact", "Stop")
 
 Event-specific fields:
@@ -227,14 +242,40 @@ Event-specific fields:
 - [examples/22_hook_precompact.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/22_hook_precompact.cr): PreCompact transcript archiving
 - [examples/23_hook_permission_request.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/23_hook_permission_request.cr): PermissionRequest hook event
 - [examples/24_thinking_interrupt_tool_ids.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/24_thinking_interrupt_tool_ids.cr): Thinking blocks, interrupts, tool ID correlation
+- [examples/25_session_history.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/25_session_history.cr): Session history inspection
+- [examples/26_dynamic_controls.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/26_dynamic_controls.cr): Live model/permission control changes
+- [examples/27_rich_events.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/27_rich_events.cr): Rich init/task/system event handling
+- [examples/28_hook_input_override.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/28_hook_input_override.cr): Hook-based tool input rewrite
+- [examples/29_server_info.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/29_server_info.cr): Initialization metadata / server info
+- [examples/30_session_mutations.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/30_session_mutations.cr): Rename, tag, and inspect saved sessions
+- [examples/31_async_message_controls.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/31_async_message_controls.cr): Prompt suggestions, settings inspection, and queued message cancellation
+- [examples/32_elicitation_support.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/32_elicitation_support.cr): MCP elicitation callbacks and completion events
 
 ## Optional
 
 - [spec/](https://github.com/amscotti/claude-agent-cr/tree/main/spec): Test files
 - [shard.yml](https://github.com/amscotti/claude-agent-cr/blob/main/shard.yml): Crystal shard configuration
 
+## Optional Live E2E
+
+Optional parity-critical live checks can be run with:
+
+```bash
+CLAUDE_AGENT_RUN_E2E=1 crystal spec spec/e2e_spec.cr
+```
+
+These live E2E specs cover:
+
+- Server info and dynamic controls
+- Session history
+- Hook-based tool input overrides
+- Rich task events
+- Structured outputs
+- Typed init-message metadata
+
 ## Version Notes
 
+- **0.4.0**: Session history and mutation APIs, dynamic controls (model, permissions, MCP, flag settings, remote control, proactive mode, session titles), server info, richer task/init/rate-limit/prompt-suggestion/elicitation/unknown message typing, thinking/effort options, `ResultMessage.stop_reason`, fine-grained partial streaming for `include_partial_messages`, prompt suggestions, async message controls, MCP elicitation support, hook/permission propagation parity, hook matcher timeouts, and optional live E2E coverage
 - **0.3.0**: Full hook parity, CompactBoundaryMessage for session compaction detection, all event-specific fields, PermissionRequest hook event
 - **0.2.0**: Added UnknownBlock, Notification hook, resume_session_at, PreCompact hook fields, fixed hook callback dispatch
-- Tested with Claude Code CLI v2.1.29
+- Tested with Claude Code CLI v2.1.71

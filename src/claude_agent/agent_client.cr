@@ -1,18 +1,72 @@
+require "set"
 require "./cli_client"
 require "./hooks"
 require "./types/control_messages"
 
 module ClaudeAgent
   class AgentClient
+    private alias ControlRequestResult = Hash(String, JSON::Any) | Exception
+    private HOOK_NAME_ALIASES = {
+      "PreToolUse"            => "pre_tool_use",
+      "pre_tool_use"          => "pre_tool_use",
+      "PostToolUse"           => "post_tool_use",
+      "post_tool_use"         => "post_tool_use",
+      "PostToolUseFailure"    => "post_tool_use_failure",
+      "post_tool_use_failure" => "post_tool_use_failure",
+      "PermissionRequest"     => "permission_request",
+      "permission_request"    => "permission_request",
+      "Elicitation"           => "elicitation",
+      "elicitation"           => "elicitation",
+      "ElicitationResult"     => "elicitation_result",
+      "elicitation_result"    => "elicitation_result",
+      "Notification"          => "notification",
+      "notification"          => "notification",
+      "PreCompact"            => "pre_compact",
+      "pre_compact"           => "pre_compact",
+      "SubagentStart"         => "subagent_start",
+      "subagent_start"        => "subagent_start",
+      "SubagentStop"          => "subagent_stop",
+      "subagent_stop"         => "subagent_stop",
+      "SessionStart"          => "session_start",
+      "session_start"         => "session_start",
+      "SessionEnd"            => "session_end",
+      "session_end"           => "session_end",
+      "UserPromptSubmit"      => "user_prompt_submit",
+      "user_prompt_submit"    => "user_prompt_submit",
+      "Stop"                  => "stop",
+      "stop"                  => "stop",
+    }
+
+    private struct HookCallbackRegistration
+      getter hook_name : String
+      getter callback : HookCallback
+
+      def initialize(@hook_name : String, @callback : HookCallback)
+      end
+    end
+
     @cli_client : CLIClient
     @message_channel : Channel(Message)
     @response_fiber : Fiber?
+    @pending_control_requests : Hash(String, Channel(ControlRequestResult))
+    @control_request_mutex : Mutex
+    @registered_hook_callbacks : Hash(String, HookCallbackRegistration)
+    @registered_control_hook_events : Set(String)
+    @hook_callback_counter : Int64 = 0
+    @request_counter : Int64 = 0
     @interrupted : Bool = false
     @sdk_init_sent : Bool = false
+    @started : Bool = false
+    @server_info : ServerInfo? = nil
+    @state_mutex : Mutex = Mutex.new
 
-    def initialize(@options : AgentOptions? = nil)
-      @cli_client = CLIClient.new(@options)
+    def initialize(@options : AgentOptions? = nil, cli_client : CLIClient? = nil)
+      @cli_client = cli_client || CLIClient.new(@options)
       @message_channel = Channel(Message).new(100)
+      @pending_control_requests = {} of String => Channel(ControlRequestResult)
+      @control_request_mutex = Mutex.new
+      @registered_hook_callbacks = {} of String => HookCallbackRegistration
+      @registered_control_hook_events = Set(String).new
     end
 
     # Get the current session ID
@@ -20,114 +74,257 @@ module ClaudeAgent
       @cli_client.session_id
     end
 
+    def started? : Bool
+      @state_mutex.synchronize { @started }
+    end
+
     def start
       @cli_client.start
-      @interrupted = false
-      trigger_hook(:session_start)
+      @state_mutex.synchronize do
+        @interrupted = false
+        @started = true
+      end
       start_response_reader
-      # Send SDK MCP server initialization if configured
-      send_sdk_initialization
+      begin
+        send_sdk_initialization
+      rescue ex
+        @state_mutex.synchronize { @started = false }
+        @cli_client.stop
+        @message_channel.close unless @message_channel.closed?
+        raise ex
+      end
+      trigger_hook(:session_start)
     end
 
     # Send SDK MCP server initialization to CLI
     private def send_sdk_initialization
       return if @sdk_init_sent
-      return unless @cli_client.has_sdk_servers?
+      request = {} of String => JSON::Any
+      request["subtype"] = JSON::Any.new("initialize")
 
-      @cli_client.send_sdk_init
+      if @cli_client.has_sdk_servers?
+        request["sdkMcpServers"] = JSON::Any.new(
+          @cli_client.sdk_server_names.map { |name| JSON::Any.new(name) }
+        )
+      end
+
+      if hooks_payload = build_hook_initialize_payload
+        request["hooks"] = JSON::Any.new(hooks_payload)
+      end
+
+      if agents_payload = build_agents_initialize_payload
+        request["agents"] = agents_payload
+      end
+
+      request["promptSuggestions"] = JSON::Any.new(true) if @options.try(&.prompt_suggestions?)
+      request["agentProgressSummaries"] = JSON::Any.new(true) if @options.try(&.agent_progress_summaries?)
+
+      response = send_control_request(request, 90.seconds)
+      @server_info = response.empty? ? nil : ServerInfo.from_data(response)
       @sdk_init_sent = true
     end
 
     def stop
+      @state_mutex.synchronize { @started = false }
       trigger_hook(:session_end)
+      fail_pending_control_requests(ConnectionError.new("Agent client stopped"))
       @cli_client.stop
       @message_channel.close
     end
 
     # Send a query and get responses
-    def query(prompt : String)
+    def query(prompt : String, *, uuid : String? = nil)
       trigger_hook(:user_prompt_submit, prompt)
-      @cli_client.send_prompt(prompt)
+      @cli_client.send_prompt(prompt, uuid: uuid)
+    end
+
+    def cancel_async_message(message_uuid : String) : Bool
+      response = send_control_request({
+        "subtype"      => JSON::Any.new("cancel_async_message"),
+        "message_uuid" => JSON::Any.new(message_uuid),
+      })
+
+      response["cancelled"]?.try(&.as_bool?) == true
     end
 
     # Interrupt a streaming query
     def interrupt
-      return if @interrupted
-      @interrupted = true
+      @state_mutex.synchronize do
+        return if @interrupted
+        @interrupted = true
+      end
 
-      # Send interrupt message to CLI
       @cli_client.send_message({
-        "type" => "interrupt",
+        "type" => JSON::Any.new("interrupt"),
       })
     end
 
-    # Rewind files to a checkpoint
-    # Requires enable_file_checkpointing: true and replay_user_messages: true
-    def rewind_files(user_message_uuid : String)
-      @cli_client.send_message({
-        "type"              => "rewind_files",
-        "user_message_uuid" => user_message_uuid,
+    # ameba:disable Naming/AccessorMethodName
+    def set_permission_mode(mode : PermissionMode)
+      set_permission_mode(permission_mode_value(mode))
+    end
+
+    # ameba:disable Naming/AccessorMethodName
+    def set_permission_mode(mode : String)
+      send_control_request({
+        "subtype" => JSON::Any.new("set_permission_mode"),
+        "mode"    => JSON::Any.new(mode),
+      })
+    end
+
+    # ameba:disable Naming/AccessorMethodName
+    def set_model(model : String? = nil)
+      request = {
+        "subtype" => JSON::Any.new("set_model"),
+      }
+      request["model"] = model ? JSON::Any.new(model) : JSON::Any.new(nil)
+      send_control_request(request)
+    end
+
+    # ameba:disable Naming/AccessorMethodName
+    def get_mcp_status : MCPStatusResponse
+      response = send_control_request({
+        "subtype" => JSON::Any.new("mcp_status"),
+      })
+
+      response = response.dup
+      response["mcpServers"] ||= JSON::Any.new([] of JSON::Any)
+      MCPStatusResponse.from_json(response.to_json)
+    end
+
+    # ameba:disable Naming/AccessorMethodName
+    def get_server_info : ServerInfo?
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      @server_info
+    end
+
+    def supported_agents : Array(ServerAgentInfo)
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      @server_info.try(&.agents) || [] of ServerAgentInfo
+    end
+
+    def supported_commands : Array(ServerCommand)
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      @server_info.try(&.commands) || [] of ServerCommand
+    end
+
+    def reconnect_mcp_server(server_name : String)
+      send_control_request({
+        "subtype"    => JSON::Any.new("mcp_reconnect"),
+        "serverName" => JSON::Any.new(server_name),
+      })
+    end
+
+    def toggle_mcp_server(server_name : String, enabled : Bool)
+      send_control_request({
+        "subtype"    => JSON::Any.new("mcp_toggle"),
+        "serverName" => JSON::Any.new(server_name),
+        "enabled"    => JSON::Any.new(enabled),
+      })
+    end
+
+    def stop_task(task_id : String)
+      send_control_request({
+        "subtype" => JSON::Any.new("stop_task"),
+        "task_id" => JSON::Any.new(task_id),
+      })
+    end
+
+    def settings : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype" => JSON::Any.new("get_settings"),
+      })
+    end
+
+    def apply_flag_settings(flag_settings : Hash(String, JSON::Any))
+      send_control_request({
+        "subtype"  => JSON::Any.new("apply_flag_settings"),
+        "settings" => JSON::Any.new(flag_settings),
+      })
+    end
+
+    def enable_remote_control(enabled : Bool = true) : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype" => JSON::Any.new("remote_control"),
+        "enabled" => JSON::Any.new(enabled),
+      })
+    end
+
+    # ameba:disable Naming/AccessorMethodName
+    def set_proactive(enabled : Bool)
+      send_control_request({
+        "subtype" => JSON::Any.new("set_proactive"),
+        "enabled" => JSON::Any.new(enabled),
+      })
+    end
+
+    def generate_session_title(description : String, *, persist : Bool = false) : String?
+      response = send_control_request({
+        "subtype"     => JSON::Any.new("generate_session_title"),
+        "description" => JSON::Any.new(description),
+        "persist"     => JSON::Any.new(persist),
+      })
+
+      response["title"]?.try(&.as_s?)
+    end
+
+    # ameba:enable Naming/AccessorMethodName
+
+    # Rewind files to a checkpoint.
+    # Requires enable_file_checkpointing: true and replay_user_messages: true.
+    # Sends via the control protocol (matching the TypeScript SDK).
+    def rewind_files(user_message_id : String, *, dry_run : Bool = false) : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype"         => JSON::Any.new("rewind_files"),
+        "user_message_id" => JSON::Any.new(user_message_id),
+        "dry_run"         => JSON::Any.new(dry_run),
       })
     end
 
     # Iterate over incoming messages
     def each_response(&block : Message ->)
+      result_received = false
+
       loop do
-        message = @message_channel.receive?
+        message = receive_next_message(result_received)
         break unless message
+        next if handle_internal_message(message)
 
-        # Handle control requests from CLI (SDK MCP server routing)
-        if message.is_a?(ControlRequest)
-          handle_control_request(message)
-          next # Control requests are internal, don't pass to user
-        end
-
-        # Ignore control responses (acknowledgments of our requests)
-        if message.is_a?(ControlResponseMessage)
-          next # Control responses are internal, don't pass to user
-        end
-
-        # Handle permissions/hooks
-        if message.is_a?(PermissionRequest)
-          handle_permission_request(message)
-        end
-
-        # Trigger PostToolUse hooks when we see tool results in AssistantMessage
-        if message.is_a?(AssistantMessage)
-          handle_post_tool_use_hooks(message)
-          handle_subagent_hooks(message)
-        end
-
-        # Trigger Stop hook when we receive ResultMessage
-        if message.is_a?(ResultMessage)
-          trigger_stop_hook(message)
-        end
-
+        run_message_hooks(message)
         block.call(message)
 
-        break if message.is_a?(ResultMessage)
+        if result_received
+          break
+        elsif message.is_a?(ResultMessage)
+          result_received = true
+          break unless @options.try(&.prompt_suggestions?)
+        end
       end
     end
 
     # Send a follow-up message
-    def send_user_message(content : String)
+    def send_user_message(content : String, *, uuid : String? = nil)
       trigger_hook(:user_prompt_submit, content)
-      @cli_client.send_message({
-        "type"    => "user",
-        "message" => {"role" => "user", "content" => content},
-      })
+      @cli_client.send_user_message(content, uuid: uuid)
     end
 
     # Send permission response
     def grant_permission(tool_use_id : String, allow : Bool, reason : String? = nil)
-      @cli_client.send_message({
-        "type"        => "permission_response",
-        "tool_use_id" => tool_use_id,
-        "allow"       => allow,
-        "reason"      => reason,
-      })
+      message = Hash(String, String | Bool | Nil).new
+      message["type"] = "permission_response"
+      message["tool_use_id"] = tool_use_id
+      message["allow"] = allow
+      message["reason"] = reason if reason
+      @cli_client.send_json(message)
     end
 
+    # Answer a UserQuestion from the CLI.
+    # Note: The wire format for this response has not been confirmed against the
+    # official SDK protocol. If Claude Code changes the expected shape, this may
+    # need updating.
     def answer_question(uuid : String, answer : String)
       @cli_client.send_message({
         "type"    => "user_response",
@@ -151,15 +348,258 @@ module ClaudeAgent
       @response_fiber = spawn do
         begin
           @cli_client.each_message do |message|
-            break if @message_channel.closed?
+            next if @message_channel.closed?
+
+            if message.is_a?(ControlResponseMessage)
+              handle_control_response(message)
+              next
+            end
+
             @message_channel.send(message)
           end
+        rescue Channel::ClosedError
+          # Expected during shutdown
         rescue ex
-          # Log or handle
+          STDERR.puts "claude-agent-cr: response reader error: #{ex.message}"
         ensure
+          fail_pending_control_requests(ConnectionError.new("Agent client connection closed"))
           @message_channel.close unless @message_channel.closed?
         end
       end
+    end
+
+    private def permission_mode_value(mode : PermissionMode) : String
+      mode.to_cli_value
+    end
+
+    private def receive_post_result_message : Message?
+      select
+      when message = @message_channel.receive?
+        message
+      when timeout(2.seconds)
+        nil
+      end
+    end
+
+    private def receive_next_message(result_received : Bool) : Message?
+      if result_received && @options.try(&.prompt_suggestions?)
+        receive_post_result_message
+      else
+        @message_channel.receive?
+      end
+    end
+
+    private def handle_internal_message(message : Message) : Bool
+      case message
+      when ControlRequest
+        handle_control_request(message)
+        true
+      when ControlResponseMessage
+        true
+      when PermissionRequest
+        handle_permission_request(message)
+        @options.try(&.can_use_tool) || has_permission_hooks? ? true : false
+      else
+        false
+      end
+    end
+
+    private def run_message_hooks(message : Message)
+      case message
+      when AssistantMessage
+        handle_post_tool_use_hooks(message)
+        handle_subagent_hooks(message)
+      when ResultMessage
+        trigger_stop_hook(message)
+      end
+    end
+
+    private def has_permission_hooks? : Bool
+      hooks = @options.try(&.hooks)
+      return false unless hooks
+
+      !hooks.pre_tool_use.nil? || !hooks.permission_request.nil? ||
+        control_hook_registered?("PreToolUse") || control_hook_registered?("PermissionRequest")
+    end
+
+    private def send_control_request(
+      request : Hash(String, JSON::Any),
+      timeout : Time::Span = 60.seconds,
+    ) : Hash(String, JSON::Any)
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      response_channel = Channel(ControlRequestResult).new(1)
+      request_id = register_pending_control_request(response_channel)
+
+      control_request = {
+        "type"       => JSON::Any.new("control_request"),
+        "request_id" => JSON::Any.new(request_id),
+        "request"    => JSON::Any.new(request),
+      }
+
+      @cli_client.send_message(control_request)
+
+      select
+      when result = response_channel.receive
+        case result
+        when Exception
+          raise result
+        when Hash(String, JSON::Any)
+          parse_control_response(result, request)
+        else
+          {} of String => JSON::Any
+        end
+      when timeout(timeout)
+        unregister_pending_control_request(request_id)
+        subtype = request["subtype"]?.try(&.as_s?) || "unknown"
+        raise TimeoutError.new("Control request timeout: #{subtype}")
+      end
+    end
+
+    private def register_pending_control_request(
+      response_channel : Channel(ControlRequestResult),
+    ) : String
+      @control_request_mutex.synchronize do
+        @request_counter += 1
+        request_id = "req_#{@request_counter}"
+        @pending_control_requests[request_id] = response_channel
+        request_id
+      end
+    end
+
+    private def unregister_pending_control_request(
+      request_id : String,
+    ) : Channel(ControlRequestResult)?
+      @control_request_mutex.synchronize do
+        @pending_control_requests.delete(request_id)
+      end
+    end
+
+    private def handle_control_response(message : ControlResponseMessage)
+      request_id = message.response["request_id"]?.try(&.as_s?)
+      return unless request_id
+
+      response_channel = unregister_pending_control_request(request_id)
+      return unless response_channel
+
+      response_channel.send(message.response)
+    rescue Channel::ClosedError
+    end
+
+    private def parse_control_response(
+      response : Hash(String, JSON::Any),
+      request : Hash(String, JSON::Any),
+    ) : Hash(String, JSON::Any)
+      case response["subtype"]?.try(&.as_s?)
+      when "error"
+        message = response["error"]?.try(&.as_s?) || "Control request failed"
+        raise Error.new(message)
+      else
+        response["response"]?.try(&.as_h?) || {} of String => JSON::Any
+      end
+    end
+
+    private def fail_pending_control_requests(error : Exception)
+      channels = @control_request_mutex.synchronize do
+        pending = @pending_control_requests.values
+        @pending_control_requests.clear
+        pending
+      end
+
+      channels.each do |channel|
+        begin
+          channel.send(error)
+        rescue Channel::ClosedError
+        end
+      end
+    end
+
+    private def build_hook_initialize_payload : Hash(String, JSON::Any)?
+      hooks = @options.try(&.hooks)
+      return nil unless hooks
+
+      payload = {} of String => JSON::Any
+
+      add_matcher_hook_payload(payload, "PreToolUse", hooks.pre_tool_use)
+      add_matcher_hook_payload(payload, "PostToolUse", hooks.post_tool_use)
+      add_matcher_hook_payload(payload, "PostToolUseFailure", hooks.post_tool_use_failure)
+      add_matcher_hook_payload(payload, "PermissionRequest", hooks.permission_request)
+      add_simple_hook_payload(payload, "Elicitation", hooks.elicitation)
+      add_simple_hook_payload(payload, "ElicitationResult", hooks.elicitation_result)
+      add_simple_hook_payload(payload, "PreCompact", hooks.pre_compact)
+      add_simple_hook_payload(payload, "Notification", hooks.notification)
+      add_simple_hook_payload(payload, "SubagentStart", hooks.subagent_start)
+      add_simple_hook_payload(payload, "SubagentStop", hooks.subagent_stop)
+      add_simple_hook_payload(payload, "Stop", hooks.stop)
+
+      payload.empty? ? nil : payload
+    end
+
+    private def add_matcher_hook_payload(
+      payload : Hash(String, JSON::Any),
+      hook_name : String,
+      matchers : Array(HookMatcher)?,
+    )
+      return unless matchers
+
+      entries = matchers.compact_map do |matcher|
+        callback_ids = register_hook_callbacks(hook_name, matcher.hooks)
+        next if callback_ids.empty?
+
+        entry = {} of String => JSON::Any
+        if matcher_value = matcher.matcher
+          entry["matcher"] = JSON::Any.new(matcher_value)
+        end
+        matcher.timeout.try { |timeout| entry["timeout"] = JSON::Any.new(timeout) }
+        entry["hookCallbackIds"] = JSON::Any.new(callback_ids.map { |id| JSON::Any.new(id) })
+        JSON::Any.new(entry)
+      end
+
+      return if entries.empty?
+
+      payload[hook_name] = JSON::Any.new(entries)
+      @registered_control_hook_events.add(hook_name)
+    end
+
+    private def add_simple_hook_payload(
+      payload : Hash(String, JSON::Any),
+      hook_name : String,
+      callbacks : Array(HookCallback)?,
+    )
+      return unless callbacks
+
+      callback_ids = register_hook_callbacks(hook_name, callbacks)
+      return if callback_ids.empty?
+
+      entry = {
+        "hookCallbackIds" => JSON::Any.new(callback_ids.map { |id| JSON::Any.new(id) }),
+      }
+
+      payload[hook_name] = JSON::Any.new([JSON::Any.new(entry)])
+      @registered_control_hook_events.add(hook_name)
+    end
+
+    private def register_hook_callbacks(
+      hook_name : String,
+      callbacks : Array(HookCallback),
+    ) : Array(String)
+      callbacks.map do |callback|
+        @hook_callback_counter += 1
+        callback_id = "hook_#{@hook_callback_counter}"
+        @registered_hook_callbacks[callback_id] = HookCallbackRegistration.new(hook_name, callback)
+        callback_id
+      end
+    end
+
+    private def control_hook_registered?(hook_name : String) : Bool
+      @registered_control_hook_events.includes?(hook_name)
+    end
+
+    private def build_agents_initialize_payload : JSON::Any?
+      agents = @options.try(&.agents)
+      return nil unless agents
+
+      JSON.parse(agents.to_json)
     end
 
     # Common context fields for all hook inputs
@@ -167,7 +607,7 @@ module ClaudeAgent
       {
         session_id:      session_id || "unknown",
         cwd:             @options.try(&.cwd),
-        permission_mode: @options.try(&.permission_mode).try(&.to_s),
+        permission_mode: @options.try(&.permission_mode).try { |mode| permission_mode_value(mode) },
         hook_event_name: hook_event_name,
       }
     end
@@ -209,60 +649,9 @@ module ClaudeAgent
 
     private def handle_permission_request(request : PermissionRequest)
       all_hooks = @options.try(&.hooks)
+      return if run_local_pre_tool_use_hooks(all_hooks, request)
+      run_local_permission_request_hooks(all_hooks, request)
 
-      # 1. Run PreToolUse hooks
-      if hooks = all_hooks.try(&.pre_tool_use)
-        hooks.each do |hook_matcher|
-          if hook_matcher.matches?(request.tool_name)
-            common = hook_common_fields("PreToolUse")
-            input = HookInput.new(
-              session_id: common[:session_id],
-              cwd: common[:cwd],
-              permission_mode: common[:permission_mode],
-              hook_event_name: common[:hook_event_name],
-              tool_name: request.tool_name,
-              tool_input: request.tool_input,
-              tool_use_id: request.tool_use_id,
-            )
-
-            ctx = HookContext.new(session_id: common[:session_id])
-
-            hook_matcher.hooks.each do |callback|
-              res = callback.call(input, request.tool_use_id, ctx)
-
-              # If any hook denies, we deny and return (short-circuit)
-              if output = res.hook_specific_output
-                if output.permission_decision == "deny"
-                  grant_permission(request.tool_use_id, false, output.permission_decision_reason)
-                  return
-                end
-              end
-            end
-          end
-        end
-      end
-
-      # 2. Run PermissionRequest hooks
-      if hooks = all_hooks.try(&.permission_request)
-        hooks.each do |hook_matcher|
-          if hook_matcher.matches?(request.tool_name)
-            common = hook_common_fields("PermissionRequest")
-            input = HookInput.new(
-              session_id: common[:session_id],
-              cwd: common[:cwd],
-              permission_mode: common[:permission_mode],
-              hook_event_name: common[:hook_event_name],
-              tool_name: request.tool_name,
-              tool_input: request.tool_input,
-              tool_use_id: request.tool_use_id,
-            )
-            ctx = HookContext.new(session_id: common[:session_id])
-            hook_matcher.hooks.each(&.call(input, request.tool_use_id, ctx))
-          end
-        end
-      end
-
-      # 3. Run User Callback if present
       if callback = @options.try(&.can_use_tool)
         context = PermissionContext.new(
           tool_name: request.tool_name,
@@ -273,6 +662,68 @@ module ClaudeAgent
         result = callback.call(context)
         grant_permission(request.tool_use_id, result.allow?, result.reason)
         return
+      end
+    end
+
+    private def run_local_pre_tool_use_hooks(
+      hooks : HookConfig?,
+      request : PermissionRequest,
+    ) : Bool
+      return false if control_hook_registered?("PreToolUse")
+
+      hooks.try(&.pre_tool_use).try do |matchers|
+        common = hook_common_fields("PreToolUse")
+        input = HookInput.new(
+          session_id: common[:session_id],
+          cwd: common[:cwd],
+          permission_mode: common[:permission_mode],
+          hook_event_name: common[:hook_event_name],
+          tool_name: request.tool_name,
+          tool_input: request.tool_input,
+          tool_use_id: request.tool_use_id,
+        )
+        ctx = HookContext.new(session_id: common[:session_id])
+
+        matchers.each do |hook_matcher|
+          next unless hook_matcher.matches?(request.tool_name)
+
+          hook_matcher.hooks.each do |callback|
+            result = callback.call(input, request.tool_use_id, ctx)
+            output = result.hook_specific_output
+            next unless output && output.permission_decision == "deny"
+
+            grant_permission(request.tool_use_id, false, output.permission_decision_reason)
+            return true
+          end
+        end
+      end
+
+      false
+    end
+
+    private def run_local_permission_request_hooks(
+      hooks : HookConfig?,
+      request : PermissionRequest,
+    )
+      return if control_hook_registered?("PermissionRequest")
+
+      hooks.try(&.permission_request).try do |matchers|
+        common = hook_common_fields("PermissionRequest")
+        input = HookInput.new(
+          session_id: common[:session_id],
+          cwd: common[:cwd],
+          permission_mode: common[:permission_mode],
+          hook_event_name: common[:hook_event_name],
+          tool_name: request.tool_name,
+          tool_input: request.tool_input,
+          tool_use_id: request.tool_use_id,
+        )
+        ctx = HookContext.new(session_id: common[:session_id])
+
+        matchers.each do |hook_matcher|
+          next unless hook_matcher.matches?(request.tool_name)
+          hook_matcher.hooks.each(&.call(input, request.tool_use_id, ctx))
+        end
       end
     end
 
@@ -291,6 +742,12 @@ module ClaudeAgent
 
         # Determine if this was a failure
         is_error = block.is_error == true
+        if is_error
+          next if control_hook_registered?("PostToolUseFailure")
+        else
+          next if control_hook_registered?("PostToolUse")
+        end
+
         hook_matchers = is_error ? hooks.post_tool_use_failure : hooks.post_tool_use
         next unless hook_matchers
 
@@ -366,6 +823,7 @@ module ClaudeAgent
 
     private def handle_subagent_start(hooks : HookConfig, block : ToolUseBlock)
       return unless block.name == "Task"
+      return if control_hook_registered?("SubagentStart")
       callbacks = hooks.subagent_start
       return unless callbacks
 
@@ -385,6 +843,7 @@ module ClaudeAgent
     private def handle_subagent_stop(hooks : HookConfig, message : AssistantMessage, block : ToolResultBlock)
       tool_name = find_tool_name_for_result(message, block.tool_use_id)
       return unless tool_name == "Task"
+      return if control_hook_registered?("SubagentStop")
       callbacks = hooks.subagent_stop
       return unless callbacks
 
@@ -410,6 +869,7 @@ module ClaudeAgent
     private def trigger_stop_hook(result : ResultMessage)
       hooks = @options.try(&.hooks)
       return unless hooks
+      return if control_hook_registered?("Stop")
 
       callbacks = hooks.stop
       return unless callbacks
@@ -436,12 +896,15 @@ module ClaudeAgent
         handle_initialize_request(request.request_id, req)
       when ControlPermissionRequest
         handle_control_permission_request(request.request_id, req)
+      when ControlElicitationRequest
+        handle_control_elicitation_request(request.request_id, req)
       when ControlHookCallbackRequest
         handle_hook_callback_request(request.request_id, req)
       else
-        # Unknown control request subtype - send error response
         send_control_error(request.request_id, "Unknown control request subtype")
       end
+    rescue ex
+      send_control_error(request.request_id, ex.message || "Control request failed")
     end
 
     # Handle MCP message request (route to SDK MCP server)
@@ -489,71 +952,58 @@ module ClaudeAgent
 
     # Handle permission request via control protocol
     private def handle_control_permission_request(request_id : String, req : ControlPermissionRequest)
-      # Route to permission callback if configured
-      if callback = @options.try(&.can_use_tool)
-        context = PermissionContext.new(
-          tool_name: req.tool_name,
-          tool_input: req.input,
-          session_id: session_id || "unknown"
-        )
-        result = callback.call(context)
+      response_data = if callback = @options.try(&.can_use_tool)
+                        context = PermissionContext.new(
+                          tool_name: req.tool_name,
+                          tool_input: req.input,
+                          session_id: session_id || "unknown",
+                          suggestions: parse_permission_suggestions(req.permission_suggestions),
+                        )
+                        permission_result_to_response(callback.call(context), req.input)
+                      else
+                        {
+                          "behavior"     => JSON::Any.new("allow"),
+                          "updatedInput" => JSON::Any.new(req.input),
+                        }
+                      end
 
-        # Build response
-        behavior = result.allow? ? "allow" : "deny"
-        response_data = {
-          "behavior" => JSON::Any.new(behavior),
-        }
-        result.reason.try { |reason| response_data["reason"] = JSON::Any.new(reason) }
+      response = ControlResponse.success(request_id, JSON::Any.new(response_data))
+      @cli_client.send_control_response(response)
+    end
 
-        response = ControlResponse.success(request_id, JSON::Any.new(response_data))
-        @cli_client.send_control_response(response)
-      else
-        # No callback - default to allow
-        response = ControlResponse.success(request_id, JSON::Any.new({
-          "behavior" => JSON::Any.new("allow"),
-        }))
-        @cli_client.send_control_response(response)
-      end
+    private def handle_control_elicitation_request(request_id : String, req : ControlElicitationRequest)
+      response_data = if callback = @options.try(&.on_elicitation)
+                        elicitation_response_to_json(
+                          callback.call(
+                            ElicitationRequest.new(
+                              server_name: req.mcp_server_name,
+                              message: req.message,
+                              mode: req.mode,
+                              url: req.url,
+                              elicitation_id: req.elicitation_id,
+                              requested_schema: req.requested_schema,
+                            )
+                          )
+                        )
+                      else
+                        elicitation_response_to_json(ElicitationResponse.decline)
+                      end
+
+      response = ControlResponse.success(request_id, JSON::Any.new(response_data))
+      @cli_client.send_control_response(response)
     end
 
     # Handle hook callback request from CLI (e.g. PreCompact)
     private def handle_hook_callback_request(request_id : String, req : ControlHookCallbackRequest)
-      hooks = @options.try(&.hooks)
+      registration = @registered_hook_callbacks[req.callback_id]?
+      raise Error.new("No hook callback found for ID: #{req.callback_id}") unless registration
 
-      unless hooks
-        response = ControlResponse.success(request_id)
-        @cli_client.send_control_response(response)
-        return
-      end
+      input = build_hook_input(req.input, registration.hook_name)
+      ctx = HookContext.new(session_id: input.session_id || "unknown", cwd: input.cwd)
+      result = registration.callback.call(input, req.tool_use_id || input.tool_use_id || request_id, ctx)
 
-      callbacks = get_callbacks_for_hook(hooks, req.hook)
-
-      if callbacks
-        input = build_hook_input(req)
-        ctx = HookContext.new(session_id: input.session_id || "unknown")
-
-        callbacks.each do |callback|
-          callback.call(input, request_id, ctx)
-        end
-      end
-
-      response = ControlResponse.success(request_id)
+      response = ControlResponse.success(request_id, JSON::Any.new(hook_result_to_response(result)))
       @cli_client.send_control_response(response)
-    end
-
-    # pre_tool_use and post_tool_use are handled via PermissionRequest
-    # and AssistantMessage respectively, not via control callbacks here.
-    private def get_callbacks_for_hook(hooks : HookConfig, hook_name : String) : Array(HookCallback)?
-      case hook_name
-      when "pre_compact"        then hooks.pre_compact
-      when "user_prompt_submit" then hooks.user_prompt_submit
-      when "stop"               then hooks.stop
-      when "session_start"      then hooks.session_start
-      when "session_end"        then hooks.session_end
-      when "subagent_start"     then hooks.subagent_start
-      when "subagent_stop"      then hooks.subagent_stop
-      when "notification"       then hooks.notification
-      end
     end
 
     # Send control error response
@@ -562,83 +1012,397 @@ module ClaudeAgent
       @cli_client.send_control_response(response)
     end
 
-    # Map hook name to PascalCase event name
-    private def hook_event_name_for(hook_name : String) : String
-      case hook_name
-      when "pre_compact"        then "PreCompact"
-      when "notification"       then "Notification"
-      when "user_prompt_submit" then "UserPromptSubmit"
-      when "stop"               then "Stop"
-      when "session_start"      then "SessionStart"
-      when "session_end"        then "SessionEnd"
-      when "subagent_start"     then "SubagentStart"
-      when "subagent_stop"      then "SubagentStop"
-      when "permission_request" then "PermissionRequest"
-      else                           hook_name
+    private def extract_any(input : Hash(String, JSON::Any)?, *keys : String) : JSON::Any?
+      return nil unless input
+
+      keys.each do |key|
+        if value = input[key]?
+          return value
+        end
       end
+
+      nil
     end
 
     # Extract a string field from a hash
-    private def extract_string(input : Hash(String, JSON::Any)?, key : String) : String?
-      input.try(&.[key]?.try(&.as_s?))
+    private def extract_string(input : Hash(String, JSON::Any)?, *keys : String) : String?
+      extract_any(input, *keys).try(&.as_s?)
     end
 
     # Extract a bool field from a hash
-    private def extract_bool(input : Hash(String, JSON::Any)?, key : String) : Bool?
-      input.try(&.[key]?.try(&.as_bool?))
+    private def extract_bool(input : Hash(String, JSON::Any)?, *keys : String) : Bool?
+      extract_any(input, *keys).try(&.as_bool?)
+    end
+
+    private def extract_array(input : Hash(String, JSON::Any)?, *keys : String) : Array(JSON::Any)?
+      extract_any(input, *keys).try(&.as_a?)
+    end
+
+    private def extract_hash(input : Hash(String, JSON::Any)?, *keys : String) : Hash(String, JSON::Any)?
+      extract_any(input, *keys).try(&.as_h?)
+    end
+
+    private def normalize_hook_name(hook_name : String) : String
+      HOOK_NAME_ALIASES[hook_name]? || hook_name
     end
 
     # Build base HookInput with common context fields populated
-    private def build_base_hook_input(req : ControlHookCallbackRequest) : HookInput
-      tool_input = req.input
-      common = hook_common_fields(hook_event_name_for(req.hook))
+    private def build_base_hook_input(input_data : Hash(String, JSON::Any)?, hook_name : String) : HookInput
+      common = hook_common_fields(hook_name)
 
       HookInput.new(
-        session_id: extract_string(tool_input, "session_id") || common[:session_id],
-        transcript_path: extract_string(tool_input, "transcript_path"),
-        cwd: extract_string(tool_input, "cwd") || common[:cwd],
-        permission_mode: extract_string(tool_input, "permission_mode") || common[:permission_mode],
-        hook_event_name: common[:hook_event_name],
-        tool_input: tool_input,
+        session_id: extract_string(input_data, "session_id", "sessionId") || common[:session_id],
+        transcript_path: extract_string(input_data, "transcript_path", "transcriptPath"),
+        cwd: extract_string(input_data, "cwd") || common[:cwd],
+        permission_mode: extract_string(input_data, "permission_mode", "permissionMode") || common[:permission_mode],
+        hook_event_name: extract_string(input_data, "hook_event_name", "hookEventName") || common[:hook_event_name],
       )
     end
 
     # Build HookInput with appropriate fields based on hook type
-    private def build_hook_input(req : ControlHookCallbackRequest) : HookInput
-      input = build_base_hook_input(req)
-      tool_input = req.input
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def build_hook_input(input_data : Hash(String, JSON::Any)?, hook_name : String) : HookInput
+      input = build_base_hook_input(input_data, hook_name)
+      normalized_hook_name = normalize_hook_name(input.hook_event_name || hook_name)
 
-      case req.hook
+      case normalized_hook_name
       when "notification"
-        input.notification_message = extract_string(tool_input, "message")
-        input.notification_title = extract_string(tool_input, "title")
-        input.notification_type = extract_string(tool_input, "notification_type")
+        input = apply_notification_fields(input, input_data)
       when "pre_compact"
-        input.trigger = extract_string(tool_input, "trigger")
-        input.custom_instructions = extract_string(tool_input, "custom_instructions")
+        input = apply_pre_compact_fields(input, input_data)
       when "stop"
-        input.stop_hook_active = extract_bool(tool_input, "stop_hook_active")
+        input.stop_hook_active = extract_bool(input_data, "stop_hook_active", "stopHookActive")
       when "session_start"
-        input.source = extract_string(tool_input, "source")
+        input.source = extract_string(input_data, "source")
       when "session_end"
-        input.session_end_reason = extract_string(tool_input, "reason")
+        input.session_end_reason = extract_string(input_data, "reason", "session_end_reason", "sessionEndReason")
       when "subagent_start"
-        input.agent_id = extract_string(tool_input, "agent_id")
-        input.agent_type = extract_string(tool_input, "agent_type")
+        input = apply_subagent_fields(input, input_data)
       when "subagent_stop"
-        input.agent_id = extract_string(tool_input, "agent_id")
-        input.agent_type = extract_string(tool_input, "agent_type")
-        input.agent_transcript_path = extract_string(tool_input, "agent_transcript_path")
-        input.stop_hook_active = extract_bool(tool_input, "stop_hook_active")
+        input = apply_subagent_fields(input, input_data)
+        input.stop_hook_active = extract_bool(input_data, "stop_hook_active", "stopHookActive")
       when "pre_tool_use", "post_tool_use", "post_tool_use_failure"
-        input.tool_name = extract_string(tool_input, "tool_name")
-        input.tool_use_id = extract_string(tool_input, "tool_use_id")
+        input = apply_tool_fields(input, input_data)
       when "permission_request"
-        input.tool_name = extract_string(tool_input, "tool_name")
-        input.tool_use_id = extract_string(tool_input, "tool_use_id")
+        input = apply_tool_fields(input, input_data)
+        input.permission_suggestions = extract_array(input_data, "permission_suggestions", "permissionSuggestions")
+      when "elicitation"
+        input = apply_elicitation_fields(input, input_data)
+      when "elicitation_result"
+        input = apply_elicitation_fields(input, input_data)
+        input.elicitation_action = extract_string(input_data, "action")
+        input.elicitation_content = extract_hash(input_data, "content")
       end
 
       input
+    end
+
+    # ameba:enable Metrics/CyclomaticComplexity
+
+    private def apply_notification_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.notification_message = extract_string(input_data, "message")
+      input.notification_title = extract_string(input_data, "title")
+      input.notification_type = extract_string(input_data, "notification_type", "notificationType")
+      input
+    end
+
+    private def apply_pre_compact_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.trigger = extract_string(input_data, "trigger")
+      input.custom_instructions = extract_string(input_data, "custom_instructions", "customInstructions")
+      input
+    end
+
+    private def apply_subagent_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.agent_id = extract_string(input_data, "agent_id", "agentId")
+      input.agent_type = extract_string(input_data, "agent_type", "agentType")
+      input.agent_transcript_path = extract_string(input_data, "agent_transcript_path", "agentTranscriptPath")
+      input
+    end
+
+    private def apply_tool_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.tool_name = extract_string(input_data, "tool_name", "toolName")
+      input.tool_input = extract_hash(input_data, "tool_input", "toolInput")
+      input.tool_use_id = extract_string(input_data, "tool_use_id", "toolUseId")
+      input.tool_result = extract_string(input_data, "tool_result", "toolResult") ||
+                          extract_string(input_data, "tool_response", "toolResponse")
+      input.tool_response = extract_string(input_data, "tool_response", "toolResponse") ||
+                            extract_string(input_data, "tool_result", "toolResult")
+      input.error = extract_string(input_data, "error")
+      input.is_interrupt = extract_bool(input_data, "is_interrupt", "isInterrupt")
+      input
+    end
+
+    private def apply_elicitation_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.mcp_server_name = extract_string(input_data, "mcp_server_name", "mcpServerName")
+      input.elicitation_message = extract_string(input_data, "message")
+      input.elicitation_mode = extract_string(input_data, "mode")
+      input.elicitation_url = extract_string(input_data, "url")
+      input.elicitation_id = extract_string(input_data, "elicitation_id", "elicitationId")
+      input.requested_schema = extract_hash(input_data, "requested_schema", "requestedSchema")
+      input
+    end
+
+    private def permission_result_to_response(
+      result : PermissionResult,
+      original_input : Hash(String, JSON::Any),
+    ) : Hash(String, JSON::Any)
+      if result.allow?
+        response = {
+          "behavior"     => JSON::Any.new("allow"),
+          "updatedInput" => JSON::Any.new(result.updated_input || original_input),
+        }
+
+        if updates = result.updated_permissions
+          response["updatedPermissions"] = JSON::Any.new(
+            updates.map { |update| permission_update_to_json_any(update) }
+          )
+        end
+
+        response
+      else
+        response = {
+          "behavior" => JSON::Any.new("deny"),
+        }
+        result.reason.try { |reason| response["message"] = JSON::Any.new(reason) }
+        response["interrupt"] = JSON::Any.new(true) if result.interrupt?
+        response
+      end
+    end
+
+    private def parse_permission_suggestions(
+      suggestions : Array(JSON::Any)?,
+    ) : Array(PermissionSuggestion)?
+      return nil unless suggestions
+
+      parsed = suggestions.compact_map do |suggestion_any|
+        suggestion = suggestion_any.as_h?
+        next unless suggestion
+
+        update_data = suggestion["update"]?.try(&.as_h?)
+        update = update_data.try { |value| parse_permission_update(value) }
+        next unless update
+
+        PermissionSuggestion.new(
+          update: update,
+          description: suggestion["description"]?.try(&.as_s?),
+        )
+      end
+
+      parsed.empty? ? nil : parsed
+    end
+
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def parse_permission_update(data : Hash(String, JSON::Any)) : PermissionUpdate?
+      case data["type"]?.try(&.as_s?)
+      when "addRules"
+        AddRulesUpdate.new(
+          rules: parse_permission_rules(data["rules"]?.try(&.as_a?) || [] of JSON::Any),
+          behavior: parse_permission_behavior(data["behavior"]?.try(&.as_s?)),
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      when "replaceRules"
+        ReplaceRulesUpdate.new(
+          rules: parse_permission_rules(data["rules"]?.try(&.as_a?) || [] of JSON::Any),
+          behavior: parse_permission_behavior(data["behavior"]?.try(&.as_s?)),
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      when "removeRules"
+        RemoveRulesUpdate.new(
+          rules: parse_permission_rules(data["rules"]?.try(&.as_a?) || [] of JSON::Any),
+          behavior: parse_permission_behavior(data["behavior"]?.try(&.as_s?)),
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      when "setMode"
+        mode = parse_permission_mode(data["mode"]?.try(&.as_s?))
+        return nil unless mode
+
+        SetModeUpdate.new(
+          mode: mode,
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      when "addDirectories"
+        AddDirectoriesUpdate.new(
+          directories: parse_string_array(data["directories"]?.try(&.as_a?) || [] of JSON::Any),
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      when "removeDirectories"
+        RemoveDirectoriesUpdate.new(
+          directories: parse_string_array(data["directories"]?.try(&.as_a?) || [] of JSON::Any),
+          destination: parse_permission_destination(data["destination"]?.try(&.as_s?)),
+        )
+      end
+    end
+
+    # ameba:enable Metrics/CyclomaticComplexity
+
+    private def parse_permission_rules(values : Array(JSON::Any)) : Array(PermissionRuleValue)
+      values.compact_map do |value|
+        rule = value.as_h?
+        next unless rule
+
+        pattern = rule["pattern"]?.try(&.as_s?)
+        next unless pattern
+
+        PermissionRuleValue.new(pattern, rule["description"]?.try(&.as_s?))
+      end
+    end
+
+    private def parse_string_array(values : Array(JSON::Any)) : Array(String)
+      values.compact_map(&.as_s?)
+    end
+
+    private def parse_permission_behavior(value : String?) : PermissionRuleBehavior
+      case value
+      when "deny" then PermissionRuleBehavior::Deny
+      when "ask"  then PermissionRuleBehavior::Ask
+      else             PermissionRuleBehavior::Allow
+      end
+    end
+
+    private def parse_permission_destination(value : String?) : PermissionUpdateDestination
+      case value
+      when "userSettings"    then PermissionUpdateDestination::UserSettings
+      when "projectSettings" then PermissionUpdateDestination::ProjectSettings
+      when "localSettings"   then PermissionUpdateDestination::LocalSettings
+      else                        PermissionUpdateDestination::Session
+      end
+    end
+
+    private def parse_permission_mode(value : String?) : PermissionMode?
+      case value
+      when "default"           then PermissionMode::Default
+      when "acceptEdits"       then PermissionMode::AcceptEdits
+      when "plan"              then PermissionMode::Plan
+      when "bypassPermissions" then PermissionMode::BypassPermissions
+      end
+    end
+
+    private def permission_update_to_json_any(update : PermissionUpdate) : JSON::Any
+      data = case update
+             when AddRulesUpdate
+               {
+                 "type"        => JSON::Any.new("addRules"),
+                 "rules"       => JSON::Any.new(update.rules.map { |rule| permission_rule_to_json_any(rule) }),
+                 "behavior"    => JSON::Any.new(permission_behavior_value(update.behavior)),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             when ReplaceRulesUpdate
+               {
+                 "type"        => JSON::Any.new("replaceRules"),
+                 "rules"       => JSON::Any.new(update.rules.map { |rule| permission_rule_to_json_any(rule) }),
+                 "behavior"    => JSON::Any.new(permission_behavior_value(update.behavior)),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             when RemoveRulesUpdate
+               {
+                 "type"        => JSON::Any.new("removeRules"),
+                 "rules"       => JSON::Any.new(update.rules.map { |rule| permission_rule_to_json_any(rule) }),
+                 "behavior"    => JSON::Any.new(permission_behavior_value(update.behavior)),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             when SetModeUpdate
+               {
+                 "type"        => JSON::Any.new("setMode"),
+                 "mode"        => JSON::Any.new(permission_mode_value(update.mode)),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             when AddDirectoriesUpdate
+               {
+                 "type"        => JSON::Any.new("addDirectories"),
+                 "directories" => JSON::Any.new(update.directories.map { |directory| JSON::Any.new(directory) }),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             when RemoveDirectoriesUpdate
+               {
+                 "type"        => JSON::Any.new("removeDirectories"),
+                 "directories" => JSON::Any.new(update.directories.map { |directory| JSON::Any.new(directory) }),
+                 "destination" => JSON::Any.new(permission_destination_value(update.destination)),
+               }
+             else
+               {} of String => JSON::Any
+             end
+
+      JSON::Any.new(data)
+    end
+
+    private def permission_rule_to_json_any(rule : PermissionRuleValue) : JSON::Any
+      data = {
+        "pattern" => JSON::Any.new(rule.pattern),
+      }
+      rule.description.try { |description| data["description"] = JSON::Any.new(description) }
+      JSON::Any.new(data)
+    end
+
+    private def permission_behavior_value(behavior : PermissionRuleBehavior) : String
+      case behavior
+      when PermissionRuleBehavior::Allow then "allow"
+      when PermissionRuleBehavior::Deny  then "deny"
+      when PermissionRuleBehavior::Ask   then "ask"
+      else                                    "allow"
+      end
+    end
+
+    private def permission_destination_value(destination : PermissionUpdateDestination) : String
+      case destination
+      when PermissionUpdateDestination::UserSettings    then "userSettings"
+      when PermissionUpdateDestination::ProjectSettings then "projectSettings"
+      when PermissionUpdateDestination::LocalSettings   then "localSettings"
+      when PermissionUpdateDestination::Session         then "session"
+      else                                                   "session"
+      end
+    end
+
+    private def hook_result_to_response(result : HookResult) : Hash(String, JSON::Any)
+      response = {
+        "continue"       => JSON::Any.new(result.continue?),
+        "suppressOutput" => JSON::Any.new(result.suppress_output?),
+      }
+
+      result.decision.try { |decision| response["decision"] = JSON::Any.new(decision) }
+      result.system_message.try { |message| response["systemMessage"] = JSON::Any.new(message) }
+      result.reason.try { |reason| response["reason"] = JSON::Any.new(reason) }
+
+      if hook_specific_output = result.hook_specific_output
+        response["hookSpecificOutput"] = JSON::Any.new(
+          hook_specific_output_to_response(hook_specific_output)
+        )
+      end
+
+      response
+    end
+
+    private def hook_specific_output_to_response(output : HookSpecificOutput) : Hash(String, JSON::Any)
+      response = {
+        "hookEventName" => JSON::Any.new(output.hook_event_name),
+      }
+
+      output.permission_decision.try do |value|
+        response["permissionDecision"] = JSON::Any.new(value)
+      end
+      output.permission_decision_reason.try do |value|
+        response["permissionDecisionReason"] = JSON::Any.new(value)
+      end
+      output.decision.try { |value| response["decision"] = JSON::Any.new(value) }
+      output.updated_input.try { |value| response["updatedInput"] = JSON::Any.new(value) }
+      output.additional_context.try do |value|
+        response["additionalContext"] = JSON::Any.new(value)
+      end
+      output.updated_mcp_tool_output.try do |value|
+        response["updatedMCPToolOutput"] = value
+      end
+      output.action.try { |value| response["action"] = JSON::Any.new(value) }
+      output.content.try { |value| response["content"] = JSON::Any.new(value) }
+
+      response
+    end
+
+    private def elicitation_response_to_json(result : ElicitationResponse) : Hash(String, JSON::Any)
+      response = {
+        "action" => JSON::Any.new(result.action),
+      }
+
+      result.content.try { |value| response["content"] = JSON::Any.new(value) }
+      response
     end
   end
 end
