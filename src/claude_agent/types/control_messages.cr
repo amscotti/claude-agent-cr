@@ -112,6 +112,12 @@ module ClaudeAgent
     getter input : Hash(String, JSON::Any)
     @[JSON::Field(key: "permission_suggestions")]
     getter permission_suggestions : Array(JSON::Any)?
+    @[JSON::Field(key: "tool_use_id")]
+    getter tool_use_id : String?
+    @[JSON::Field(key: "agent_id")]
+    getter agent_id : String?
+    @[JSON::Field(key: "blocked_path")]
+    getter blocked_path : String?
   end
 
   # Interrupt request
@@ -149,6 +155,40 @@ module ClaudeAgent
     include JSON::Serializable
 
     getter subtype : String = "get_settings"
+  end
+
+  struct ControlGetContextUsageRequest
+    include JSON::Serializable
+
+    getter subtype : String = "get_context_usage"
+  end
+
+  struct ControlReloadPluginsRequest
+    include JSON::Serializable
+
+    getter subtype : String = "reload_plugins"
+  end
+
+  struct ControlPromptSuggestionRequest
+    include JSON::Serializable
+
+    getter subtype : String = "prompt_suggestion"
+  end
+
+  struct ControlSetMcpServersRequest
+    include JSON::Serializable
+
+    getter subtype : String = "mcp_set_servers"
+    @[JSON::Field(key: "mcpServers")]
+    getter mcp_servers : Hash(String, JSON::Any)
+  end
+
+  struct ControlMcpEnableChannelRequest
+    include JSON::Serializable
+
+    getter subtype : String = "mcp_enable_channel"
+    @[JSON::Field(key: "serverName")]
+    getter server_name : String
   end
 
   struct ControlCancelAsyncMessageRequest
@@ -269,6 +309,11 @@ module ClaudeAgent
                               ControlSetModelRequest |
                               ControlSetMaxThinkingTokensRequest |
                               ControlGetSettingsRequest |
+                              ControlGetContextUsageRequest |
+                              ControlReloadPluginsRequest |
+                              ControlPromptSuggestionRequest |
+                              ControlSetMcpServersRequest |
+                              ControlMcpEnableChannelRequest |
                               ControlCancelAsyncMessageRequest |
                               ControlApplyFlagSettingsRequest |
                               ControlRemoteControlRequest |
@@ -293,6 +338,11 @@ module ClaudeAgent
       "set_model"               => ->(json : String) { ControlSetModelRequest.from_json(json).as(ControlRequestInner) },
       "set_max_thinking_tokens" => ->(json : String) { ControlSetMaxThinkingTokensRequest.from_json(json).as(ControlRequestInner) },
       "get_settings"            => ->(json : String) { ControlGetSettingsRequest.from_json(json).as(ControlRequestInner) },
+      "get_context_usage"       => ->(json : String) { ControlGetContextUsageRequest.from_json(json).as(ControlRequestInner) },
+      "reload_plugins"          => ->(json : String) { ControlReloadPluginsRequest.from_json(json).as(ControlRequestInner) },
+      "prompt_suggestion"       => ->(json : String) { ControlPromptSuggestionRequest.from_json(json).as(ControlRequestInner) },
+      "mcp_set_servers"         => ->(json : String) { ControlSetMcpServersRequest.from_json(json).as(ControlRequestInner) },
+      "mcp_enable_channel"      => ->(json : String) { ControlMcpEnableChannelRequest.from_json(json).as(ControlRequestInner) },
       "cancel_async_message"    => ->(json : String) { ControlCancelAsyncMessageRequest.from_json(json).as(ControlRequestInner) },
       "apply_flag_settings"     => ->(json : String) { ControlApplyFlagSettingsRequest.from_json(json).as(ControlRequestInner) },
       "remote_control"          => ->(json : String) { ControlRemoteControlRequest.from_json(json).as(ControlRequestInner) },
@@ -431,6 +481,7 @@ module ClaudeAgent
     getter config : Hash(String, JSON::Any)?
     getter scope : String?
     getter tools : Array(MCPToolInfo)?
+    getter capabilities : Hash(String, JSON::Any)?
   end
 
   struct MCPStatusResponse
@@ -441,5 +492,56 @@ module ClaudeAgent
 
     def initialize(@mcp_servers : Array(MCPServerStatus))
     end
+  end
+
+  # Category breakdown returned by `get_context_usage`.
+  struct ContextUsageCategory
+    include JSON::Serializable
+
+    getter name : String
+    getter tokens : Int64
+    getter color : String?
+    @[JSON::Field(key: "isDeferred")]
+    getter? deferred : Bool?
+  end
+
+  # Response payload for `get_context_usage` control requests.
+  # Exposes the data shown by the CLI `/context` command.
+  struct ContextUsageResponse
+    include JSON::Serializable
+
+    getter categories : Array(ContextUsageCategory)
+    @[JSON::Field(key: "totalTokens")]
+    getter total_tokens : Int64
+    @[JSON::Field(key: "maxTokens")]
+    getter max_tokens : Int64
+    @[JSON::Field(key: "rawMaxTokens")]
+    getter raw_max_tokens : Int64
+    getter percentage : Float64
+    getter model : String
+    @[JSON::Field(key: "isAutoCompactEnabled")]
+    getter? auto_compact_enabled : Bool
+    @[JSON::Field(key: "memoryFiles")]
+    getter memory_files : Array(JSON::Any)
+    @[JSON::Field(key: "mcpTools")]
+    getter mcp_tools : Array(JSON::Any)
+    getter agents : Array(JSON::Any)
+    @[JSON::Field(key: "gridRows")]
+    getter grid_rows : Array(JSON::Any)?
+    @[JSON::Field(key: "autoCompactThreshold")]
+    getter auto_compact_threshold : Int64?
+    @[JSON::Field(key: "deferredBuiltinTools")]
+    getter deferred_builtin_tools : Array(JSON::Any)?
+    @[JSON::Field(key: "systemTools")]
+    getter system_tools : Array(JSON::Any)?
+    @[JSON::Field(key: "systemPromptSections")]
+    getter system_prompt_sections : Array(JSON::Any)?
+    @[JSON::Field(key: "slashCommands")]
+    getter slash_commands : Hash(String, JSON::Any)?
+    getter skills : Hash(String, JSON::Any)?
+    @[JSON::Field(key: "messageBreakdown")]
+    getter message_breakdown : Hash(String, JSON::Any)?
+    @[JSON::Field(key: "apiUsage")]
+    getter api_usage : Hash(String, JSON::Any)?
   end
 end

@@ -4,12 +4,14 @@ require "../hooks"
 require "../permissions"
 
 module ClaudeAgent
-  # Permission modes matching official SDK
+  # Permission modes supported by the Claude Code CLI
   enum PermissionMode
     Default           # Normal permission prompts
     AcceptEdits       # Auto-approve file edits
     Plan              # Planning mode, no execution
     BypassPermissions # Bypass all permission checks (requires explicit opt-in)
+    Auto              # CLI-managed automatic decisions (CLI v2.1.90+)
+    DontAsk           # Never prompt (fail closed on anything not explicitly allowed)
 
     def to_cli_value : String
       case self
@@ -17,6 +19,8 @@ module ClaudeAgent
       when AcceptEdits       then "acceptEdits"
       when Plan              then "plan"
       when BypassPermissions then "bypassPermissions"
+      when Auto              then "auto"
+      when DontAsk           then "dontAsk"
       else                        "default"
       end
     end
@@ -28,14 +32,40 @@ module ClaudeAgent
     property description : String
     property prompt : String
     property tools : Array(String)?
+    @[JSON::Field(key: "disallowedTools")]
+    property disallowed_tools : Array(String)?
+    # Model alias ("sonnet", "opus", "haiku", "inherit") or full model ID.
     property model : String?
+    property skills : Array(String)?
+    property memory : String? # "user" | "project" | "local"
+    # Each entry is a server name (String) or an inline {name: config} Hash.
+    @[JSON::Field(key: "mcpServers")]
+    property mcp_servers : Array(JSON::Any)?
+    @[JSON::Field(key: "initialPrompt")]
+    property initial_prompt : String?
+    @[JSON::Field(key: "maxTurns")]
+    property max_turns : Int32?
+    property? background : Bool?
+    # Effort can be "low" | "medium" | "high" | "max" or an Int tier value.
+    property effort : JSON::Any?
+    @[JSON::Field(key: "permissionMode")]
+    property permission_mode : String?
 
     def initialize(
       @description : String,
       @prompt : String,
       @name : String? = nil,
       @tools : Array(String)? = nil,
+      @disallowed_tools : Array(String)? = nil,
       @model : String? = nil,
+      @skills : Array(String)? = nil,
+      @memory : String? = nil,
+      @mcp_servers : Array(JSON::Any)? = nil,
+      @initial_prompt : String? = nil,
+      @max_turns : Int32? = nil,
+      @background : Bool? = nil,
+      @effort : JSON::Any? = nil,
+      @permission_mode : String? = nil,
     )
     end
   end
@@ -178,19 +208,56 @@ module ClaudeAgent
     property type : String   # "preset"
     property preset : String # "claude_code"
     property append : String?
+    # When true, strips per-user dynamic sections (working directory,
+    # auto-memory, git status) from the system prompt so the cacheable prefix
+    # is identical across users. The stripped content is re-injected into the
+    # first user message. Requires CLI support; older CLIs ignore this field.
+    property? exclude_dynamic_sections : Bool = false
 
-    def initialize(@preset : String, @append : String? = nil)
+    def initialize(
+      @preset : String,
+      @append : String? = nil,
+      @exclude_dynamic_sections : Bool = false,
+    )
       @type = "preset"
     end
 
-    def self.claude_code(append : String? = nil) : SystemPromptPreset
-      new("claude_code", append)
+    def self.claude_code(
+      append : String? = nil,
+      exclude_dynamic_sections : Bool = false,
+    ) : SystemPromptPreset
+      new("claude_code", append, exclude_dynamic_sections)
+    end
+  end
+
+  # System prompt loaded from a file on disk (maps to `--system-prompt-file`).
+  struct SystemPromptFile
+    include JSON::Serializable
+    property type : String # "file"
+    property path : String
+
+    def initialize(@path : String)
+      @type = "file"
     end
   end
 
   # Union types for preset support - allows both strings and preset objects
-  alias SystemPromptOption = String | SystemPromptPreset
+  alias SystemPromptOption = String | SystemPromptPreset | SystemPromptFile
   alias ToolsOption = Array(String) | ToolsPreset
+
+  # Skills option: "all", a list of skill names, or an empty list to suppress.
+  alias SkillsOption = String | Array(String)
+
+  # API-side task budget in tokens. When set, the model is made aware of its
+  # remaining token budget so it can pace tool use and wrap up before the
+  # limit. Sent as `--task-budget <total>` on the CLI.
+  struct TaskBudget
+    include JSON::Serializable
+    property total : Int32
+
+    def initialize(@total : Int32)
+    end
+  end
 
   struct ExternalMCPServerConfig
     include JSON::Serializable
@@ -322,10 +389,14 @@ module ClaudeAgent
     end
   end
 
+  # Effort tiers accepted by the Claude Code CLI.
+  # `Xhigh` sits between `High` and `Max` and is required by Claude Opus 4.7
+  # (which defaults to `xhigh` in Claude Code).
   enum Effort
     Low
     Medium
     High
+    Xhigh
     Max
   end
 
@@ -355,9 +426,17 @@ module ClaudeAgent
     property max_thinking_tokens : Int32? # Extended thinking control
     property thinking : ThinkingConfig?
     property effort : Effort?
+    property task_budget : TaskBudget? # API-side token budget awareness
 
     # Beta features
     property betas : Array(String)?
+
+    # Skills enabled for the main session. Accepts "all", an array of skill
+    # names, or an empty array to suppress all skills. When set, the SDK
+    # auto-injects the `Skill` or `Skill(name)` entries into `allowed_tools`
+    # and defaults `setting_sources` to `["user","project"]` when unset.
+    @[JSON::Field(ignore: true)]
+    property skills : SkillsOption?
 
     # Additional directories
     property add_dirs : Array(String)?
@@ -412,6 +491,7 @@ module ClaudeAgent
     property session_id : String?
     property? fork_session : Bool = false
     property? no_session_persistence : Bool = false
+    property title : String? # Optional session title; skips auto-generation
 
     # File checkpointing
     property? enable_file_checkpointing : Bool = false
@@ -444,7 +524,9 @@ module ClaudeAgent
       @max_thinking_tokens : Int32? = nil,
       @thinking : ThinkingConfig? = nil,
       @effort : Effort? = nil,
+      @task_budget : TaskBudget? = nil,
       @betas : Array(String)? = nil,
+      @skills : SkillsOption? = nil,
       @add_dirs : Array(String)? = nil,
       @plugins : Array(String)? = nil,
       @cwd : String? = nil,
@@ -471,6 +553,7 @@ module ClaudeAgent
       @session_id : String? = nil,
       @fork_session : Bool = false,
       @no_session_persistence : Bool = false,
+      @title : String? = nil,
       @enable_file_checkpointing : Bool = false,
       @sandbox : SandboxSettings? = nil,
       @user : String? = nil,

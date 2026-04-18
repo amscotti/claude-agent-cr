@@ -1,7 +1,7 @@
 require "json"
 
 module ClaudeAgent
-  # Hook event types matching official SDKs
+  # Hook event types mirroring Claude Code CLI hook names.
   enum HookEvent
     PreToolUse         # Before tool execution (can block/modify)
     PostToolUse        # After successful tool execution
@@ -17,6 +17,9 @@ module ClaudeAgent
     PermissionRequest  # When permission dialog would appear
     Elicitation        # When an MCP server asks for user input
     ElicitationResult  # After the user responds to an MCP elicitation
+    TeammateIdle       # A background agent is idle and available
+    TaskCompleted      # A background task finished
+    ConfigChange       # Settings/permissions changed mid-session
   end
 
   # Forward declaration for types used in callback
@@ -67,6 +70,9 @@ module ClaudeAgent
     property session_start : Array(HookCallback)?
     property session_end : Array(HookCallback)?
     property notification : Array(HookCallback)?
+    property teammate_idle : Array(HookCallback)?
+    property task_completed : Array(HookCallback)?
+    property config_change : Array(HookCallback)?
 
     def initialize(
       @pre_tool_use : Array(HookMatcher)? = nil,
@@ -83,6 +89,9 @@ module ClaudeAgent
       @session_start : Array(HookCallback)? = nil,
       @session_end : Array(HookCallback)? = nil,
       @notification : Array(HookCallback)? = nil,
+      @teammate_idle : Array(HookCallback)? = nil,
+      @task_completed : Array(HookCallback)? = nil,
+      @config_change : Array(HookCallback)? = nil,
     )
     end
   end
@@ -136,6 +145,13 @@ module ClaudeAgent
     property requested_schema : Hash(String, JSON::Any)?
     property elicitation_action : String?
     property elicitation_content : Hash(String, JSON::Any)?
+    # TaskCompleted hook fields
+    property task_id : String?
+    property task_status : String?
+    property task_summary : String?
+    # ConfigChange hook fields
+    property config_change_source : String? # e.g. "settings", "permissions"
+    property config_change_diff : Hash(String, JSON::Any)?
 
     def initialize(
       @session_id : String? = nil,
@@ -171,6 +187,11 @@ module ClaudeAgent
       @requested_schema : Hash(String, JSON::Any)? = nil,
       @elicitation_action : String? = nil,
       @elicitation_content : Hash(String, JSON::Any)? = nil,
+      @task_id : String? = nil,
+      @task_status : String? = nil,
+      @task_summary : String? = nil,
+      @config_change_source : String? = nil,
+      @config_change_diff : Hash(String, JSON::Any)? = nil,
     )
     end
   end

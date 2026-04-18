@@ -1,0 +1,52 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "url": "https://context7.com/amscotti/claude-agent-cr",
+  "public_key": "pk_6hjHZg54nTibkvZPTAXhA",
+  "projectTitle": "Claude Agent SDK for Crystal",
+  "description": "Unofficial Crystal SDK that wraps the Claude Code CLI for building autonomous AI agents with typed messages, hooks, permissions, MCP servers, session management, and structured outputs.",
+  "folders": [],
+  "excludeFolders": [
+    "lib",
+    "bin",
+    "tmp",
+    "spec"
+  ],
+  "excludeFiles": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "shard.lock"
+  ],
+  "rules": [
+    "Add the dependency to shard.yml with `version: ~> 0.5.0` and run `shards install`.",
+    "The Claude Code CLI must be installed and authenticated (`curl -fsSL https://claude.ai/install.sh | bash` then `claude login`).",
+    "Use `ClaudeAgent.query(prompt, options) { |message| ... }` for simple one-shot tasks.",
+    "Use `ClaudeAgent::AgentClient.open(options) do |client| ... end` for interactive multi-turn sessions; the block form handles subprocess cleanup automatically.",
+    "Use `ClaudeAgent::StreamingSession.open(options) do |session| ... end` for bidirectional send/receive patterns.",
+    "Stream results with `client.each_response do |message| ... end` and case-match on typed subclasses: `AssistantMessage`, `ResultMessage`, `UserMessage`, `PermissionRequest`, `InitMessage`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage`, `RateLimitEvent`, `CompactBoundaryMessage`, `PromptSuggestionMessage`, `ElicitationCompleteMessage`, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`, `UnknownMessage`.",
+    "Configure the agent with `ClaudeAgent::AgentOptions.new(...)`. Every field is optional; pass named arguments for the ones you need.",
+    "Permission modes are `PermissionMode::Default`, `AcceptEdits`, `Plan`, `BypassPermissions`, `Auto`, and `DontAsk`. Map to CLI values via `to_cli_value`.",
+    "Effort tiers are `Effort::Low`, `Medium`, `High`, `Xhigh`, and `Max`. `Xhigh` is the Claude Code default for Claude Opus 4.7.",
+    "Model identifiers are opaque strings. Use aliases like `\"opus\"`, `\"sonnet\"`, `\"haiku\"`, or full IDs like `\"claude-opus-4-7\"`.",
+    "For the system prompt, accept a `String`, a `SystemPromptPreset` (use `exclude_dynamic_sections: true` for cache-friendly prompts), or a `SystemPromptFile` loaded from disk.",
+    "Enable skills by passing `skills: \"all\"` or `skills: [\"git\", \"playwright\"]`. The SDK auto-injects the matching `Skill` / `Skill(name)` allow rules and defaults `setting_sources` to `[\"user\", \"project\"]`.",
+    "Thinking config: `ThinkingConfig.adaptive` emits `--thinking adaptive`, `ThinkingConfig.disabled` emits `--thinking disabled`, and `ThinkingConfig.enabled(n)` emits `--max-thinking-tokens n`.",
+    "Define custom tools with `ClaudeAgent.tool(name:, description:, schema:) { |args| ClaudeAgent::ToolResult.text(...) }` and bundle them with `ClaudeAgent.create_sdk_mcp_server(name:, tools:)`.",
+    "Build JSON schemas with the `ClaudeAgent::Schema` helpers (`string`, `integer`, `number`, `boolean`, `array`, `object`, `enum`, `optional`, `union`) instead of hand-writing JSON. Pass the schema to tool definitions or to `OutputFormat.json_schema(schema)`.",
+    "Register hooks with `ClaudeAgent::HookConfig.new(...)` and `ClaudeAgent::HookMatcher.new(matcher:, hooks:, timeout:)`. Supported events include PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, Elicitation, ElicitationResult, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd, TeammateIdle, TaskCompleted, and ConfigChange.",
+    "Hook callbacks must return a `ClaudeAgent::HookResult` (`allow`, `allow_with_input(hash)`, `deny(message)`, or `elicitation(action)`).",
+    "Permission callbacks receive a `PermissionContext` with `tool_name`, `tool_input`, `session_id`, `suggestions`, `tool_use_id`, `agent_id`, and `blocked_path`. Return a `PermissionResult` (`allow`, `allow_and_remember`, `deny`, `deny_and_remember`).",
+    "Interact with live sessions via `client.set_model`, `client.set_permission_mode`, `client.interrupt`, `client.get_server_info`, `client.get_mcp_status`, `client.get_context_usage`, `client.reload_plugins`, `client.prompt_suggestion`, `client.set_mcp_servers`, `client.enable_mcp_channel`, `client.cancel_async_message`, `client.apply_flag_settings`, `client.generate_session_title`, `client.set_proactive`, and `client.enable_remote_control`.",
+    "Read local sessions with `ClaudeAgent.list_sessions`, `ClaudeAgent.get_session_info`, and `ClaudeAgent.get_session_messages(session_id, directory:, include_system_messages:)`.",
+    "Mutate local sessions with `ClaudeAgent.rename_session`, `ClaudeAgent.tag_session`, `ClaudeAgent.delete_session`, and `ClaudeAgent.fork_session(session_id, directory:, up_to_message_id:, title:)`.",
+    "Read subagent transcripts with `ClaudeAgent.list_subagents(session_id)` and `ClaudeAgent.get_subagent_messages(session_id, agent_id)`.",
+    "Append a user message without triggering an assistant turn by passing `should_query: false` to `client.send_user_message` or `client.query`.",
+    "Pre-warm the CLI subprocess with `client = ClaudeAgent.startup(options)`; call `client.stop` when you are done.",
+    "Always rescue `ClaudeAgent::CLINotFoundError` (CLI missing), `ClaudeAgent::ProcessError` (non-zero exit; exposes `exit_code` and `stderr`), `ClaudeAgent::ConnectionError`, `ClaudeAgent::JSONDecodeError`, `ClaudeAgent::PermissionDeniedError`, `ClaudeAgent::TimeoutError`, and `ClaudeAgent::ConfigurationError`; the base class is `ClaudeAgent::Error`.",
+    "Follow Crystal conventions: two-space indentation, `snake_case` methods and variables, `CamelCase` types, predicate methods ending in `?`, and JSON types built with `JSON::Any.new(...)`."
+  ],
+  "previousVersions": [
+    { "tag": "v0.3.0" },
+    { "tag": "v0.2.0" },
+    { "tag": "v0.1.0" }
+  ]
+}

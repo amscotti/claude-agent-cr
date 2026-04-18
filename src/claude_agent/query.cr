@@ -1,6 +1,16 @@
 require "./cli_client"
 
 module ClaudeAgent
+  # Pre-warm the Claude Code CLI subprocess without sending a prompt.
+  # Returns an `AgentClient` that has already paid the startup cost, so the
+  # next call to `#query` runs without subprocess boot latency.
+  # The caller is responsible for `#stop`-ping the returned client.
+  def self.startup(options : AgentOptions? = nil) : AgentClient
+    client = AgentClient.new(options)
+    client.start
+    client
+  end
+
   # Simple query interface - yields messages as they arrive
   def self.query(
     prompt : String,

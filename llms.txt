@@ -2,7 +2,7 @@
 
 > An unofficial Anthropic Agent SDK for Crystal that provides a programmatic interface to the Claude Code CLI. Enables building autonomous AI agents that can execute commands, edit files, stream events, manage sessions, and perform complex multi-step workflows.
 >
-> Tested with Claude Code CLI **v2.1.71**. Core features, examples, and optional live E2E coverage are up to date.
+> Developed against Claude Code CLI **v2.1.84+**. Forward-compatible: features that require newer CLI versions are gracefully no-op or surface a clear error on older CLIs.
 
 This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using `--output-format stream-json` and `--input-format stream-json` flags. This is the same architecture used by the official Claude Code Agent SDKs. The CLI handles authentication, the agent loop, built-in tools, and API communication.
 
@@ -12,25 +12,35 @@ This SDK communicates with the Claude Code CLI via JSON over stdin/stdout using 
 - V2 streaming interface with send/receive patterns
 - Type-safe JSON Schema builder (Crystal's answer to Zod)
 - Structured outputs with JSON schema validation
-- Dynamic controls (`set_permission_mode`, `set_model`, `get_mcp_status`, `reconnect_mcp_server`, `toggle_mcp_server`, `stop_task`, `apply_flag_settings`, `enable_remote_control`, `set_proactive`, `generate_session_title`)
+- Dynamic controls (`set_permission_mode`, `set_model`, `get_mcp_status`, `reconnect_mcp_server`, `toggle_mcp_server`, `stop_task`, `apply_flag_settings`, `enable_remote_control`, `set_proactive`, `generate_session_title`, `get_context_usage`, `reload_plugins`, `prompt_suggestion`, `set_mcp_servers`, `enable_mcp_channel`)
+- Typed `ContextUsageResponse` with per-category token usage and autocompact thresholds
 - Server initialization metadata via `get_server_info`
 - Convenience helpers for supported agents/commands from initialization metadata
 - Custom tool definitions with MCP server support (stdio, HTTP, SSE)
-- In-process SDK MCP servers with control protocol (same as official SDKs)
+- In-process SDK MCP servers with control protocol (same architecture as official SDKs)
 - Preset types for system prompt and tools (ToolsPreset, SystemPromptPreset)
-- Subagent definitions for specialized tasks
-- Rich event messages (`InitMessage`, task lifecycle messages, `RateLimitEvent`, compact boundary, unknown-message fallback)
-- Full hook support (PreToolUse, PostToolUse, PreCompact, Notification, etc.)
-- Permission management with callbacks and control-protocol propagation
-- Session management (resume, fork, continue, resume_session_at)
-- Session history (`list_sessions`, `get_session_info`, `get_session_messages`)
+- `SystemPromptPreset` with `exclude_dynamic_sections` for cache-friendly prompts; `SystemPromptFile` for loading the prompt from disk
+- Skills support (`skills: "all"` or a named list) with automatic `setting_sources` defaults
+- Task budgets (`task_budget`) and fixed session titles (`title`)
+- Subagent definitions with rich fields (`disallowed_tools`, `memory`, `initial_prompt`, `max_turns`, `background`, `effort`, `permission_mode`, per-agent `mcp_servers`)
+- Rich event messages (`InitMessage`, task lifecycle messages, `RateLimitEvent`, compact boundary, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`, unknown-message fallback)
+- Full hook support (PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PreCompact, Notification, Elicitation, ElicitationResult, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd, TeammateIdle, TaskCompleted, ConfigChange)
+- Permission management with callbacks and control-protocol propagation; permission context exposes `tool_use_id`, `agent_id`, and `blocked_path`
+- Permission modes: `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk`
+- Session management (resume, fork, continue, resume_session_at, delete)
+- Session history (`list_sessions`, `get_session_info`, `get_session_messages` with `include_system_messages`)
+- Session forks and subagent transcripts (`fork_session`, `list_subagents`, `get_subagent_messages`, `delete_session`)
 - Session metadata mutation (`rename_session`, `tag_session`)
+- Transcript controls (`should_query: false` appends a user message without triggering a turn)
 - Prompt suggestions and async message controls (`prompt_suggestions`, `PromptSuggestionMessage`, `settings`, `cancel_async_message`)
 - MCP elicitation callback surface (`on_elicitation`, Elicitation hooks, `ElicitationCompleteMessage`)
 - File checkpointing and rewind
 - Sandbox configuration
-- Extended thinking support (`thinking`, `effort`, `max_thinking_tokens`)
+- Extended thinking support (`thinking` with `adaptive`/`enabled`/`disabled` modes, `effort` tiers including `xhigh`, legacy `max_thinking_tokens`)
+- Pre-warming the CLI subprocess with `ClaudeAgent.startup`
+- Automatic W3C trace context propagation (`TRACEPARENT`/`TRACESTATE`)
 - Fine-grained partial streaming when `include_partial_messages` is enabled
+- `ResultMessage.terminal_reason` and `errors` accessors; `InitMessage#memory_paths`; `MCPServerStatus#capabilities`
 - Graceful handling of unknown content block types (forward-compatible)
 - Optional live E2E coverage for parity-critical flows
 
@@ -135,7 +145,7 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 
 ## Hooks and Permissions
 
-- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Hook system with all events (PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd)
+- [src/claude_agent/hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/hooks.cr): Hook system with all events (PreToolUse, PostToolUse, PostToolUseFailure, PermissionRequest, PreCompact, Notification, UserPromptSubmit, Stop, SubagentStart, SubagentStop, SessionStart, SessionEnd, Elicitation, ElicitationResult, TeammateIdle, TaskCompleted, ConfigChange)
 - [src/claude_agent/permissions.cr](https://github.com/amscotti/claude-agent-cr/blob/main/src/claude_agent/permissions.cr): Permission callback system
 
 ### Hook Events
@@ -146,6 +156,8 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 | PostToolUse | After successful tool execution | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response` |
 | PostToolUseFailure | After tool execution failure | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt` |
 | PermissionRequest | When permission dialog appears | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions` |
+| Elicitation | MCP server requests user input | `mcp_server_name`, `elicitation_message`, `elicitation_mode`, `elicitation_url`, `elicitation_id`, `requested_schema` |
+| ElicitationResult | User responded to an MCP elicitation | `mcp_server_name`, `elicitation_action`, `elicitation_content`, `elicitation_id` |
 | PreCompact | Before conversation compaction | `trigger`, `custom_instructions` |
 | Notification | Agent status notifications | `notification_message`, `notification_title`, `notification_type` |
 | UserPromptSubmit | When user submits prompt | `user_prompt` |
@@ -154,6 +166,9 @@ mcp_servers["name"] = ExternalMCPServerConfig.sse("https://url")          # SSE 
 | SubagentStop | Subagent completion | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
 | SessionStart | Session initialization | `source` |
 | SessionEnd | Session termination | `session_end_reason` |
+| TeammateIdle | A background agent is idle and available | `agent_id`, `agent_type` |
+| TaskCompleted | Background task finished | `task_id`, `task_status`, `task_summary`, `tool_use_id` |
+| ConfigChange | Settings / permissions changed mid-session | `config_change_source`, `config_change_diff` |
 
 `HookMatcher` also supports an optional `timeout` value in seconds for control-protocol hook registrations.
 
@@ -209,8 +224,8 @@ Common context fields (available on all hook events):
 - `session_id` - Current session identifier
 - `transcript_path` - Path to the JSONL transcript file
 - `cwd` - Current working directory
-- `permission_mode` - Permission mode (e.g., `default`, `acceptEdits`, `plan`, `bypassPermissions`)
-- `hook_event_name` - Hook event name (e.g., "PreToolUse", "PreCompact", "Stop")
+- `permission_mode` - Permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk`)
+- `hook_event_name` - Hook event name (e.g., "PreToolUse", "PreCompact", "Stop", "TaskCompleted")
 
 Event-specific fields:
 - `tool_name`, `tool_input`, `tool_use_id` - Tool-related fields
@@ -220,10 +235,15 @@ Event-specific fields:
 - `notification_message`, `notification_title`, `notification_type` - For Notification hook
 - `trigger`, `custom_instructions` - For PreCompact hook
 - `stop_hook_active` - For Stop/SubagentStop hooks
-- `agent_id`, `agent_type`, `agent_transcript_path` - For subagent hooks
+- `agent_id`, `agent_type`, `agent_transcript_path` - For subagent and TeammateIdle hooks
 - `source` - For SessionStart
 - `session_end_reason` - For SessionEnd
 - `permission_suggestions` - For PermissionRequest
+- `mcp_server_name`, `elicitation_message`, `elicitation_mode`, `elicitation_url`, `elicitation_id`, `requested_schema`, `elicitation_action`, `elicitation_content` - For Elicitation / ElicitationResult hooks
+- `task_id`, `task_status`, `task_summary` - For TaskCompleted
+- `config_change_source`, `config_change_diff` - For ConfigChange
+
+`PermissionContext` (passed to `can_use_tool` callbacks) additionally carries `tool_use_id`, `agent_id`, and `blocked_path` for richer permission decisions.
 
 ## Examples
 
@@ -250,6 +270,14 @@ Event-specific fields:
 - [examples/30_session_mutations.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/30_session_mutations.cr): Rename, tag, and inspect saved sessions
 - [examples/31_async_message_controls.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/31_async_message_controls.cr): Prompt suggestions, settings inspection, and queued message cancellation
 - [examples/32_elicitation_support.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/32_elicitation_support.cr): MCP elicitation callbacks and completion events
+- [examples/33_session_subagents.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/33_session_subagents.cr): `fork_session`, `list_subagents`, `get_subagent_messages`, and `delete_session`
+- [examples/34_advanced_subagents.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/34_advanced_subagents.cr): Expanded `AgentDefinition` surface (`disallowed_tools`, `skills`, `memory`, `initial_prompt`, etc.)
+- [examples/35_permission_modes_auto.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/35_permission_modes_auto.cr): `Auto` / `DontAsk` permission modes and rich permission context (`tool_use_id`, `agent_id`, `blocked_path`)
+- [examples/36_transcript_controls.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/36_transcript_controls.cr): `should_query: false` and `include_system_messages`
+- [examples/37_forward_options.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/37_forward_options.cr): Skills, `SystemPromptFile`, `exclude_dynamic_sections`, `task_budget`, `title`, adaptive thinking
+- [examples/38_context_usage.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/38_context_usage.cr): `ClaudeAgent.startup` pre-warming and `get_context_usage`
+- [examples/39_new_hooks.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/39_new_hooks.cr): `TeammateIdle`, `TaskCompleted`, `ConfigChange` hook events
+- [examples/40_mcp_runtime.cr](https://github.com/amscotti/claude-agent-cr/blob/main/examples/40_mcp_runtime.cr): Runtime MCP / plugin controls (`reload_plugins`, `prompt_suggestion`, `enable_mcp_channel`, `set_mcp_servers`)
 
 ## Optional
 
@@ -275,7 +303,8 @@ These live E2E specs cover:
 
 ## Version Notes
 
+- **0.5.0**: `skills` option, `SystemPromptFile`, `SystemPromptPreset#exclude_dynamic_sections`, `task_budget`, `title`; `PermissionMode::Auto` and `DontAsk`; `Effort::Xhigh` tier (default for Claude Opus 4.7); corrected thinking CLI mapping (`--thinking adaptive|disabled`); expanded `AgentDefinition` fields; runtime MCP/plugin controls (`get_context_usage`, `reload_plugins`, `prompt_suggestion`, `set_mcp_servers`, `enable_mcp_channel`); session helpers (`fork_session`, `delete_session`, `list_subagents`, `get_subagent_messages`); `should_query: false` and `include_system_messages`; `ClaudeAgent.startup` pre-warming; new hook events (`TeammateIdle`, `TaskCompleted`, `ConfigChange`); new typed messages (`ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`); W3C trace context propagation; `ResultMessage.terminal_reason`/`errors`, `InitMessage#memory_paths`, `MCPServerStatus#capabilities`; `PermissionContext` gains `tool_use_id`, `agent_id`, `blocked_path`; eight new examples (33-40)
 - **0.4.0**: Session history and mutation APIs, dynamic controls (model, permissions, MCP, flag settings, remote control, proactive mode, session titles), server info, richer task/init/rate-limit/prompt-suggestion/elicitation/unknown message typing, thinking/effort options, `ResultMessage.stop_reason`, fine-grained partial streaming for `include_partial_messages`, prompt suggestions, async message controls, MCP elicitation support, hook/permission propagation parity, hook matcher timeouts, and optional live E2E coverage
 - **0.3.0**: Full hook parity, CompactBoundaryMessage for session compaction detection, all event-specific fields, PermissionRequest hook event
 - **0.2.0**: Added UnknownBlock, Notification hook, resume_session_at, PreCompact hook fields, fixed hook callback dispatch
-- Tested with Claude Code CLI v2.1.71
+- Developed against Claude Code CLI v2.1.84+

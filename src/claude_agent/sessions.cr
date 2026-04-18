@@ -1,5 +1,7 @@
 require "json"
 require "set"
+require "uuid"
+require "file_utils"
 
 module ClaudeAgent
   struct SDKSessionInfo
@@ -47,6 +49,14 @@ module ClaudeAgent
       @message : Hash(String, JSON::Any),
       @parent_tool_use_id : String? = nil,
     )
+    end
+  end
+
+  # Returned by `fork_session`.
+  struct ForkSessionResult
+    getter session_id : String
+
+    def initialize(@session_id : String)
     end
   end
 
@@ -124,11 +134,276 @@ module ClaudeAgent
       )
     end
 
+    # Delete a session by removing its JSONL file and sibling subagent
+    # transcript directory (if any). Raises File::NotFoundError if the
+    # session cannot be located.
+    def delete_session(session_id : String, directory : String? = nil) : Nil
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+
+      file_path = resolve_session_file_path(session_id, directory)
+      unless file_path
+        missing = directory ? File.join(directory, "#{session_id}.jsonl") : "#{session_id}.jsonl"
+        raise File::NotFoundError.new("Session #{session_id} not found", file: missing)
+      end
+
+      File.delete(file_path)
+
+      subagent_dir = Path[file_path].parent.to_s
+      subagent_dir = File.join(subagent_dir, session_id)
+      if Dir.exists?(subagent_dir)
+        begin
+          FileUtils.rm_rf(subagent_dir)
+        rescue File::Error
+        end
+      end
+    end
+
+    # List subagent IDs associated with a session. Subagent transcripts are
+    # stored under `<projectDir>/<sessionId>/subagents/` and may be nested
+    # in subdirectories.
+    def list_subagents(session_id : String, directory : String? = nil) : Array(String)
+      return [] of String unless valid_uuid?(session_id)
+
+      subagents_dir = resolve_subagents_dir(session_id, directory)
+      return [] of String unless subagents_dir
+
+      collect_agent_files(subagents_dir).map { |tuple| tuple[0] }
+    end
+
+    # Read a subagent's conversation messages from its JSONL transcript.
+    def get_subagent_messages(
+      session_id : String,
+      agent_id : String,
+      directory : String? = nil,
+      limit : Int32? = nil,
+      offset : Int32 = 0,
+    ) : Array(SessionMessage)
+      return [] of SessionMessage unless valid_uuid?(session_id)
+      return [] of SessionMessage if agent_id.empty?
+
+      subagents_dir = resolve_subagents_dir(session_id, directory)
+      return [] of SessionMessage unless subagents_dir
+
+      match = collect_agent_files(subagents_dir).find { |tuple| tuple[0] == agent_id }
+      return [] of SessionMessage unless match
+
+      content = File.read(match[1])
+      entries = parse_transcript_entries(content)
+      chain = build_subagent_chain(entries)
+
+      messages = chain.compact_map do |entry|
+        next unless {"user", "assistant"}.includes?(string_field(entry, "type"))
+        to_session_message(entry)
+      end
+
+      start = Math.max(offset, 0)
+      return [] of SessionMessage if start >= messages.size
+
+      if limit && limit > 0
+        messages[start, limit]? || [] of SessionMessage
+      else
+        messages[start..] || [] of SessionMessage
+      end
+    rescue File::Error
+      [] of SessionMessage
+    end
+
+    # Fork a session into a new branch with fresh UUIDs. Copies transcript
+    # messages, remapping every message UUID and preserving the `parentUuid`
+    # chain. When `up_to_message_id` is provided, the transcript is sliced
+    # at (and including) that message.
+    def fork_session(
+      session_id : String,
+      directory : String? = nil,
+      up_to_message_id : String? = nil,
+      title : String? = nil,
+    ) : ForkSessionResult
+      validate_fork_inputs!(session_id, up_to_message_id)
+
+      file_path, project_dir = locate_fork_source!(session_id, directory)
+      content = File.read(file_path)
+      raise ArgumentError.new("Session #{session_id} has no messages to fork") if content.empty?
+
+      transcript, content_replacements = prepare_fork_transcript(content, session_id, up_to_message_id)
+      uuid_mapping = build_fork_uuid_mapping(transcript)
+      writable = transcript.reject { |entry| string_field(entry, "type") == "progress" }
+      raise ArgumentError.new("Session #{session_id} has no messages to fork") if writable.empty?
+
+      by_uuid = index_transcript(transcript)
+      forked_session_id = UUID.random.to_s
+
+      lines = build_fork_lines(
+        writable,
+        by_uuid,
+        uuid_mapping,
+        forked_session_id,
+        session_id,
+      )
+      append_fork_footer(lines, forked_session_id, content, content_replacements, title)
+
+      fork_path = File.join(project_dir, "#{forked_session_id}.jsonl")
+      File.open(fork_path, "w") do |file|
+        lines.each { |line| file << line << "\n" }
+      end
+
+      ForkSessionResult.new(forked_session_id)
+    end
+
+    private def validate_fork_inputs!(session_id : String, up_to_message_id : String?)
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+      if up_to_message_id && !valid_uuid?(up_to_message_id)
+        raise ArgumentError.new("Invalid up_to_message_id: #{up_to_message_id}")
+      end
+    end
+
+    private def locate_fork_source!(
+      session_id : String,
+      directory : String?,
+    ) : Tuple(String, String)
+      source = find_session_file_with_dir(session_id, directory)
+      return source if source
+
+      raise File::NotFoundError.new("Session #{session_id} not found", file: "#{session_id}.jsonl")
+    end
+
+    private def prepare_fork_transcript(
+      content : String,
+      session_id : String,
+      up_to_message_id : String?,
+    ) : Tuple(Array(TranscriptEntry), Array(JSON::Any))
+      transcript, content_replacements = parse_fork_transcript(content, session_id)
+      transcript.reject! { |entry| bool_field(entry, "isSidechain") }
+      raise ArgumentError.new("Session #{session_id} has no messages to fork") if transcript.empty?
+
+      if up_to_message_id
+        cutoff = transcript.index { |entry| string_field(entry, "uuid") == up_to_message_id }
+        unless cutoff
+          raise ArgumentError.new("Message #{up_to_message_id} not found in session #{session_id}")
+        end
+        transcript = transcript[0..cutoff]
+      end
+
+      {transcript, content_replacements}
+    end
+
+    private def build_fork_uuid_mapping(transcript : Array(TranscriptEntry)) : Hash(String, String)
+      mapping = {} of String => String
+      transcript.each do |entry|
+        uuid = string_field(entry, "uuid")
+        mapping[uuid] = UUID.random.to_s if uuid
+      end
+      mapping
+    end
+
+    private def index_transcript(transcript : Array(TranscriptEntry)) : Hash(String, TranscriptEntry)
+      by_uuid = {} of String => TranscriptEntry
+      transcript.each do |entry|
+        uuid = string_field(entry, "uuid")
+        by_uuid[uuid] = entry if uuid
+      end
+      by_uuid
+    end
+
+    private def build_fork_lines(
+      writable : Array(TranscriptEntry),
+      by_uuid : Hash(String, TranscriptEntry),
+      uuid_mapping : Hash(String, String),
+      forked_session_id : String,
+      original_session_id : String,
+    ) : Array(String)
+      lines = [] of String
+      now = Time.utc.to_rfc3339
+
+      writable.each_with_index do |original, index|
+        original_uuid = string_field(original, "uuid")
+        next unless original_uuid
+
+        new_uuid = uuid_mapping[original_uuid]?
+        next unless new_uuid
+
+        entry = remap_fork_entry(
+          original,
+          original_uuid,
+          new_uuid,
+          by_uuid,
+          uuid_mapping,
+          forked_session_id,
+          original_session_id,
+          index == writable.size - 1,
+          now,
+        )
+        lines << entry.to_json
+      end
+
+      lines
+    end
+
+    private def remap_fork_entry(
+      original : TranscriptEntry,
+      original_uuid : String,
+      new_uuid : String,
+      by_uuid : Hash(String, TranscriptEntry),
+      uuid_mapping : Hash(String, String),
+      forked_session_id : String,
+      original_session_id : String,
+      is_leaf : Bool,
+      now : String,
+    ) : Hash(String, JSON::Any)
+      forked = {} of String => JSON::Any
+      original.each { |k, v| forked[k] = v }
+
+      new_parent = resolve_fork_parent(original, by_uuid, uuid_mapping)
+      timestamp = is_leaf ? now : (string_field(original, "timestamp") || now)
+      logical_parent = string_field(original, "logicalParentUuid")
+
+      forked["uuid"] = JSON::Any.new(new_uuid)
+      forked["parentUuid"] = new_parent ? JSON::Any.new(new_parent) : JSON::Any.new(nil)
+      if logical_parent
+        forked["logicalParentUuid"] = JSON::Any.new(uuid_mapping[logical_parent]? || logical_parent)
+      end
+      forked["sessionId"] = JSON::Any.new(forked_session_id)
+      forked["timestamp"] = JSON::Any.new(timestamp)
+      forked["isSidechain"] = JSON::Any.new(false)
+      forked["forkedFrom"] = JSON::Any.new({
+        "sessionId"   => JSON::Any.new(original_session_id),
+        "messageUuid" => JSON::Any.new(original_uuid),
+      })
+      %w[teamName agentName slug sourceToolAssistantUUID].each { |key| forked.delete(key) }
+      forked
+    end
+
+    private def append_fork_footer(
+      lines : Array(String),
+      forked_session_id : String,
+      content : String,
+      content_replacements : Array(JSON::Any),
+      explicit_title : String?,
+    ) : Nil
+      unless content_replacements.empty?
+        lines << {
+          "type"         => JSON::Any.new("content-replacement"),
+          "sessionId"    => JSON::Any.new(forked_session_id),
+          "replacements" => JSON::Any.new(content_replacements),
+        }.to_json
+      end
+
+      title = explicit_title.try(&.strip)
+      title = nil if title && title.empty?
+      title ||= derive_fork_title(content)
+
+      lines << {
+        "type"        => JSON::Any.new("custom-title"),
+        "sessionId"   => JSON::Any.new(forked_session_id),
+        "customTitle" => JSON::Any.new(title),
+      }.to_json
+    end
+
     def get_session_messages(
       session_id : String,
       directory : String? = nil,
       limit : Int32? = nil,
       offset : Int32 = 0,
+      include_system_messages : Bool = false,
     ) : Array(SessionMessage)
       return [] of SessionMessage unless valid_uuid?(session_id)
 
@@ -142,7 +417,7 @@ module ClaudeAgent
       entries = parse_transcript_entries(content)
       chain = build_conversation_chain(entries)
       messages = chain.compact_map do |entry|
-        next unless visible_message?(entry)
+        next unless visible_message?(entry, include_system_messages)
         to_session_message(entry)
       end
 
@@ -380,9 +655,13 @@ module ClaudeAgent
       end
     end
 
-    private def visible_message?(entry : TranscriptEntry) : Bool
+    private def visible_message?(
+      entry : TranscriptEntry,
+      include_system_messages : Bool = false,
+    ) : Bool
       type = string_field(entry, "type")
-      return false unless {"user", "assistant"}.includes?(type)
+      allowed = include_system_messages ? {"user", "assistant", "system"} : {"user", "assistant"}
+      return false unless allowed.includes?(type)
       return false if bool_field(entry, "isMeta")
       return false if bool_field(entry, "isSidechain")
 
@@ -770,6 +1049,184 @@ module ClaudeAgent
       nil
     end
 
+    private def resolve_subagents_dir(session_id : String, directory : String?) : String?
+      file_path = resolve_session_file_path(session_id, directory)
+      return nil unless file_path
+
+      project_dir = Path[file_path].parent.to_s
+      File.join(project_dir, session_id, "subagents")
+    end
+
+    private def collect_agent_files(base_dir : String) : Array({String, String})
+      results = [] of {String, String}
+      return results unless Dir.exists?(base_dir)
+
+      walk_agent_files(base_dir, results)
+      results
+    end
+
+    private def walk_agent_files(current : String, results : Array({String, String})) : Nil
+      entries = begin
+        Dir.children(current).sort!
+      rescue File::Error
+        return
+      end
+
+      entries.each do |entry|
+        path = File.join(current, entry)
+        if File.file?(path) && entry.starts_with?("agent-") && entry.ends_with?(".jsonl")
+          agent_id = entry.lchop("agent-").rchop(".jsonl")
+          results << {agent_id, path}
+        elsif Dir.exists?(path)
+          walk_agent_files(path, results)
+        end
+      end
+    end
+
+    private def build_subagent_chain(entries : Array(TranscriptEntry)) : Array(TranscriptEntry)
+      return [] of TranscriptEntry if entries.empty?
+
+      by_uuid = {} of String => TranscriptEntry
+      entries.each do |entry|
+        uuid = string_field(entry, "uuid")
+        by_uuid[uuid] = entry if uuid
+      end
+
+      leaf = nil.as(TranscriptEntry?)
+      entries.reverse_each do |entry|
+        type = string_field(entry, "type")
+        if type == "user" || type == "assistant"
+          leaf = entry
+          break
+        end
+      end
+
+      return [] of TranscriptEntry unless leaf
+
+      chain = [] of TranscriptEntry
+      seen = Set(String).new
+      current = leaf
+
+      loop do
+        break unless current
+        uuid = string_field(current, "uuid")
+        break unless uuid
+        break if seen.includes?(uuid)
+
+        seen.add(uuid)
+        chain << current
+
+        parent = string_field(current, "parentUuid")
+        break unless parent
+        current = by_uuid[parent]?
+      end
+
+      chain.reverse!
+      chain
+    end
+
+    private def find_session_file_with_dir(
+      session_id : String,
+      directory : String?,
+    ) : Tuple(String, String)?
+      file_name = "#{session_id}.jsonl"
+
+      if directory
+        canonical_dir = canonicalize_path(directory)
+        project_dir = find_project_dir(canonical_dir)
+        if project_dir && appendable_session_file?(path = File.join(project_dir, file_name))
+          return {path, project_dir}
+        end
+
+        worktree_paths(canonical_dir).each do |worktree_path|
+          next if worktree_path == canonical_dir
+          worktree_dir = find_project_dir(worktree_path)
+          next unless worktree_dir
+          candidate = File.join(worktree_dir, file_name)
+          return {candidate, worktree_dir} if appendable_session_file?(candidate)
+        end
+
+        return nil
+      end
+
+      projects_dir = projects_dir_path
+      return nil unless Dir.exists?(projects_dir)
+
+      Dir.children(projects_dir).each do |entry|
+        project_dir = File.join(projects_dir, entry)
+        next unless Dir.exists?(project_dir)
+
+        candidate = File.join(project_dir, file_name)
+        return {candidate, project_dir} if appendable_session_file?(candidate)
+      end
+
+      nil
+    rescue File::Error
+      nil
+    end
+
+    private def parse_fork_transcript(
+      content : String,
+      session_id : String,
+    ) : Tuple(Array(TranscriptEntry), Array(JSON::Any))
+      transcript = [] of TranscriptEntry
+      content_replacements = [] of JSON::Any
+      transcript_types = {"user", "assistant", "attachment", "system", "progress"}
+
+      content.each_line do |raw_line|
+        line = raw_line.strip
+        next if line.empty?
+
+        begin
+          data = JSON.parse(line)
+          entry = data.as_h?
+          next unless entry
+
+          type = string_field(entry, "type")
+          uuid = string_field(entry, "uuid")
+          if type && uuid && transcript_types.includes?(type)
+            transcript << entry
+          elsif type == "content-replacement" && string_field(entry, "sessionId") == session_id
+            replacements = entry["replacements"]?.try(&.as_a?)
+            replacements.try(&.each { |item| content_replacements << item })
+          end
+        rescue JSON::ParseException
+        end
+      end
+
+      {transcript, content_replacements}
+    end
+
+    private def resolve_fork_parent(
+      original : TranscriptEntry,
+      by_uuid : Hash(String, TranscriptEntry),
+      uuid_mapping : Hash(String, String),
+    ) : String?
+      parent_id = string_field(original, "parentUuid")
+
+      while parent_id
+        parent = by_uuid[parent_id]?
+        break unless parent
+
+        if string_field(parent, "type") != "progress"
+          return uuid_mapping[parent_id]?
+        end
+
+        parent_id = string_field(parent, "parentUuid")
+      end
+
+      nil
+    end
+
+    private def derive_fork_title(content : String) : String
+      entries = parse_jsonl_entries(content)
+      base = last_string_field(entries, "customTitle") ||
+             last_string_field(entries, "aiTitle") ||
+             extract_first_prompt(entries) ||
+             "Forked session"
+      "#{base} (fork)"
+    end
+
     private def simple_hash(value : String) : String
       hash = 0_i64
 
@@ -814,8 +1271,15 @@ module ClaudeAgent
     directory : String? = nil,
     limit : Int32? = nil,
     offset : Int32 = 0,
+    include_system_messages : Bool = false,
   ) : Array(SessionMessage)
-    SessionStorage.get_session_messages(session_id, directory, limit, offset)
+    SessionStorage.get_session_messages(
+      session_id,
+      directory,
+      limit,
+      offset,
+      include_system_messages,
+    )
   end
 
   def self.rename_session(
@@ -832,5 +1296,32 @@ module ClaudeAgent
     directory : String? = nil,
   ) : Nil
     SessionStorage.tag_session(session_id, tag, directory)
+  end
+
+  def self.delete_session(session_id : String, directory : String? = nil) : Nil
+    SessionStorage.delete_session(session_id, directory)
+  end
+
+  def self.list_subagents(session_id : String, directory : String? = nil) : Array(String)
+    SessionStorage.list_subagents(session_id, directory)
+  end
+
+  def self.get_subagent_messages(
+    session_id : String,
+    agent_id : String,
+    directory : String? = nil,
+    limit : Int32? = nil,
+    offset : Int32 = 0,
+  ) : Array(SessionMessage)
+    SessionStorage.get_subagent_messages(session_id, agent_id, directory, limit, offset)
+  end
+
+  def self.fork_session(
+    session_id : String,
+    directory : String? = nil,
+    up_to_message_id : String? = nil,
+    title : String? = nil,
+  ) : ForkSessionResult
+    SessionStorage.fork_session(session_id, directory, up_to_message_id, title)
   end
 end

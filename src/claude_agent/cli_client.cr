@@ -82,9 +82,9 @@ module ClaudeAgent
     end
 
     private def build_env : Hash(String, String)?
-      base_env = @options.try(&.env) || {} of String => String
+      base_env = @options.try(&.env).try(&.dup) || {} of String => String
 
-      # Set SDK entrypoint identifier (matches official SDK behavior)
+      # SDK entrypoint identifier used by Claude Code to distinguish clients.
       base_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cr"
 
       if @options.try(&.include_partial_messages?)
@@ -94,6 +94,17 @@ module ClaudeAgent
       # User identifier for tracking
       if user = @options.try(&.user)
         base_env["CLAUDE_CODE_USER"] = user
+      end
+
+      # Propagate W3C trace context to the subprocess when the caller has
+      # already populated it in their environment, so CLI spans parent
+      # under the caller's distributed trace. Explicit values in
+      # options.env always win.
+      %w[TRACEPARENT TRACESTATE].each do |key|
+        next if base_env.has_key?(key)
+        if value = ENV[key]?
+          base_env[key] = value
+        end
       end
 
       base_env
@@ -107,12 +118,21 @@ module ClaudeAgent
       @running = false
     end
 
-    def send_prompt(prompt : String, parent_tool_use_id : String? = nil, *, uuid : String? = nil)
-      message = Hash(String, String | Hash(String, String) | Nil).new
+    # Send a user prompt. When `should_query` is false the message is
+    # appended to the transcript without triggering an assistant turn.
+    def send_prompt(
+      prompt : String,
+      parent_tool_use_id : String? = nil,
+      *,
+      uuid : String? = nil,
+      should_query : Bool = true,
+    )
+      message = Hash(String, String | Hash(String, String) | Bool | Nil).new
       message["type"] = "user"
       message["message"] = {"role" => "user", "content" => prompt}
       message["parent_tool_use_id"] = parent_tool_use_id if parent_tool_use_id
       message["uuid"] = uuid if uuid
+      message["should_query"] = false unless should_query
 
       send_json(message)
     end
@@ -122,8 +142,9 @@ module ClaudeAgent
       parent_tool_use_id : String? = nil,
       *,
       uuid : String? = nil,
+      should_query : Bool = true,
     )
-      send_prompt(content, parent_tool_use_id, uuid: uuid)
+      send_prompt(content, parent_tool_use_id, uuid: uuid, should_query: should_query)
     end
 
     def send_json(message)
@@ -242,6 +263,8 @@ module ClaudeAgent
 
       opts.max_turns.try { |turns| args << "--max-turns" << turns.to_s }
       opts.max_budget_usd.try { |budget| args << "--max-budget-usd" << budget.to_s }
+      opts.task_budget.try { |budget| args << "--task-budget" << budget.total.to_s }
+      opts.title.try { |title| args << "--title" << title }
       opts.betas.try { |betas| args << "--betas" << betas.join(" ") }
     end
 
@@ -250,8 +273,12 @@ module ClaudeAgent
       when String
         args << "--system-prompt" << system_prompt
       when SystemPromptPreset
-        args << "--system-prompt" << system_prompt.preset
+        # Preset is implicit when only append/exclude_dynamic_sections are set;
+        # only the `append` portion is a direct CLI arg.
         system_prompt.append.try { |append| args << "--append-system-prompt" << append }
+        args << "--exclude-dynamic-sections" if system_prompt.exclude_dynamic_sections?
+      when SystemPromptFile
+        args << "--system-prompt-file" << system_prompt.path
       end
 
       opts.append_system_prompt.try { |append| args << "--append-system-prompt" << append }
@@ -267,14 +294,26 @@ module ClaudeAgent
       when Effort::Low    then "low"
       when Effort::Medium then "medium"
       when Effort::High   then "high"
+      when Effort::Xhigh  then "xhigh"
       when Effort::Max    then "max"
       else                     "medium"
       end
     end
 
+    # `thinking` takes precedence over the deprecated `max_thinking_tokens`.
+    # Adaptive/disabled modes emit `--thinking <mode>`; enabled mode emits
+    # `--max-thinking-tokens <budget>`.
     private def add_thinking_args(args : Array(String), opts : AgentOptions)
-      resolved_max_thinking_tokens = resolve_max_thinking_tokens(opts)
-      resolved_max_thinking_tokens.try do |tokens|
+      if thinking = opts.thinking
+        case thinking
+        when ThinkingConfigAdaptive
+          args << "--thinking" << "adaptive"
+        when ThinkingConfigEnabled
+          args << "--max-thinking-tokens" << thinking.budget_tokens.to_s
+        when ThinkingConfigDisabled
+          args << "--thinking" << "disabled"
+        end
+      elsif tokens = opts.max_thinking_tokens
         args << "--max-thinking-tokens" << tokens.to_s
       end
 
@@ -283,25 +322,9 @@ module ClaudeAgent
       end
     end
 
-    private def resolve_max_thinking_tokens(opts : AgentOptions) : Int32?
-      resolved = opts.max_thinking_tokens
-
-      if thinking = opts.thinking
-        case thinking
-        when ThinkingConfigAdaptive
-          resolved ||= 32_000
-        when ThinkingConfigEnabled
-          resolved = thinking.budget_tokens
-        when ThinkingConfigDisabled
-          resolved = 0
-        end
-      end
-
-      resolved
-    end
-
     private def add_tool_args(args : Array(String), opts : AgentOptions)
-      opts.allowed_tools.try { |tools| args << "--allowedTools" << tools.join(" ") }
+      effective_allowed, _ = apply_skills_defaults(opts)
+      args << "--allowedTools" << effective_allowed.join(" ") unless effective_allowed.empty?
       opts.disallowed_tools.try { |tools| args << "--disallowedTools" << tools.join(" ") }
 
       add_tools_option_args(args, opts)
@@ -315,6 +338,33 @@ module ClaudeAgent
 
       opts.agents.try { |agents| args << "--agents" << build_agents_json(agents) }
       opts.agent.try { |agent| args << "--agent" << agent }
+    end
+
+    # Compute effective allowed_tools/setting_sources from `skills`.
+    # Injects `Skill` or `Skill(name)` entries into allowed_tools and defaults
+    # setting_sources to ["user","project"] when unset. Returns copies; does
+    # not mutate `opts`.
+    protected def apply_skills_defaults(opts : AgentOptions) : {Array(String), Array(String)?}
+      allowed = opts.allowed_tools.try(&.dup) || [] of String
+      sources = opts.setting_sources.try(&.dup)
+
+      case skills = opts.skills
+      when Nil
+        # No-op. CLI defaults still apply.
+      when String
+        if skills == "all"
+          allowed << "Skill" unless allowed.includes?("Skill")
+          sources ||= ["user", "project"]
+        end
+      when Array(String)
+        skills.each do |name|
+          pattern = "Skill(#{name})"
+          allowed << pattern unless allowed.includes?(pattern)
+        end
+        sources ||= ["user", "project"]
+      end
+
+      {allowed, sources}
     end
 
     private def add_tools_option_args(args : Array(String), opts : AgentOptions)
@@ -341,7 +391,20 @@ module ClaudeAgent
         agent_obj["description"] = JSON::Any.new(defn.description)
         agent_obj["prompt"] = JSON::Any.new(defn.prompt)
         defn.tools.try { |tools| agent_obj["tools"] = JSON::Any.new(tools.map { |tool| JSON::Any.new(tool) }) }
+        defn.disallowed_tools.try do |tools|
+          agent_obj["disallowedTools"] = JSON::Any.new(tools.map { |tool| JSON::Any.new(tool) })
+        end
         defn.model.try { |model| agent_obj["model"] = JSON::Any.new(model) }
+        defn.skills.try do |skills|
+          agent_obj["skills"] = JSON::Any.new(skills.map { |skill| JSON::Any.new(skill) })
+        end
+        defn.memory.try { |memory| agent_obj["memory"] = JSON::Any.new(memory) }
+        defn.mcp_servers.try { |servers| agent_obj["mcpServers"] = JSON::Any.new(servers) }
+        defn.initial_prompt.try { |prompt| agent_obj["initialPrompt"] = JSON::Any.new(prompt) }
+        defn.max_turns.try { |turns| agent_obj["maxTurns"] = JSON::Any.new(turns.to_i64) }
+        defn.background?.try { |background| agent_obj["background"] = JSON::Any.new(background) }
+        defn.effort.try { |effort| agent_obj["effort"] = effort }
+        defn.permission_mode.try { |mode| agent_obj["permissionMode"] = JSON::Any.new(mode) }
         result[name] = JSON::Any.new(agent_obj)
       end
       result.to_json
@@ -414,8 +477,17 @@ module ClaudeAgent
     end
 
     private def add_session_settings_args(args : Array(String), opts : AgentOptions)
-      # --setting-sources takes comma-separated values
-      opts.setting_sources.try { |sources| args << "--setting-sources" << sources.join(",") }
+      # --setting-sources takes comma-separated values. An empty array disables
+      # all filesystem settings; it must be passed as a single `--setting-sources=`
+      # token so the CLI does not consume the next flag as its value.
+      _, effective_sources = apply_skills_defaults(opts)
+      effective_sources.try do |sources|
+        if sources.empty?
+          args << "--setting-sources="
+        else
+          args << "--setting-sources" << sources.join(",")
+        end
+      end
 
       # --settings takes a path or JSON string
       # If sandbox settings are provided without a settings_path, serialize them

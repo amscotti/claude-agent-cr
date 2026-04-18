@@ -35,6 +35,12 @@ module ClaudeAgent
       "user_prompt_submit"    => "user_prompt_submit",
       "Stop"                  => "stop",
       "stop"                  => "stop",
+      "TeammateIdle"          => "teammate_idle",
+      "teammate_idle"         => "teammate_idle",
+      "TaskCompleted"         => "task_completed",
+      "task_completed"        => "task_completed",
+      "ConfigChange"          => "config_change",
+      "config_change"         => "config_change",
     }
 
     private struct HookCallbackRegistration
@@ -119,6 +125,15 @@ module ClaudeAgent
       request["promptSuggestions"] = JSON::Any.new(true) if @options.try(&.prompt_suggestions?)
       request["agentProgressSummaries"] = JSON::Any.new(true) if @options.try(&.agent_progress_summaries?)
 
+      # Forward `skills` to the CLI so a supporting CLI can filter which
+      # skills are loaded into the system prompt. Older CLIs ignore this.
+      case skills = @options.try(&.skills)
+      when String
+        request["skills"] = JSON::Any.new(skills)
+      when Array(String)
+        request["skills"] = JSON::Any.new(skills.map { |skill| JSON::Any.new(skill) })
+      end
+
       response = send_control_request(request, 90.seconds)
       @server_info = response.empty? ? nil : ServerInfo.from_data(response)
       @sdk_init_sent = true
@@ -133,9 +148,9 @@ module ClaudeAgent
     end
 
     # Send a query and get responses
-    def query(prompt : String, *, uuid : String? = nil)
-      trigger_hook(:user_prompt_submit, prompt)
-      @cli_client.send_prompt(prompt, uuid: uuid)
+    def query(prompt : String, *, uuid : String? = nil, should_query : Bool = true)
+      trigger_hook(:user_prompt_submit, prompt) if should_query
+      @cli_client.send_prompt(prompt, uuid: uuid, should_query: should_query)
     end
 
     def cancel_async_message(message_uuid : String) : Bool
@@ -190,6 +205,52 @@ module ClaudeAgent
       response = response.dup
       response["mcpServers"] ||= JSON::Any.new([] of JSON::Any)
       MCPStatusResponse.from_json(response.to_json)
+    end
+
+    # Retrieve a breakdown of context window usage by category.
+    # ameba:disable Naming/AccessorMethodName
+    def get_context_usage : ContextUsageResponse
+      response = send_control_request({
+        "subtype" => JSON::Any.new("get_context_usage"),
+      })
+
+      ContextUsageResponse.from_json(response.to_json)
+    end
+
+    # Reload plugins and receive refreshed commands, agents, and MCP servers.
+    # Returns the raw response payload (shape mirrors system/init).
+    def reload_plugins : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype" => JSON::Any.new("reload_plugins"),
+      })
+    end
+
+    # Request a prompt suggestion based on the current conversation context.
+    # Returns the response payload; the suggestion itself is typically
+    # delivered as a `prompt_suggestion` SDK message.
+    def prompt_suggestion : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype" => JSON::Any.new("prompt_suggestion"),
+      })
+    end
+
+    # Replace the active MCP server configuration at runtime.
+    # Accepts a hash mirroring the `mcpServers` entries from options.
+    # ameba:disable Naming/AccessorMethodName
+    def set_mcp_servers(mcp_servers : Hash(String, JSON::Any))
+      send_control_request({
+        "subtype"    => JSON::Any.new("mcp_set_servers"),
+        "mcpServers" => JSON::Any.new(mcp_servers),
+      })
+    end
+
+    # Activate the tools channel on an MCP server that advertises it
+    # lazily. No-op for servers that are already fully connected.
+    def enable_mcp_channel(server_name : String)
+      send_control_request({
+        "subtype"    => JSON::Any.new("mcp_enable_channel"),
+        "serverName" => JSON::Any.new(server_name),
+      })
     end
 
     # ameba:disable Naming/AccessorMethodName
@@ -305,10 +366,11 @@ module ClaudeAgent
       end
     end
 
-    # Send a follow-up message
-    def send_user_message(content : String, *, uuid : String? = nil)
-      trigger_hook(:user_prompt_submit, content)
-      @cli_client.send_user_message(content, uuid: uuid)
+    # Send a follow-up message. Pass `should_query: false` to append the
+    # message to the transcript without triggering an assistant turn.
+    def send_user_message(content : String, *, uuid : String? = nil, should_query : Bool = true)
+      trigger_hook(:user_prompt_submit, content) if should_query
+      @cli_client.send_user_message(content, uuid: uuid, should_query: should_query)
     end
 
     # Send permission response
@@ -531,6 +593,9 @@ module ClaudeAgent
       add_simple_hook_payload(payload, "SubagentStart", hooks.subagent_start)
       add_simple_hook_payload(payload, "SubagentStop", hooks.subagent_stop)
       add_simple_hook_payload(payload, "Stop", hooks.stop)
+      add_simple_hook_payload(payload, "TeammateIdle", hooks.teammate_idle)
+      add_simple_hook_payload(payload, "TaskCompleted", hooks.task_completed)
+      add_simple_hook_payload(payload, "ConfigChange", hooks.config_change)
 
       payload.empty? ? nil : payload
     end
@@ -958,6 +1023,9 @@ module ClaudeAgent
                           tool_input: req.input,
                           session_id: session_id || "unknown",
                           suggestions: parse_permission_suggestions(req.permission_suggestions),
+                          tool_use_id: req.tool_use_id,
+                          agent_id: req.agent_id,
+                          blocked_path: req.blocked_path,
                         )
                         permission_result_to_response(callback.call(context), req.input)
                       else
@@ -1092,6 +1160,17 @@ module ClaudeAgent
         input = apply_elicitation_fields(input, input_data)
         input.elicitation_action = extract_string(input_data, "action")
         input.elicitation_content = extract_hash(input_data, "content")
+      when "task_completed"
+        input.task_id = extract_string(input_data, "task_id", "taskId")
+        input.task_status = extract_string(input_data, "status")
+        input.task_summary = extract_string(input_data, "summary")
+        input.tool_use_id = extract_string(input_data, "tool_use_id", "toolUseId")
+      when "teammate_idle"
+        input.agent_id = extract_string(input_data, "agent_id", "agentId")
+        input.agent_type = extract_string(input_data, "agent_type", "agentType")
+      when "config_change"
+        input.config_change_source = extract_string(input_data, "source", "changeSource")
+        input.config_change_diff = extract_hash(input_data, "diff", "change")
       end
 
       input
@@ -1274,6 +1353,8 @@ module ClaudeAgent
       when "acceptEdits"       then PermissionMode::AcceptEdits
       when "plan"              then PermissionMode::Plan
       when "bypassPermissions" then PermissionMode::BypassPermissions
+      when "auto"              then PermissionMode::Auto
+      when "dontAsk"           then PermissionMode::DontAsk
       end
     end
 

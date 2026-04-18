@@ -147,12 +147,23 @@ module ClaudeAgent
     property tool_input : Hash(String, JSON::Any)
     property session_id : String
     property suggestions : Array(PermissionSuggestion)?
+    # Unique identifier for this specific tool call. Multiple parallel tool
+    # calls in the same assistant message will have different tool_use_ids.
+    property tool_use_id : String?
+    # When running inside a subagent, the subagent's ID.
+    property agent_id : String?
+    # For file-write permission requests, the blocked path the caller tried
+    # to access. Useful for building `addRules` suggestions.
+    property blocked_path : String?
 
     def initialize(
       @tool_name : String,
       @tool_input : Hash(String, JSON::Any),
       @session_id : String,
       @suggestions : Array(PermissionSuggestion)? = nil,
+      @tool_use_id : String? = nil,
+      @agent_id : String? = nil,
+      @blocked_path : String? = nil,
     )
     end
   end

@@ -30,10 +30,6 @@ class TestableCLIClient < ClaudeAgent::CLIClient
   def test_effort_value(effort : ClaudeAgent::Effort) : String
     effort_value(effort)
   end
-
-  def test_resolve_max_thinking_tokens(opts : ClaudeAgent::AgentOptions) : Int32?
-    resolve_max_thinking_tokens(opts)
-  end
 end
 
 describe ClaudeAgent::CLIClient do
@@ -134,47 +130,51 @@ describe TestableCLIClient do
       client.test_effort_value(ClaudeAgent::Effort::Low).should eq("low")
       client.test_effort_value(ClaudeAgent::Effort::Medium).should eq("medium")
       client.test_effort_value(ClaudeAgent::Effort::High).should eq("high")
+      client.test_effort_value(ClaudeAgent::Effort::Xhigh).should eq("xhigh")
       client.test_effort_value(ClaudeAgent::Effort::Max).should eq("max")
     end
   end
 
-  describe "#resolve_max_thinking_tokens" do
-    it "uses max_thinking_tokens when no thinking config is set" do
-      opts = ClaudeAgent::AgentOptions.new(max_thinking_tokens: 4096)
-      client = TestableCLIClient.new
-      client.test_resolve_max_thinking_tokens(opts).should eq(4096)
+  describe "#build_cli_args thinking args" do
+    it "emits --max-thinking-tokens when only max_thinking_tokens is set" do
+      options = ClaudeAgent::AgentOptions.new(max_thinking_tokens: 4096)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+      args.should contain("--max-thinking-tokens")
+      args.should contain("4096")
+      args.should_not contain("--thinking")
     end
 
-    it "uses adaptive thinking default when no explicit budget is set" do
-      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.adaptive)
-      client = TestableCLIClient.new
-      client.test_resolve_max_thinking_tokens(opts).should eq(32_000)
+    it "emits --thinking adaptive for adaptive thinking config" do
+      options = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.adaptive)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+      idx = args.index("--thinking")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("adaptive") if idx
+      args.should_not contain("--max-thinking-tokens")
     end
 
-    it "preserves explicit max_thinking_tokens for adaptive thinking" do
-      opts = ClaudeAgent::AgentOptions.new(
-        max_thinking_tokens: 16_000,
-        thinking: ClaudeAgent::ThinkingConfig.adaptive,
-      )
-      client = TestableCLIClient.new
-      client.test_resolve_max_thinking_tokens(opts).should eq(16_000)
+    it "emits --thinking disabled for disabled thinking config" do
+      options = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.disabled)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+      idx = args.index("--thinking")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("disabled") if idx
+      args.should_not contain("--max-thinking-tokens")
     end
 
-    it "uses enabled thinking budget tokens" do
-      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.enabled(12_000))
-      client = TestableCLIClient.new
-      client.test_resolve_max_thinking_tokens(opts).should eq(12_000)
+    it "emits --max-thinking-tokens for enabled thinking config" do
+      options = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.enabled(12_000))
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+      args.should contain("--max-thinking-tokens")
+      args.should contain("12000")
+      args.should_not contain("--thinking")
     end
 
-    it "uses zero tokens when thinking is disabled" do
-      opts = ClaudeAgent::AgentOptions.new(thinking: ClaudeAgent::ThinkingConfig.disabled)
-      client = TestableCLIClient.new
-      client.test_resolve_max_thinking_tokens(opts).should eq(0)
-    end
-  end
-
-  describe "#build_cli_args" do
-    it "adds max-thinking-tokens and effort flags" do
+    it "adds effort flags alongside thinking config" do
       options = ClaudeAgent::AgentOptions.new(
         thinking: ClaudeAgent::ThinkingConfig.enabled(8192),
         effort: ClaudeAgent::Effort::High,
@@ -186,6 +186,100 @@ describe TestableCLIClient do
       args.should contain("8192")
       args.should contain("--effort")
       args.should contain("high")
+    end
+  end
+
+  describe "#build_cli_args skills handling" do
+    it "injects the bare Skill tool when skills is \"all\"" do
+      options = ClaudeAgent::AgentOptions.new(skills: "all")
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--allowedTools")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should contain("Skill") if idx
+
+      source_idx = args.index("--setting-sources")
+      source_idx.should_not be_nil
+      args[source_idx.as(Int32) + 1].should eq("user,project") if source_idx
+    end
+
+    it "injects Skill(name) entries when given a list" do
+      options = ClaudeAgent::AgentOptions.new(skills: ["git", "playwright"])
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--allowedTools")
+      idx.should_not be_nil
+      value = args[idx.as(Int32) + 1] if idx
+      value.try(&.includes?("Skill(git)")).should be_true
+      value.try(&.includes?("Skill(playwright)")).should be_true
+    end
+
+    it "does not touch setting_sources when caller set one explicitly" do
+      options = ClaudeAgent::AgentOptions.new(skills: "all", setting_sources: ["local"])
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--setting-sources")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("local") if idx
+    end
+
+    it "emits single --setting-sources= token for an empty array" do
+      options = ClaudeAgent::AgentOptions.new(setting_sources: [] of String)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--setting-sources=")
+      args.should_not contain("--setting-sources")
+    end
+  end
+
+  describe "#build_cli_args with task_budget and title" do
+    it "emits --task-budget and --title flags" do
+      options = ClaudeAgent::AgentOptions.new(
+        task_budget: ClaudeAgent::TaskBudget.new(120_000),
+        title: "refactor session",
+      )
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--task-budget")
+      args.should contain("120000")
+      args.should contain("--title")
+      args.should contain("refactor session")
+    end
+  end
+
+  describe "#build_cli_args SystemPromptFile" do
+    it "emits --system-prompt-file for file-backed prompts" do
+      options = ClaudeAgent::AgentOptions.new(
+        system_prompt: ClaudeAgent::SystemPromptFile.new("/tmp/prompt.md"),
+      )
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--system-prompt-file")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("/tmp/prompt.md") if idx
+    end
+  end
+
+  describe "#build_cli_args SystemPromptPreset with exclude_dynamic_sections" do
+    it "passes --exclude-dynamic-sections when requested" do
+      options = ClaudeAgent::AgentOptions.new(
+        system_prompt: ClaudeAgent::SystemPromptPreset.claude_code(
+          "extra instructions",
+          true,
+        ),
+      )
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--exclude-dynamic-sections")
+      args.should contain("--append-system-prompt")
+      args.should contain("extra instructions")
     end
   end
 
@@ -251,6 +345,38 @@ describe TestableCLIClient do
       parsed["researcher"]["prompt"].as_s.should eq("You are a researcher")
       parsed["researcher"]["tools"].as_a.map(&.as_s).should eq(["Read", "Grep"])
       parsed["researcher"]["model"].as_s.should eq("claude-sonnet-4-20250514")
+    end
+
+    it "builds JSON for expanded agent definition" do
+      effort = JSON::Any.new("high")
+      agents = {
+        "expanded" => ClaudeAgent::AgentDefinition.new(
+          description: "Expanded agent",
+          prompt: "You are expanded",
+          tools: ["Read"],
+          disallowed_tools: ["Bash"],
+          skills: ["git"],
+          memory: "project",
+          max_turns: 4,
+          initial_prompt: "kick-off",
+          background: true,
+          effort: effort,
+          permission_mode: "plan",
+        ),
+      }
+
+      client = TestableCLIClient.new
+      json = client.test_build_agents_json(agents)
+      parsed = JSON.parse(json)
+
+      parsed["expanded"]["disallowedTools"].as_a.map(&.as_s).should eq(["Bash"])
+      parsed["expanded"]["skills"].as_a.map(&.as_s).should eq(["git"])
+      parsed["expanded"]["memory"].as_s.should eq("project")
+      parsed["expanded"]["maxTurns"].as_i.should eq(4)
+      parsed["expanded"]["initialPrompt"].as_s.should eq("kick-off")
+      parsed["expanded"]["background"].as_bool.should be_true
+      parsed["expanded"]["effort"].as_s.should eq("high")
+      parsed["expanded"]["permissionMode"].as_s.should eq("plan")
     end
 
     it "builds JSON for minimal agent definition" do
