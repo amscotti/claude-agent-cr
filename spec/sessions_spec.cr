@@ -623,4 +623,108 @@ describe "ClaudeAgent session utilities" do
       FileUtils.rm_rf(project_path)
     end
   end
+
+  it "deletes a session and its subagent transcript directory" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+      File.write(File.join(subagent_dir, "agent-abc.jsonl"), "{}\n")
+
+      ClaudeAgent.delete_session(session_id, directory: project_path)
+
+      File.exists?(File.join(project_dir, "#{session_id}.jsonl")).should be_false
+      Dir.exists?(File.join(project_dir, session_id)).should be_false
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "lists subagents from the session's subagents directory" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(File.join(subagent_dir, "workflows"))
+      File.write(File.join(subagent_dir, "agent-top.jsonl"), "{}\n")
+      File.write(File.join(subagent_dir, "workflows", "agent-nested.jsonl"), "{}\n")
+
+      ids = ClaudeAgent.list_subagents(session_id, directory: project_path)
+      ids.sort.should eq(["nested", "top"])
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "reads subagent conversation messages" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      agent_id = "abc"
+      user_id = UUID.random.to_s
+      assistant_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+      File.write(
+        File.join(subagent_dir, "agent-#{agent_id}.jsonl"),
+        [
+          make_transcript_entry("user", user_id, nil, session_id, content: "plan"),
+          make_transcript_entry("assistant", assistant_id, user_id, session_id, content: "ack"),
+        ].join('\n') + "\n"
+      )
+
+      messages = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path)
+      messages.size.should eq(2)
+      messages.first.type.should eq("user")
+      messages.last.type.should eq("assistant")
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "forks a session into a new JSONL file with remapped UUIDs" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      user_id = UUID.random.to_s
+      assistant_id = UUID.random.to_s
+
+      write_transcript(project_dir, session_id, [
+        make_transcript_entry("user", user_id, nil, session_id, content: "hi"),
+        make_transcript_entry("assistant", assistant_id, user_id, session_id, content: "hello"),
+      ])
+
+      result = ClaudeAgent.fork_session(session_id, directory: project_path)
+      result.session_id.should_not eq(session_id)
+
+      fork_path = File.join(project_dir, "#{result.session_id}.jsonl")
+      File.exists?(fork_path).should be_true
+
+      entries = File.read(fork_path).each_line.compact_map do |line|
+        JSON.parse(line.strip).as_h?
+      end.to_a
+
+      # Expect at least 2 user/assistant entries + custom-title footer.
+      entries.size.should be >= 3
+      entries.first["sessionId"].as_s.should eq(result.session_id)
+      entries.first["uuid"].as_s.should_not eq(user_id)
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
 end

@@ -166,6 +166,29 @@ describe ClaudeAgent::PermissionMode do
     ClaudeAgent::PermissionMode::AcceptEdits.to_s.should eq("AcceptEdits")
     ClaudeAgent::PermissionMode::Plan.to_s.should eq("Plan")
     ClaudeAgent::PermissionMode::BypassPermissions.to_s.should eq("BypassPermissions")
+    ClaudeAgent::PermissionMode::Auto.to_s.should eq("Auto")
+    ClaudeAgent::PermissionMode::DontAsk.to_s.should eq("DontAsk")
+  end
+
+  it "maps to CLI string values" do
+    ClaudeAgent::PermissionMode::Auto.to_cli_value.should eq("auto")
+    ClaudeAgent::PermissionMode::DontAsk.to_cli_value.should eq("dontAsk")
+  end
+end
+
+describe ClaudeAgent::SystemPromptFile do
+  it "wraps a path with type = file" do
+    prompt = ClaudeAgent::SystemPromptFile.new("/tmp/prompt.md")
+    prompt.type.should eq("file")
+    prompt.path.should eq("/tmp/prompt.md")
+  end
+end
+
+describe ClaudeAgent::TaskBudget do
+  it "round-trips through JSON" do
+    budget = ClaudeAgent::TaskBudget.new(50_000)
+    parsed = ClaudeAgent::TaskBudget.from_json(budget.to_json)
+    parsed.total.should eq(50_000)
   end
 end
 
@@ -174,6 +197,7 @@ describe ClaudeAgent::Effort do
     ClaudeAgent::Effort::Low.to_s.should eq("Low")
     ClaudeAgent::Effort::Medium.to_s.should eq("Medium")
     ClaudeAgent::Effort::High.to_s.should eq("High")
+    ClaudeAgent::Effort::Xhigh.to_s.should eq("Xhigh")
     ClaudeAgent::Effort::Max.to_s.should eq("Max")
   end
 end

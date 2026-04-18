@@ -22,18 +22,31 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
     @messages.close unless @messages.closed?
   end
 
-  def send_prompt(prompt : String, parent_tool_use_id : String? = nil, *, uuid : String? = nil)
+  def send_prompt(
+    prompt : String,
+    parent_tool_use_id : String? = nil,
+    *,
+    uuid : String? = nil,
+    should_query : Bool = true,
+  )
     payload = {
       "type"               => JSON::Any.new("user"),
       "message"            => JSON::Any.new({"role" => JSON::Any.new("user"), "content" => JSON::Any.new(prompt)}),
       "parent_tool_use_id" => parent_tool_use_id ? JSON::Any.new(parent_tool_use_id) : JSON::Any.new(nil),
     }
     payload["uuid"] = JSON::Any.new(uuid) if uuid
+    payload["should_query"] = JSON::Any.new(false) unless should_query
     @sent_messages << payload
   end
 
-  def send_user_message(content : String, parent_tool_use_id : String? = nil, *, uuid : String? = nil)
-    send_prompt(content, parent_tool_use_id, uuid: uuid)
+  def send_user_message(
+    content : String,
+    parent_tool_use_id : String? = nil,
+    *,
+    uuid : String? = nil,
+    should_query : Bool = true,
+  )
+    send_prompt(content, parent_tool_use_id, uuid: uuid, should_query: should_query)
   end
 
   def send_message(message : Hash)
@@ -137,11 +150,11 @@ describe ClaudeAgent::AgentClient do
 
     begin
       client.start
-      client.set_model("claude-opus-4-1-20250805")
+      client.set_model("claude-opus-4-7")
 
       request = fake_cli.sent_messages.last
       request["request"].as_h["subtype"].as_s.should eq("set_model")
-      request["request"].as_h["model"].as_s.should eq("claude-opus-4-1-20250805")
+      request["request"].as_h["model"].as_s.should eq("claude-opus-4-7")
     ensure
       client.stop
     end
@@ -182,6 +195,21 @@ describe ClaudeAgent::AgentClient do
       first = user_messages[0]
       first["message"].as_h["content"].as_s.should eq("hello")
       first["uuid"].as_s.should eq("msg-1")
+    ensure
+      client.stop
+    end
+  end
+
+  it "marks user messages with should_query=false when requested" do
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+    begin
+      client.start
+      client.send_user_message("context only", should_query: false)
+
+      user_messages = fake_cli.sent_messages.select { |message| message["type"]?.try(&.as_s?) == "user" }
+      user_messages[0]["should_query"]?.try(&.as_bool).should be_false
     ensure
       client.stop
     end
@@ -350,6 +378,64 @@ describe ClaudeAgent::AgentClient do
       stop_task = fake_cli.sent_messages[-1]
       stop_task["request"].as_h["subtype"].as_s.should eq("stop_task")
       stop_task["request"].as_h["task_id"].as_s.should eq("task-123")
+    ensure
+      client.stop
+    end
+  end
+
+  it "returns a typed ContextUsageResponse from get_context_usage" do
+    fake_cli = FakeCLIClient.new(
+      control_responses: {
+        "get_context_usage" => {
+          "categories" => JSON::Any.new([
+            JSON::Any.new({
+              "name"   => JSON::Any.new("System"),
+              "tokens" => JSON::Any.new(1200_i64),
+              "color"  => JSON::Any.new("#ff00ff"),
+            }),
+          ]),
+          "totalTokens"          => JSON::Any.new(1200_i64),
+          "maxTokens"            => JSON::Any.new(200_000_i64),
+          "rawMaxTokens"         => JSON::Any.new(200_000_i64),
+          "percentage"           => JSON::Any.new(0.6),
+          "model"                => JSON::Any.new("claude-sonnet-4-5"),
+          "isAutoCompactEnabled" => JSON::Any.new(true),
+          "memoryFiles"          => JSON::Any.new([] of JSON::Any),
+          "mcpTools"             => JSON::Any.new([] of JSON::Any),
+          "agents"               => JSON::Any.new([] of JSON::Any),
+        },
+      },
+    )
+    client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+    begin
+      client.start
+      usage = client.get_context_usage
+
+      usage.total_tokens.should eq(1200)
+      usage.max_tokens.should eq(200_000)
+      usage.model.should eq("claude-sonnet-4-5")
+      usage.auto_compact_enabled?.should be_true
+      usage.categories.size.should eq(1)
+      usage.categories.first.name.should eq("System")
+    ensure
+      client.stop
+    end
+  end
+
+  it "sends reload_plugins, prompt_suggestion, and mcp_enable_channel control requests" do
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+    begin
+      client.start
+      client.reload_plugins
+      client.prompt_suggestion
+      client.enable_mcp_channel("remote")
+
+      subtypes = fake_cli.sent_messages.last(3).map(&.["request"].as_h["subtype"].as_s)
+      subtypes.should eq(["reload_plugins", "prompt_suggestion", "mcp_enable_channel"])
+      fake_cli.sent_messages.last["request"].as_h["serverName"].as_s.should eq("remote")
     ensure
       client.stop
     end

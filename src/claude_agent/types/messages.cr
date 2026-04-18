@@ -9,7 +9,9 @@ module ClaudeAgent
   # Base message type
   abstract struct Message
     PARSERS = {
-      "assistant"          => ->(json : String, _data : MessageData) { AssistantMessage.from_json(json).as(Message) },
+      "assistant" => ->(json : String, _data : MessageData) { AssistantMessage.from_json(json).as(Message) },
+      # mirror_error intentionally handled in parse_special_message so we can
+      # derive defaults when fields are missing.
       "user"               => ->(json : String, _data : MessageData) { UserMessage.from_json(json).as(Message) },
       "result"             => ->(json : String, _data : MessageData) { ResultMessage.from_json(json).as(Message) },
       "permission_request" => ->(json : String, _data : MessageData) { PermissionRequest.from_json(json).as(Message) },
@@ -52,9 +54,20 @@ module ClaudeAgent
         parse_system_message(json, JSON::Any.new(message))
       when "rate_limit_event"
         parse_rate_limit_event(message)
+      when "mirror_error"
+        parse_mirror_error(message)
       else
         UnknownMessage.new(type, message)
       end
+    end
+
+    private def self.parse_mirror_error(data : MessageData) : Message
+      uuid = data["uuid"]?.try(&.as_s?)
+      session_id = data["session_id"]?.try(&.as_s?)
+      error = data["error"]?.try(&.as_s?)
+      return UnknownMessage.new("mirror_error", data) unless session_id && error
+
+      MirrorErrorMessage.new(uuid, session_id, error, data)
     end
 
     private def self.parse_system_message(json : String, data : JSON::Any) : Message
@@ -79,9 +92,37 @@ module ClaudeAgent
         parse_task_notification(message, session_id)
       when "elicitation_complete"
         parse_elicitation_complete(message, session_id)
+      when "api_retry"
+        parse_api_retry(message, session_id)
+      when "memory_recall"
+        parse_memory_recall(message, session_id)
+      when "status"
+        parse_status_message(message, session_id)
       else
         GenericSystemMessage.new(subtype, session_id, message)
       end
+    end
+
+    private def self.parse_api_retry(data : MessageData, session_id : String) : Message
+      ApiRetryMessage.new(
+        session_id,
+        data,
+        data["attempt"]?.try(&.as_i64?),
+        data["max_retries"]?.try(&.as_i64?),
+        data["delay_ms"]?.try(&.as_i64?),
+        data["status"]?.try(&.as_i64?),
+        data["error"]?.try(&.as_s?),
+      )
+    end
+
+    private def self.parse_memory_recall(data : MessageData, session_id : String) : Message
+      paths = data["memory_paths"]?.try(&.as_a?).try(&.compact_map(&.as_s?)) || [] of String
+      MemoryRecallMessage.new(session_id, data, paths)
+    end
+
+    private def self.parse_status_message(data : MessageData, session_id : String) : Message
+      status = data["status"]?.try(&.as_s?) || "unknown"
+      StatusMessage.new(session_id, data, status)
     end
 
     private def self.parse_compact_boundary(data : MessageData, session_id : String) : Message
@@ -360,6 +401,12 @@ module ClaudeAgent
     def account : ServerAccountInfo?
       server_info.account
     end
+
+    # List of memory file paths currently loaded in the session.
+    def memory_paths : Array(String)
+      values = data["memory_paths"]?.try(&.as_a?)
+      values ? values.compact_map(&.as_s?) : [] of String
+    end
   end
 
   struct TaskUsage
@@ -509,6 +556,71 @@ module ClaudeAgent
     end
   end
 
+  # Emitted on retryable API errors; exposes attempt counters and delay.
+  struct ApiRetryMessage < SystemMessage
+    getter attempt : Int64?
+    getter max_retries : Int64?
+    getter delay_ms : Int64?
+    getter status : Int64?
+    getter error : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @attempt : Int64? = nil,
+      @max_retries : Int64? = nil,
+      @delay_ms : Int64? = nil,
+      @status : Int64? = nil,
+      @error : String? = nil,
+    )
+      super("api_retry", session_id, data)
+    end
+  end
+
+  # Emitted when the CLI loads additional memory entries into the session.
+  struct MemoryRecallMessage < SystemMessage
+    getter memory_paths : Array(String)
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @memory_paths : Array(String),
+    )
+      super("memory_recall", session_id, data)
+    end
+  end
+
+  # Streaming status signal (e.g. "requesting" emitted before each API call
+  # when `include_partial_messages` is enabled).
+  struct StatusMessage < SystemMessage
+    getter status : String
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @status : String,
+    )
+      super("status", session_id, data)
+    end
+  end
+
+  # Emitted when an external session-store adapter fails to mirror an append.
+  struct MirrorErrorMessage < Message
+    getter type : String = "mirror_error"
+    getter uuid : String?
+    getter session_id : String
+    getter error : String
+    getter data : MessageData
+
+    def initialize(
+      @uuid : String?,
+      @session_id : String,
+      @error : String,
+      @data : MessageData,
+    )
+    end
+  end
+
   struct ElicitationCompleteMessage < SystemMessage
     getter uuid : String
     getter mcp_server_name : String
@@ -563,6 +675,13 @@ module ClaudeAgent
     getter is_error : Bool?
     getter num_turns : Int32?
     getter stop_reason : String?
+    # Reason the query loop terminated. Example values:
+    # "completed", "aborted_tools", "max_turns", "blocking_limit",
+    # "max_budget_usd", "max_session_duration_ms", "error", "resume".
+    getter terminal_reason : String?
+    # Non-fatal errors accumulated during the run (present on some result
+    # subtypes, may be omitted entirely).
+    getter errors : Array(JSON::Any)?
     getter total_cost_usd : Float64?
     getter structured_output : JSON::Any?
     getter usage : Hash(String, JSON::Any)?
