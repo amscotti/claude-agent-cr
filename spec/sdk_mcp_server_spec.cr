@@ -252,7 +252,7 @@ describe ClaudeAgent::ControlResponse do
     response.response["error"].as_s.should eq("Something failed")
   end
 
-  it "creates an MCP response" do
+  it "creates an MCP response nested under the standard response wrapper" do
     mcp_result = JSON::Any.new({
       "jsonrpc" => JSON::Any.new("2.0"),
       "id"      => JSON::Any.new(1_i64),
@@ -263,7 +263,15 @@ describe ClaudeAgent::ControlResponse do
 
     response.type.should eq("control_response")
     response.response["subtype"].as_s.should eq("success")
-    response.response["mcp_response"].should_not be_nil
+    response.response["request_id"].as_s.should eq("req-789")
+
+    # The JSON-RPC response must live at response.response["response"]["mcp_response"],
+    # matching the wire shape the CLI expects. A regression here would send
+    # the JSON-RPC result one layer too shallow and the CLI would reject it.
+    nested = response.response["response"].as_h
+    nested.should_not be_nil
+    nested["mcp_response"].should_not be_nil
+    nested["mcp_response"].as_h["jsonrpc"].as_s.should eq("2.0")
   end
 end
 
@@ -446,6 +454,23 @@ describe "Control Message Parsing" do
         req.user_message_uuid.should eq("msg-uuid-12345")
       end
     end
+  end
+
+  it "parses unknown control_request subtype as ControlUnknownRequest (never raises)" do
+    json = <<-JSON
+    {
+      "type": "control_request",
+      "request_id": "req-unknown-1",
+      "request": {
+        "subtype": "brand_new_subtype_we_dont_know",
+        "some_field": 42
+      }
+    }
+    JSON
+
+    request = ClaudeAgent::ControlRequest.from_json(json)
+    request.request.should be_a(ClaudeAgent::ControlUnknownRequest)
+    request.request.as(ClaudeAgent::ControlUnknownRequest).subtype.should eq("brand_new_subtype_we_dont_know")
   end
 end
 

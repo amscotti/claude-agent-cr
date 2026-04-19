@@ -125,6 +125,30 @@ module ClaudeAgent
     getter models : Array(ServerModelInfo)
     getter account : ServerAccountInfo?
     getter pid : Int64?
+    # Built-in tool names the CLI advertises for the session
+    # (e.g., `["Task","Bash","Read",...]`).
+    getter tools : Array(String)
+    # Skill identifiers currently loaded in the session.
+    getter skills : Array(String)
+    # Summary of each configured MCP server (name + status + tools).
+    # Raw JSON::Any entries so forward-compat fields are preserved.
+    getter mcp_servers : Array(JSON::Any)
+    # Loaded plugin descriptors (name, path, source).
+    getter plugins : Array(JSON::Any)
+    # Current working directory reported by the CLI.
+    getter cwd : String?
+    # Model identifier the session opened with (distinct from the
+    # `models` list which enumerates selectable models).
+    getter model : String?
+    # Permission mode the session opened with ("default", "acceptEdits",
+    # ...). Camel-case on the wire; exposed here verbatim.
+    getter permission_mode : String?
+    # Fast-mode runtime state ("on" / "off" / ...).
+    getter fast_mode_state : String?
+    # CLI build advertised by the subprocess.
+    getter claude_code_version : String?
+    # Full init payload, including any forward-compat fields this struct
+    # doesn't type directly.
     getter raw_data : Hash(String, JSON::Any)
 
     def initialize(
@@ -135,6 +159,15 @@ module ClaudeAgent
       @models : Array(ServerModelInfo) = [] of ServerModelInfo,
       @account : ServerAccountInfo? = nil,
       @pid : Int64? = nil,
+      @tools : Array(String) = [] of String,
+      @skills : Array(String) = [] of String,
+      @mcp_servers : Array(JSON::Any) = [] of JSON::Any,
+      @plugins : Array(JSON::Any) = [] of JSON::Any,
+      @cwd : String? = nil,
+      @model : String? = nil,
+      @permission_mode : String? = nil,
+      @fast_mode_state : String? = nil,
+      @claude_code_version : String? = nil,
       @raw_data : Hash(String, JSON::Any) = {} of String => JSON::Any,
     )
     end
@@ -155,8 +188,21 @@ module ClaudeAgent
         models: typed_array(data["models"]?, ServerModelInfo),
         account: ServerAccountInfo.from_any(data["account"]?),
         pid: data["pid"]?.try(&.as_i64?),
+        tools: string_array(data["tools"]?),
+        skills: string_array(data["skills"]?),
+        mcp_servers: json_array(data["mcp_servers"]?),
+        plugins: json_array(data["plugins"]?),
+        cwd: data["cwd"]?.try(&.as_s?),
+        model: data["model"]?.try(&.as_s?),
+        permission_mode: data["permissionMode"]?.try(&.as_s?) || data["permission_mode"]?.try(&.as_s?),
+        fast_mode_state: data["fast_mode_state"]?.try(&.as_s?),
+        claude_code_version: data["claude_code_version"]?.try(&.as_s?),
         raw_data: data,
       )
+    end
+
+    private def self.json_array(value : JSON::Any?) : Array(JSON::Any)
+      value.try(&.as_a?) || [] of JSON::Any
     end
 
     def slash_commands : Array(String)

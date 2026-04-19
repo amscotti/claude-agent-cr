@@ -5,6 +5,37 @@ require "./errors"
 
 module ClaudeAgent
   class CLIClient
+    # Forward-compatible option flags that the SDK may append but that older
+    # Claude Code CLI releases do not understand. When a capability probe
+    # confirms the CLI advertises none of these, they are silently stripped
+    # from argv so the subprocess does not abort with
+    # `error: unknown option '--<flag>'` before the handshake. Core flags
+    # (e.g., `--model`, `--output-format`) are never filtered.
+    OPTIONAL_CLI_FLAGS = [
+      "--task-budget",
+      "--thinking",
+      "--system-prompt-file",
+    ]
+
+    # Cache of parsed `claude --help` flag sets keyed by resolved cli_path,
+    # so repeated client starts (common in long-running applications) only
+    # probe once per binary.
+    @@capability_cache = {} of String => Set(String)
+    @@capability_mutex = Mutex.new
+
+    # Test-only: clear the capability cache so a spec can inject its own
+    # probe result or re-exercise the probe path.
+    def self.clear_capability_cache : Nil
+      @@capability_mutex.synchronize { @@capability_cache.clear }
+    end
+
+    # Test-only: seed the cache with a known set of supported flags for a
+    # given cli_path so specs can exercise the argv filter without spawning
+    # a real subprocess.
+    def self.seed_capability_cache(cli_path : String, flags : Enumerable(String)) : Nil
+      @@capability_mutex.synchronize { @@capability_cache[cli_path] = flags.to_set }
+    end
+
     @process : Process?
     @input : IO?
     @output : IO?
@@ -12,6 +43,8 @@ module ClaudeAgent
     @running : Bool = false
     @session_id : String?
     @sdk_mcp_servers : Hash(String, SDKMCPServer)
+    @stderr_tail : Array(String) = [] of String
+    @stderr_mutex : Mutex = Mutex.new
 
     def initialize(@options : AgentOptions? = nil)
       @sdk_mcp_servers = extract_sdk_servers
@@ -56,6 +89,10 @@ module ClaudeAgent
       cli_path = find_cli_path
       args = build_cli_args
 
+      # Reset the rolling stderr tail so `detect_unknown_option_error`
+      # never surfaces a diagnostic from a previous session.
+      @stderr_mutex.synchronize { @stderr_tail.clear }
+
       cwd = @options.try(&.cwd)
       env = build_env
 
@@ -91,6 +128,10 @@ module ClaudeAgent
         base_env["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
       end
 
+      if @options.try(&.enable_file_checkpointing?)
+        base_env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
+      end
+
       # User identifier for tracking
       if user = @options.try(&.user)
         base_env["CLAUDE_CODE_USER"] = user
@@ -110,12 +151,60 @@ module ClaudeAgent
       base_env
     end
 
+    # Stop the CLI subprocess with a three-stage cascade:
+    #   1. Close stdin so a well-behaved CLI sees EOF and exits.
+    #   2. Wait up to 5 seconds for graceful exit.
+    #   3. Send SIGTERM; wait another 5 seconds.
+    #   4. SIGKILL as a last resort.
+    # A subprocess that's alive but unresponsive (stuck MCP handler,
+    # deadlocked writer) used to hang `stop` forever. Each stage has a
+    # bounded wait, so `stop` always returns within ~10 seconds.
     def stop
       return unless @running
+      @running = false
 
       @input.try(&.close)
-      @process.try(&.wait)
-      @running = false
+
+      if process = @process
+        unless wait_for_exit(process, 5.seconds)
+          begin
+            process.terminate
+          rescue IO::Error
+          rescue RuntimeError
+          end
+
+          unless wait_for_exit(process, 5.seconds)
+            begin
+              process.terminate(graceful: false)
+            rescue IO::Error
+            rescue RuntimeError
+            end
+            wait_for_exit(process, 2.seconds)
+          end
+        end
+      end
+
+      @error.try(&.close) rescue nil
+      @output.try(&.close) rescue nil
+    end
+
+    # Block up to `span` seconds waiting for the process to exit.
+    # Returns true if it exited, false on timeout.
+    private def wait_for_exit(process : Process, span : Time::Span) : Bool
+      done = Channel(Bool).new(1)
+      spawn do
+        process.wait
+        done.send(true)
+      rescue
+        done.send(false)
+      end
+
+      select
+      when outcome = done.receive
+        outcome
+      when timeout(span)
+        false
+      end
     end
 
     # Send a user prompt. When `should_query` is false the message is
@@ -132,7 +221,9 @@ module ClaudeAgent
       message["message"] = {"role" => "user", "content" => prompt}
       message["parent_tool_use_id"] = parent_tool_use_id if parent_tool_use_id
       message["uuid"] = uuid if uuid
-      message["should_query"] = false unless should_query
+      # Wire name is camelCase per the stream-json contract (matches the
+      # TypeScript SDK's `SDKUserMessage.shouldQuery` field).
+      message["shouldQuery"] = false unless should_query
 
       send_json(message)
     end
@@ -170,23 +261,6 @@ module ClaudeAgent
       send_json({"type" => response.type, "response" => response.response})
     end
 
-    # Send SDK MCP server initialization to CLI
-    # This registers the SDK servers with the CLI so it knows to route
-    # tool calls back to the SDK via control_request messages
-    def send_sdk_init
-      return unless has_sdk_servers?
-
-      # Build initialization request
-      init_request = {
-        "type"    => "control_request",
-        "request" => {
-          "subtype"       => "initialize",
-          "sdkMcpServers" => sdk_server_names,
-        },
-      }
-      send_json(init_request)
-    end
-
     def each_message(&)
       @output.try do |output|
         output.each_line do |line|
@@ -207,9 +281,16 @@ module ClaudeAgent
 
             yield message
           rescue ex : JSON::ParseException
-            STDERR.puts "[CLI JSON Error] #{ex.message}"
+            # Log the offending line (truncated) so users can debug
+            # malformed output without digging through stderr manually.
+            truncated = line.size > 500 ? "#{line[0, 500]}…" : line
+            decode_error = JSONDecodeError.new(
+              "Failed to parse CLI stream-json line: #{ex.message}",
+              truncated,
+            )
+            log_message("[claude-agent-cr] #{decode_error.message}\n  raw: #{decode_error.raw_data}\n")
           rescue ex : Exception
-            STDERR.puts "[CLI Error] #{ex.message}"
+            log_message("[claude-agent-cr] CLI message handling error: #{ex.class}: #{ex.message}\n")
           end
         end
       end
@@ -224,6 +305,15 @@ module ClaudeAgent
       spawn do
         begin
           stderr.each_line do |line|
+            @stderr_mutex.synchronize do
+              @stderr_tail << line
+              # Keep a bounded tail (~512 lines) so we can surface
+              # "unknown option" errors in `stop` without holding onto
+              # arbitrarily large output.
+              while @stderr_tail.size > 512
+                @stderr_tail.shift
+              end
+            end
             if cb = stderr_callback
               cb.call(line)
             end
@@ -231,6 +321,181 @@ module ClaudeAgent
         rescue IO::Error
         end
       end
+    end
+
+    # Run `claude --help` once per cli_path and return the set of long
+    # option flags it advertises (e.g., `--title`). Returns nil when
+    # probing is disabled or the probe fails for any reason.
+    #
+    # IMPORTANT: this is now a DIAGNOSTIC-ONLY helper. The SDK no longer
+    # pre-emptively strips flags based on the probe, because the Claude
+    # Code CLI hides several real flags from its `--help` output
+    # (`--task-budget`, `--thinking`, `--system-prompt-file`, etc.) and the
+    # regex-based parser would otherwise strip them invisibly. Stripping a
+    # safety cap like `task_budget` silently is worse than letting the
+    # subprocess fail with an actionable `UnsupportedOptionError`.
+    private def probe_cli_capabilities(cli_path : String) : Set(String)?
+      opts = @options
+      return nil if opts && !opts.probe_cli_capabilities?
+
+      if cached = @@capability_mutex.synchronize { @@capability_cache[cli_path]? }
+        return cached
+      end
+
+      flags = run_cli_help_probe(cli_path)
+      if flags
+        @@capability_mutex.synchronize { @@capability_cache[cli_path] = flags }
+      end
+      flags
+    end
+
+    # Exposed for testing; overridden by a TestableCLIClient subclass.
+    # Bounded by a 5-second timeout so a hung `claude --help` (e.g., CLI
+    # waiting on a TTY auth prompt) can't freeze `start`.
+    protected def run_cli_help_probe(cli_path : String) : Set(String)?
+      output = IO::Memory.new
+      done = Channel(Bool).new(1)
+
+      process = Process.new(
+        command: cli_path,
+        args: ["--help"],
+        input: Process::Redirect::Close,
+        output: output,
+        error: Process::Redirect::Close,
+      )
+
+      spawn do
+        process.wait
+        done.send(true)
+      rescue
+        done.send(false)
+      end
+
+      select
+      when outcome = done.receive
+        outcome ? self.class.parse_long_flags(output.to_s) : nil
+      when timeout(5.seconds)
+        begin
+          process.terminate rescue nil
+          spawn do
+            sleep 500.milliseconds
+            process.terminate(graceful: false) rescue nil
+          end
+        end
+        nil
+      end
+    rescue File::NotFoundError
+      nil
+    rescue IO::Error
+      nil
+    end
+
+    # Extract every long-form option flag from `claude --help` output.
+    # Matches names made of lowercase letters, digits, and hyphens starting
+    # with a letter (e.g., `--task-budget`, `--max-thinking-tokens`).
+    def self.parse_long_flags(help_text : String) : Set(String)
+      flags = Set(String).new
+      help_text.scan(/--([a-z][a-z0-9-]*)/) do |match|
+        flags << "--#{match[1]}"
+      end
+      flags
+    end
+
+    # Drop optional flags the CLI does not advertise from an already-built
+    # argv. Both `--flag value` pairs and `--flag=value` forms are removed.
+    # Passes through unchanged when capabilities is nil.
+    def filter_unsupported_flags(
+      args : Array(String),
+      capabilities : Set(String)?,
+    ) : Array(String)
+      return args unless capabilities
+
+      filtered = [] of String
+      i = 0
+      while i < args.size
+        token = args[i]
+        flag_base = token.starts_with?("--") ? token.split('=', 2).first : nil
+
+        if flag_base && OPTIONAL_CLI_FLAGS.includes?(flag_base) && !capabilities.includes?(flag_base)
+          warn_dropped_flag(flag_base)
+          if token.includes?('=') || i + 1 >= args.size
+            i += 1
+          else
+            # Also skip the next token which is this flag's value.
+            i += 2
+          end
+        else
+          filtered << token
+          i += 1
+        end
+      end
+      filtered
+    end
+
+    private def warn_dropped_flag(flag : String)
+      callback = @options.try(&.stderr)
+      message = "claude-agent-cr: dropping unsupported CLI flag '#{flag}'; " \
+                "install a newer Claude Code CLI to use it\n"
+      if callback
+        callback.call(message)
+      else
+        STDERR.puts(message)
+      end
+    end
+
+    # Inspect recent stderr lines for an "unknown option '--xxx'" message
+    # emitted by Claude Code's argv parser, and return the offending flag
+    # name when one is found. Helps translate opaque connection failures
+    # into `UnsupportedOptionError` with actionable guidance.
+    def detect_unknown_option_error : String?
+      lines = @stderr_mutex.synchronize { @stderr_tail.dup }
+      lines.reverse_each do |line|
+        if match = line.match(/unknown option ['"`]?(--[a-z][a-z0-9-]*)['"`]?/)
+          return match[1]
+        end
+      end
+      nil
+    end
+
+    # Copy of the buffered stderr tail for diagnostics; intentionally
+    # returns a snapshot so callers never mutate the internal buffer.
+    def stderr_tail : Array(String)
+      @stderr_mutex.synchronize { @stderr_tail.dup }
+    end
+
+    # Test-only: append a synthetic stderr line to the rolling buffer so
+    # specs can exercise `detect_unknown_option_error` without spawning
+    # a real subprocess.
+    def record_stderr_for_test(line : String) : Nil
+      @stderr_mutex.synchronize { @stderr_tail << line }
+    end
+
+    # Route a diagnostic line to the caller-supplied `stderr` callback
+    # when present, falling back to STDERR. Keeps parse/MCP/hook errors
+    # observable from application code without racing STDERR writes.
+    private def log_message(line : String) : Nil
+      if callback = @options.try(&.stderr)
+        callback.call(line)
+      else
+        STDERR.puts(line.chomp)
+      end
+    end
+
+    # Test-only: inject an IO as the subprocess input, so specs can inspect
+    # what `send_prompt` / `send_json` actually writes without spawning a
+    # real subprocess.
+    # ameba:disable Naming/AccessorMethodName
+    def set_input_for_test(io : IO) : Nil
+      @input = io
+    end
+
+    # Test-only: inject an IO as the subprocess output, so specs can feed
+    # canned stream-json lines through `each_message` without spawning a
+    # real CLI. This is the Crystal analogue of Python's
+    # `test_subprocess_buffering.py` mock-stream pattern.
+    # ameba:disable Naming/AccessorMethodName
+    def set_output_for_test(io : IO) : Nil
+      @output = io
     end
 
     private def find_cli_path : String
@@ -246,9 +511,27 @@ module ClaudeAgent
         add_core_args(args, opts)
         add_tool_args(args, opts)
         add_session_args(args, opts)
+        add_extra_args(args, opts)
       end
 
       args
+    end
+
+    # Escape-hatch for CLI flags that aren't modeled as typed options (yet).
+    # Added last so a caller can override behavior or forward newly-added
+    # Claude Code CLI flags without waiting for an SDK release.
+    private def add_extra_args(args : Array(String), opts : AgentOptions)
+      extra = opts.extra_args
+      return unless extra
+
+      extra.each do |key, value|
+        flag = key.starts_with?("--") ? key : "--#{key}"
+        if value.nil?
+          args << flag
+        else
+          args << flag << value
+        end
+      end
     end
 
     private def add_core_args(args : Array(String), opts : AgentOptions)
@@ -264,21 +547,43 @@ module ClaudeAgent
       opts.max_turns.try { |turns| args << "--max-turns" << turns.to_s }
       opts.max_budget_usd.try { |budget| args << "--max-budget-usd" << budget.to_s }
       opts.task_budget.try { |budget| args << "--task-budget" << budget.total.to_s }
-      opts.title.try { |title| args << "--title" << title }
-      opts.betas.try { |betas| args << "--betas" << betas.join(" ") }
+      # NOTE: `opts.title` is a post-hoc session metadata mutation, not a CLI
+      # argument. The Claude Code CLI does not accept a `--title` flag; the
+      # SDK applies the title by writing a `custom-title` entry to the
+      # session JSONL (see `ClaudeAgent.rename_session` / the
+      # `generate_session_title` control request). We intentionally do not
+      # append anything to argv for `opts.title` here.
+      # `--betas <betas...>` is variadic: each beta must be its own argv
+      # token or the CLI parses the whole joined string as a single beta
+      # name (e.g. "context-1m-2025-08-07,other" would be rejected as one
+      # unknown beta). Emitting them as separate tokens is the only form
+      # that works for multi-beta configurations.
+      opts.betas.try do |betas|
+        unless betas.empty?
+          args << "--betas"
+          betas.each { |beta| args << beta }
+        end
+      end
     end
 
+    # SDK convention: when no system prompt is supplied, emit `--system-prompt ""`
+    # so the subprocess does NOT load the CLI's default Claude Code system
+    # prompt. Programmatic SDK callers want a vanilla agent by default; the
+    # interactive CLI behavior (claude_code preset) is opt-in via
+    # `SystemPromptPreset.claude_code`.
     private def add_system_prompt_args(args : Array(String), opts : AgentOptions)
       case system_prompt = opts.system_prompt
       when String
         args << "--system-prompt" << system_prompt
       when SystemPromptPreset
-        # Preset is implicit when only append/exclude_dynamic_sections are set;
-        # only the `append` portion is a direct CLI arg.
+        # Preset is implicit when only append is set. `exclude_dynamic_sections`
+        # is communicated via the initialize control request (as
+        # `excludeDynamicSections`), not via argv.
         system_prompt.append.try { |append| args << "--append-system-prompt" << append }
-        args << "--exclude-dynamic-sections" if system_prompt.exclude_dynamic_sections?
       when SystemPromptFile
         args << "--system-prompt-file" << system_prompt.path
+      when Nil
+        args << "--system-prompt" << ""
       end
 
       opts.append_system_prompt.try { |append| args << "--append-system-prompt" << append }
@@ -324,8 +629,11 @@ module ClaudeAgent
 
     private def add_tool_args(args : Array(String), opts : AgentOptions)
       effective_allowed, _ = apply_skills_defaults(opts)
-      args << "--allowedTools" << effective_allowed.join(" ") unless effective_allowed.empty?
-      opts.disallowed_tools.try { |tools| args << "--disallowedTools" << tools.join(" ") }
+      # CLI accepts both comma- and space-separated forms; we emit comma for
+      # consistency with the rest of the flag surface and to avoid any chance
+      # of the shell splitting the argument unexpectedly.
+      args << "--allowedTools" << effective_allowed.join(",") unless effective_allowed.empty?
+      opts.disallowed_tools.try { |tools| args << "--disallowedTools" << tools.join(",") }
 
       add_tools_option_args(args, opts)
 
@@ -336,14 +644,19 @@ module ClaudeAgent
 
       args << "--strict-mcp-config" if opts.strict_mcp_config?
 
-      opts.agents.try { |agents| args << "--agents" << build_agents_json(agents) }
+      # NOTE: `opts.agents` is NOT forwarded as the `--agents` CLI flag.
+      # Agent definitions flow via the `initialize` control request (see
+      # `AgentClient#populate_initialize_agents`), matching the Python and
+      # TypeScript SDKs. Double-delivery used to risk redundant argv
+      # length and race-condition ambiguity.
       opts.agent.try { |agent| args << "--agent" << agent }
     end
 
     # Compute effective allowed_tools/setting_sources from `skills`.
     # Injects `Skill` or `Skill(name)` entries into allowed_tools and defaults
-    # setting_sources to ["user","project"] when unset. Returns copies; does
-    # not mutate `opts`.
+    # setting_sources to ["user","project"] ONLY when the caller enabled
+    # skills via a non-empty configuration. Returns copies; does not
+    # mutate `opts`.
     protected def apply_skills_defaults(opts : AgentOptions) : {Array(String), Array(String)?}
       allowed = opts.allowed_tools.try(&.dup) || [] of String
       sources = opts.setting_sources.try(&.dup)
@@ -352,16 +665,31 @@ module ClaudeAgent
       when Nil
         # No-op. CLI defaults still apply.
       when String
-        if skills == "all"
+        case skills
+        when "all"
           allowed << "Skill" unless allowed.includes?("Skill")
           sources ||= ["user", "project"]
+        else
+          # Any string other than "all" is invalid. Surface it rather
+          # than silently no-op-ing; users typing "none" / "off" /
+          # "<skill>" get immediate feedback instead of debugging why
+          # their skill configuration is being ignored.
+          raise ConfigurationError.new(
+            "AgentOptions#skills must be \"all\", an Array(String) of skill names, " \
+            "or nil. Got: #{skills.inspect}",
+          )
         end
       when Array(String)
-        skills.each do |name|
-          pattern = "Skill(#{name})"
-          allowed << pattern unless allowed.includes?(pattern)
+        # Empty array is an explicit no-op: the caller wants to opt *out*
+        # of skill injection entirely, so we must not mutate
+        # `setting_sources` as a side effect.
+        unless skills.empty?
+          skills.each do |name|
+            pattern = "Skill(#{name})"
+            allowed << pattern unless allowed.includes?(pattern)
+          end
+          sources ||= ["user", "project"]
         end
-        sources ||= ["user", "project"]
       end
 
       {allowed, sources}
@@ -370,9 +698,15 @@ module ClaudeAgent
     private def add_tools_option_args(args : Array(String), opts : AgentOptions)
       case tools = opts.tools
       when Array(String)
+        # `--tools ""` explicitly disables all tools. `--tools "A,B,C"` is the
+        # comma-separated allowlist the CLI expects.
         args << "--tools" << tools.join(",")
       when ToolsPreset
-        args << "--tools" << tools.preset
+        # The CLI recognises the preset value "default" (all tools). The
+        # legacy preset name "claude_code" is an SDK alias that maps to
+        # the canonical "default" so older CLIs don't reject it.
+        preset_value = tools.preset == "claude_code" ? "default" : tools.preset
+        args << "--tools" << preset_value
       end
     end
 
@@ -449,8 +783,15 @@ module ClaudeAgent
 
         server_config
       when SDKMCPServer
-        # SDK MCP servers are handled differently (in-process)
-        nil
+        # SDK MCP servers still need to be declared to the CLI via
+        # `--mcp-config` so the CLI knows to route tool calls back as
+        # `mcp_message` control requests. The `instance` itself stays
+        # in the SDK; only the declaration metadata crosses the wire.
+        sdk_config = {} of String => JSON::Any
+        sdk_config["type"] = JSON::Any.new("sdk")
+        sdk_config["name"] = JSON::Any.new(config.name)
+        sdk_config["version"] = JSON::Any.new(config.version)
+        sdk_config
       else
         nil
       end
@@ -468,7 +809,20 @@ module ClaudeAgent
 
       # --resume takes a session ID, not just a flag
       opts.resume.try { |id| args << "--resume" << id }
-      opts.resume_session_at.try { |uuid| args << "--resume-session-at" << uuid }
+
+      if uuid = opts.resume_session_at
+        # CLI rejects `--resume-session-at` when `--resume` isn't present.
+        # Validate here so callers get an actionable error pointing at the
+        # specific option, rather than an opaque subprocess failure.
+        unless opts.resume
+          raise ConfigurationError.new(
+            "AgentOptions#resume_session_at requires AgentOptions#resume to " \
+            "be set to the session ID to resume.",
+          )
+        end
+        args << "--resume-session-at" << uuid
+      end
+
       args << "--fork-session" if opts.fork_session?
       opts.session_id.try { |id| args << "--session-id" << id }
 
@@ -477,16 +831,14 @@ module ClaudeAgent
     end
 
     private def add_session_settings_args(args : Array(String), opts : AgentOptions)
-      # --setting-sources takes comma-separated values. An empty array disables
-      # all filesystem settings; it must be passed as a single `--setting-sources=`
-      # token so the CLI does not consume the next flag as its value.
+      # --setting-sources takes comma-separated values. Always emitted as
+      # a single `--setting-sources=<csv>` token (matching the canonical
+      # Python SDK shape). The empty case becomes `--setting-sources=`,
+      # which disables all filesystem settings without the CLI consuming
+      # the next flag as its value.
       _, effective_sources = apply_skills_defaults(opts)
       effective_sources.try do |sources|
-        if sources.empty?
-          args << "--setting-sources="
-        else
-          args << "--setting-sources" << sources.join(",")
-        end
+        args << "--setting-sources=#{sources.join(",")}"
       end
 
       # --settings takes a path or JSON string
@@ -511,6 +863,12 @@ module ClaudeAgent
       sandbox_obj["autoAllowBashIfSandboxed"] = JSON::Any.new(sandbox.auto_allow_bash_if_sandboxed?) if sandbox.auto_allow_bash_if_sandboxed?
       sandbox_obj["allowUnsandboxedCommands"] = JSON::Any.new(sandbox.allow_unsandboxed_commands?) if sandbox.allow_unsandboxed_commands?
       sandbox_obj["enableWeakerNestedSandbox"] = JSON::Any.new(sandbox.enable_weaker_nested_sandbox?) if sandbox.enable_weaker_nested_sandbox?
+      # Always emit failIfUnavailable explicitly when the sandbox is enabled
+      # so callers who rely on the default (fail fast) behavior get it even
+      # on CLIs that historically defaulted to silent fallback.
+      if sandbox.enabled?
+        sandbox_obj["failIfUnavailable"] = JSON::Any.new(sandbox.fail_if_unavailable?)
+      end
 
       sandbox.excluded_commands.try do |cmds|
         sandbox_obj["excludedCommands"] = JSON::Any.new(cmds.map { |cmd| JSON::Any.new(cmd) })
@@ -542,9 +900,14 @@ module ClaudeAgent
     private def add_session_streaming_args(args : Array(String), opts : AgentOptions)
       # Streaming options
       args << "--include-partial-messages" if opts.include_partial_messages?
+      args << "--include-hook-events" if opts.include_hook_events?
       args << "--replay-user-messages" if opts.replay_user_messages?
-      args << "--enable-file-checkpointing" if opts.enable_file_checkpointing?
-      opts.permission_prompt_tool_name.try { |name| args << "--permission-prompt-tool-name" << name }
+      # NOTE: file checkpointing is enabled via the
+      # `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true` environment variable
+      # (see `#build_env`), NOT a CLI flag. The CLI does not accept any
+      # `--enable-file-checkpointing` flag and will abort argv parsing if
+      # one is passed.
+      opts.permission_prompt_tool_name.try { |name| args << "--permission-prompt-tool" << name }
 
       # Structured output via JSON schema
       add_output_format_args(args, opts)

@@ -191,6 +191,19 @@ module ClaudeAgent
     getter server_name : String
   end
 
+  # Placeholder for an inbound `control_request` whose subtype the SDK
+  # does not recognize. The outer dispatcher should respond with a
+  # control_response error so the CLI's pending request resolves, rather
+  # than letting the request hang forever.
+  struct ControlUnknownRequest
+    include JSON::Serializable
+
+    getter subtype : String
+
+    def initialize(@subtype : String)
+    end
+  end
+
   struct ControlCancelAsyncMessageRequest
     include JSON::Serializable
 
@@ -325,7 +338,8 @@ module ClaudeAgent
                               ControlStopTaskRequest |
                               ControlElicitationRequest |
                               ControlHookCallbackRequest |
-                              ControlRewindFilesRequest
+                              ControlRewindFilesRequest |
+                              ControlUnknownRequest
 
   # Converter for parsing control request inner based on subtype
   module ControlRequestInnerConverter
@@ -363,7 +377,12 @@ module ClaudeAgent
       subtype = data["subtype"]?.try(&.as_s)
 
       parser = subtype.try { |value| PARSERS[value]? }
-      raise Error.new("Unknown control request subtype: #{subtype}") unless parser
+      # Fall back to a typed "unknown" variant so `handle_control_request`
+      # can reply with a proper control_response error. Raising here used
+      # to bubble out of `each_message`, the exception got swallowed, and
+      # the CLI would block forever waiting for a response to the request
+      # it just sent.
+      return ControlUnknownRequest.new(subtype || "") unless parser
 
       parser.call(json_str)
     end
@@ -434,25 +453,41 @@ module ClaudeAgent
       new(response)
     end
 
-    # Create an MCP response (for mcp_message requests)
+    # Create an MCP response (for mcp_message requests).
+    # The CLI expects the JSON-RPC response nested under the standard
+    # `response` key so the full wire shape is:
+    #   {"type":"control_response",
+    #    "response":{"subtype":"success","request_id":"...",
+    #                "response":{"mcp_response":{...jsonrpc...}}}}
     def self.mcp_response(request_id : String, mcp_result : JSON::Any) : ControlResponse
+      wrapped = {"mcp_response" => mcp_result}
       response = {
-        "subtype"      => JSON::Any.new("success"),
-        "request_id"   => JSON::Any.new(request_id),
-        "mcp_response" => mcp_result,
+        "subtype"    => JSON::Any.new("success"),
+        "request_id" => JSON::Any.new(request_id),
+        "response"   => JSON::Any.new(wrapped),
       }
       new(response)
     end
   end
 
+  # Tool annotations / "hints" advertised alongside an MCP tool.
+  # Field names are the MCP-spec `*Hint` suffixes. Older CLIs that emitted
+  # the unsuffixed variants (`readOnly`, `destructive`, `openWorld`) will
+  # simply leave these getters nil; the raw annotations hash is available
+  # via `MCPToolInfo#annotations` for those cases.
   struct MCPToolAnnotations
     include JSON::Serializable
 
-    @[JSON::Field(key: "readOnly")]
-    getter read_only : Bool?
-    getter destructive : Bool?
-    @[JSON::Field(key: "openWorld")]
-    getter open_world : Bool?
+    @[JSON::Field(key: "readOnlyHint")]
+    getter? read_only_hint : Bool?
+    @[JSON::Field(key: "destructiveHint")]
+    getter? destructive_hint : Bool?
+    @[JSON::Field(key: "openWorldHint")]
+    getter? open_world_hint : Bool?
+    @[JSON::Field(key: "idempotentHint")]
+    getter? idempotent_hint : Bool?
+    @[JSON::Field(key: "title")]
+    getter title : String?
   end
 
   struct MCPToolInfo

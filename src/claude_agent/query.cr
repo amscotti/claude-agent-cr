@@ -55,20 +55,27 @@ module ClaudeAgent
     include Iterator(Message)
 
     @client : CLIClient
-    @channel : Channel(Message | Iterator::Stop)
+    @channel : Channel(Message | Iterator::Stop | Exception)
     @started : Bool = false
 
     def initialize(@prompt : String, @options : AgentOptions?)
       @client = CLIClient.new(@options)
-      @channel = Channel(Message | Iterator::Stop).new
+      @channel = Channel(Message | Iterator::Stop | Exception).new
     end
 
+    # Advance the iterator. Raises if the background fiber encountered
+    # an error (e.g., CLI not found, subprocess crashed, unsupported
+    # option); the previous implementation swallowed those silently and
+    # produced an empty iterator with no diagnostic.
     def next : Message | Iterator::Stop
       start_if_needed
 
       case msg = @channel.receive
       when Message
         msg
+      when Exception
+        stop
+        raise msg
       when Iterator::Stop
         stop
       else
@@ -94,10 +101,13 @@ module ClaudeAgent
           @client.each_message do |message|
             @channel.send(message)
           end
-        rescue
-          # Errors are silently handled - iteration will stop
+        rescue ex
+          # Forward the exception to the consumer instead of swallowing
+          # it. Without this, a bad CLI path or a control-protocol
+          # failure produced an empty iterator and no way to diagnose.
+          @channel.send(ex) unless @channel.closed?
         ensure
-          @channel.send(Iterator::Stop.new)
+          @channel.send(Iterator::Stop.new) unless @channel.closed?
           @client.stop
         end
       end

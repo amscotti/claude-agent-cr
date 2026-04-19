@@ -108,43 +108,84 @@ module ClaudeAgent
       request = {} of String => JSON::Any
       request["subtype"] = JSON::Any.new("initialize")
 
-      if @cli_client.has_sdk_servers?
-        request["sdkMcpServers"] = JSON::Any.new(
-          @cli_client.sdk_server_names.map { |name| JSON::Any.new(name) }
-        )
-      end
-
-      if hooks_payload = build_hook_initialize_payload
-        request["hooks"] = JSON::Any.new(hooks_payload)
-      end
-
-      if agents_payload = build_agents_initialize_payload
-        request["agents"] = agents_payload
-      end
-
-      request["promptSuggestions"] = JSON::Any.new(true) if @options.try(&.prompt_suggestions?)
-      request["agentProgressSummaries"] = JSON::Any.new(true) if @options.try(&.agent_progress_summaries?)
-
-      # Forward `skills` to the CLI so a supporting CLI can filter which
-      # skills are loaded into the system prompt. Older CLIs ignore this.
-      case skills = @options.try(&.skills)
-      when String
-        request["skills"] = JSON::Any.new(skills)
-      when Array(String)
-        request["skills"] = JSON::Any.new(skills.map { |skill| JSON::Any.new(skill) })
-      end
+      populate_initialize_mcp(request)
+      populate_initialize_hooks(request)
+      populate_initialize_agents(request)
+      populate_initialize_flags(request)
+      populate_initialize_skills(request)
+      populate_initialize_system_prompt(request)
 
       response = send_control_request(request, 90.seconds)
       @server_info = response.empty? ? nil : ServerInfo.from_data(response)
       @sdk_init_sent = true
     end
 
+    private def populate_initialize_mcp(request : Hash(String, JSON::Any))
+      return unless @cli_client.has_sdk_servers?
+
+      request["sdkMcpServers"] = JSON::Any.new(
+        @cli_client.sdk_server_names.map { |name| JSON::Any.new(name) }
+      )
+    end
+
+    private def populate_initialize_hooks(request : Hash(String, JSON::Any))
+      if hooks_payload = build_hook_initialize_payload
+        request["hooks"] = JSON::Any.new(hooks_payload)
+      end
+    end
+
+    private def populate_initialize_agents(request : Hash(String, JSON::Any))
+      if agents_payload = build_agents_initialize_payload
+        request["agents"] = agents_payload
+      end
+    end
+
+    private def populate_initialize_flags(request : Hash(String, JSON::Any))
+      request["promptSuggestions"] = JSON::Any.new(true) if @options.try(&.prompt_suggestions?)
+      request["agentProgressSummaries"] = JSON::Any.new(true) if @options.try(&.agent_progress_summaries?)
+    end
+
+    # Forward `skills` to the CLI so a supporting CLI can filter which
+    # skills are loaded into the system prompt. Older CLIs ignore this.
+    #
+    # `"all"` and omitted are equivalent at the wire level (no filter),
+    # so the `"all"` case is a no-op here; the injection happens in
+    # `apply_skills_defaults` via the `Skill` allow-rule instead.
+    private def populate_initialize_skills(request : Hash(String, JSON::Any))
+      case skills = @options.try(&.skills)
+      when Array(String)
+        request["skills"] = JSON::Any.new(skills.map { |skill| JSON::Any.new(skill) })
+      end
+    end
+
+    # `exclude_dynamic_sections` on a `SystemPromptPreset` flows through
+    # the initialize request as `excludeDynamicSections`, not a CLI flag.
+    # `title` is also forwarded here so the CLI can apply it to the
+    # session transcript without us waiting for `session_id` first.
+    # Older CLIs silently ignore unknown initialize fields.
+    private def populate_initialize_system_prompt(request : Hash(String, JSON::Any))
+      preset = @options.try(&.system_prompt).as?(SystemPromptPreset)
+      if preset && preset.exclude_dynamic_sections?
+        request["excludeDynamicSections"] = JSON::Any.new(true)
+      end
+
+      @options.try(&.title).try do |title|
+        stripped = title.strip
+        request["title"] = JSON::Any.new(stripped) unless stripped.empty?
+      end
+    end
+
     def stop
       @state_mutex.synchronize { @started = false }
       trigger_hook(:session_end)
       fail_pending_control_requests(ConnectionError.new("Agent client stopped"))
+      # Close the message channel BEFORE stopping the CLI. That way, any
+      # fiber blocked inside `each_response` on `@message_channel.receive?`
+      # wakes immediately with `nil` and exits cleanly. If the CLI side
+      # is stuck, the graceful→TERM→KILL cascade in `CLIClient#stop` then
+      # takes over without leaving `each_response` blocked.
+      @message_channel.close unless @message_channel.closed?
       @cli_client.stop
-      @message_channel.close
     end
 
     # Send a query and get responses
@@ -424,9 +465,21 @@ module ClaudeAgent
         rescue ex
           STDERR.puts "claude-agent-cr: response reader error: #{ex.message}"
         ensure
-          fail_pending_control_requests(ConnectionError.new("Agent client connection closed"))
+          fail_pending_control_requests(connection_closed_error)
           @message_channel.close unless @message_channel.closed?
         end
+      end
+    end
+
+    # Translate an abrupt subprocess exit into a more actionable error when
+    # the CLI's stderr contains an "unknown option '--xxx'" message (a
+    # signature of forwarding a v0.5+ SDK-only flag to an older CLI).
+    # Falls back to a generic ConnectionError otherwise.
+    private def connection_closed_error : ClaudeAgent::Error
+      if flag = @cli_client.detect_unknown_option_error
+        UnsupportedOptionError.new(flag, cli_path: @options.try(&.cli_path))
+      else
+        ConnectionError.new("Agent client connection closed")
       end
     end
 
@@ -708,7 +761,25 @@ module ClaudeAgent
       ctx = HookContext.new(session_id: common[:session_id])
 
       callbacks.each do |callback|
-        callback.call(input, "", ctx)
+        safe_hook_call(common[:hook_event_name] || "?") { callback.call(input, "", ctx) }
+      end
+    end
+
+    # Invoke a user-provided hook callback without letting it take down
+    # the response-reader fiber. A callback that raises writes a one-line
+    # diagnostic to STDERR (or the configured stderr callback) and the
+    # pipeline continues. Without this guard a buggy hook used to skip
+    # `fail_pending_control_requests`, leaking subprocesses and hanging
+    # in-flight control requests.
+    private def safe_hook_call(event_name : String, &)
+      yield
+    rescue ex
+      stderr_cb = @options.try(&.stderr)
+      message = "[hook error] #{event_name}: #{ex.class}: #{ex.message}\n"
+      if stderr_cb
+        stderr_cb.call(message)
+      else
+        STDERR.puts(message)
       end
     end
 
@@ -845,7 +916,9 @@ module ClaudeAgent
           ctx = HookContext.new(session_id: common[:session_id])
 
           hook_matcher.hooks.each do |callback|
-            callback.call(input, block.tool_use_id, ctx)
+            safe_hook_call("PostToolUse") do
+              callback.call(input, block.tool_use_id, ctx)
+            end
           end
         end
       end
@@ -902,7 +975,9 @@ module ClaudeAgent
         tool_input: block.input,
       )
       ctx = HookContext.new(session_id: common[:session_id])
-      callbacks.each(&.call(input, block.id, ctx))
+      callbacks.each do |callback|
+        safe_hook_call("SubagentStart") { callback.call(input, block.id, ctx) }
+      end
     end
 
     private def handle_subagent_stop(hooks : HookConfig, message : AssistantMessage, block : ToolResultBlock)
@@ -927,7 +1002,9 @@ module ClaudeAgent
         tool_result: result_content,
       )
       ctx = HookContext.new(session_id: common[:session_id])
-      callbacks.each(&.call(input, block.tool_use_id, ctx))
+      callbacks.each do |callback|
+        safe_hook_call("SubagentStop") { callback.call(input, block.tool_use_id, ctx) }
+      end
     end
 
     # Trigger Stop hook when agent finishes
@@ -947,7 +1024,9 @@ module ClaudeAgent
         hook_event_name: common[:hook_event_name],
       )
       ctx = HookContext.new(session_id: common[:session_id])
-      callbacks.each(&.call(input, result.uuid, ctx))
+      callbacks.each do |callback|
+        safe_hook_call("Stop") { callback.call(input, result.uuid, ctx) }
+      end
     end
 
     # --- Control Request Handling (SDK MCP Server Integration) ---
@@ -965,8 +1044,15 @@ module ClaudeAgent
         handle_control_elicitation_request(request.request_id, req)
       when ControlHookCallbackRequest
         handle_hook_callback_request(request.request_id, req)
+      when ControlUnknownRequest
+        # Always reply so the CLI's pending request resolves. Without this
+        # reply the CLI would wait indefinitely for a response.
+        send_control_error(
+          request.request_id,
+          "Unknown control request subtype: #{req.subtype}",
+        )
       else
-        send_control_error(request.request_id, "Unknown control request subtype")
+        send_control_error(request.request_id, "Unhandled control request subtype")
       end
     rescue ex
       send_control_error(request.request_id, ex.message || "Control request failed")
@@ -1000,10 +1086,14 @@ module ClaudeAgent
       response.id.try { |id| result["id"] = id }
       response.result.try { |res| result["result"] = res }
       if err = response.error
-        result["error"] = JSON::Any.new({
-          "code"    => JSON::Any.new(err.code.to_i64),
-          "message" => JSON::Any.new(err.message),
-        })
+        error_obj = {} of String => JSON::Any
+        error_obj["code"] = JSON::Any.new(err.code.to_i64)
+        error_obj["message"] = JSON::Any.new(err.message)
+        # JSON-RPC 2.0 allows an optional `data` payload on errors. If a
+        # SDK MCP tool raises with structured diagnostics, this keeps
+        # them reachable to the caller instead of silently dropping them.
+        err.data.try { |data| error_obj["data"] = data }
+        result["error"] = JSON::Any.new(error_obj)
       end
       JSON::Any.new(result)
     end

@@ -727,4 +727,252 @@ describe "ClaudeAgent session utilities" do
       FileUtils.rm_rf(project_path)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Session edge cases — equivalent to Python's `test_sessions.py` helpers
+  # that exercise UUID validation, path sanitization, filter semantics, and
+  # invalid-input handling. These run on synthetic JSONL and touch no CLI.
+  # ---------------------------------------------------------------------------
+
+  it "rejects invalid UUIDs in delete_session / fork_session / get_session_messages" do
+    with_temp_claude_config do
+      # Synchronous validators raise ArgumentError on malformed UUIDs.
+      expect_raises(ArgumentError, /Invalid session_id/) do
+        ClaudeAgent.delete_session("not-a-uuid")
+      end
+
+      expect_raises(ArgumentError, /Invalid session_id/) do
+        ClaudeAgent.fork_session("also-not-a-uuid")
+      end
+
+      # Read-side helpers silently return empty collections for invalid input.
+      ClaudeAgent.get_session_messages("bad-uuid").should be_empty
+      ClaudeAgent.list_subagents("bad-uuid").should be_empty
+      ClaudeAgent.get_subagent_messages("bad-uuid", "agent-1").should be_empty
+    end
+  end
+
+  it "fork_session refuses a malformed up_to_message_id" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-fork-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      user_id = UUID.random.to_s
+
+      write_transcript(project_dir, session_id, [
+        make_transcript_entry("user", user_id, nil, session_id, content: "hi"),
+      ])
+
+      expect_raises(ArgumentError, /Invalid up_to_message_id/) do
+        ClaudeAgent.fork_session(
+          session_id,
+          directory: project_path,
+          up_to_message_id: "not-a-uuid",
+        )
+      end
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "delete_session raises when the session file is missing" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-del-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      make_project_dir(config_dir, project_path)
+
+      expect_raises(File::NotFoundError) do
+        ClaudeAgent.delete_session(UUID.random.to_s, directory: project_path)
+      end
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "sanitize_path produces a hash-suffixed form for long paths" do
+    long_path = "/" + ("a" * 220)
+    sanitized = ClaudeAgent::SessionStorage.sanitize_path(long_path)
+
+    # Claude Code caps project-dir names at ~200 chars and appends a short
+    # hash to keep the mapping collision-resistant. The resulting name
+    # must never collide between distinct long paths.
+    sanitized.size.should be < long_path.size
+    sanitized.should_not contain("/")
+    # The hash suffix is appended via a trailing `-hexdigits` sequence.
+    sanitized.matches?(/-[a-z0-9]+\z/).should be_true
+
+    other = ClaudeAgent::SessionStorage.sanitize_path("/" + ("b" * 220))
+    sanitized.should_not eq(other)
+  end
+
+  it "sanitize_path is stable across calls for the same input" do
+    path = "/home/user/projects/my-project"
+    a = ClaudeAgent::SessionStorage.sanitize_path(path)
+    b = ClaudeAgent::SessionStorage.sanitize_path(path)
+    a.should eq(b)
+  end
+
+  it "list_sessions filters out zero-byte files" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-empty-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+
+      # A zero-byte JSONL with a UUID filename must not appear in listings —
+      # that's how Claude Code marks abandoned / never-started sessions.
+      empty_session_id = UUID.random.to_s
+      File.write(File.join(project_dir, "#{empty_session_id}.jsonl"), "")
+
+      real_session_id = UUID.random.to_s
+      make_session_file(project_dir, session_id: real_session_id)
+
+      ids = ClaudeAgent.list_sessions(directory: project_path).map(&.session_id)
+      ids.should contain(real_session_id)
+      ids.should_not contain(empty_session_id)
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "list_sessions ignores non-UUID .jsonl filenames" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-nouuid-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+
+      File.write(File.join(project_dir, "not-a-uuid.jsonl"), "content")
+      File.write(File.join(project_dir, "README.md"), "not a session")
+      real_session_id = UUID.random.to_s
+      make_session_file(project_dir, session_id: real_session_id)
+
+      ids = ClaudeAgent.list_sessions(directory: project_path).map(&.session_id)
+      ids.should eq([real_session_id])
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "rename_session / tag_session reject invalid session IDs" do
+    with_temp_claude_config do
+      expect_raises(ArgumentError, /Invalid session_id/) do
+        ClaudeAgent.rename_session("not-a-uuid", "my title")
+      end
+      expect_raises(ArgumentError, /Invalid session_id/) do
+        ClaudeAgent.tag_session("not-a-uuid", "my-tag")
+      end
+    end
+  end
+
+  it "get_session_messages respects offset and limit" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-pag-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+
+      # Build a linear 5-turn transcript so the returned list has
+      # predictable ordering.
+      entries = [] of String
+      previous_uuid : String? = nil
+      5.times do |i|
+        type = i.even? ? "user" : "assistant"
+        uuid = UUID.random.to_s
+        entries << make_transcript_entry(type, uuid, previous_uuid, session_id, content: "msg-#{i}")
+        previous_uuid = uuid
+      end
+      write_transcript(project_dir, session_id, entries)
+
+      full = ClaudeAgent.get_session_messages(session_id, directory: project_path)
+      full.size.should eq(5)
+
+      offset = ClaudeAgent.get_session_messages(session_id, directory: project_path, offset: 2)
+      offset.size.should eq(3)
+
+      limited = ClaudeAgent.get_session_messages(
+        session_id,
+        directory: project_path,
+        limit: 2,
+      )
+      limited.size.should eq(2)
+
+      page = ClaudeAgent.get_session_messages(
+        session_id,
+        directory: project_path,
+        offset: 1,
+        limit: 2,
+      )
+      page.size.should eq(2)
+
+      # An offset past the end returns an empty list rather than raising.
+      ClaudeAgent.get_session_messages(
+        session_id,
+        directory: project_path,
+        offset: 100,
+      ).should be_empty
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "fork_session with up_to_message_id slices at the cutoff message" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-slice-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+
+      uuids = Array.new(5) { UUID.random.to_s }
+      entries = uuids.each_with_index.map do |uuid, i|
+        parent = i == 0 ? nil : uuids[i - 1]
+        type = i.even? ? "user" : "assistant"
+        make_transcript_entry(type, uuid, parent, session_id, content: "m-#{i}")
+      end.to_a
+      write_transcript(project_dir, session_id, entries)
+
+      # Fork only the first 3 messages (0..2).
+      cutoff = uuids[2]
+      result = ClaudeAgent.fork_session(
+        session_id,
+        directory: project_path,
+        up_to_message_id: cutoff,
+      )
+
+      messages = ClaudeAgent.get_session_messages(
+        result.session_id,
+        directory: project_path,
+      )
+
+      # 3 sliced messages; `custom-title` + `fork_header` are non-visible.
+      messages.size.should eq(3)
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "fork_session accepts an explicit title that overrides derived title" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-ftitle-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      user_id = UUID.random.to_s
+
+      write_transcript(project_dir, session_id, [
+        make_transcript_entry("user", user_id, nil, session_id, content: "hi"),
+      ])
+
+      result = ClaudeAgent.fork_session(
+        session_id,
+        directory: project_path,
+        title: "my fork title",
+      )
+
+      info = ClaudeAgent.get_session_info(result.session_id, directory: project_path)
+      info.should_not be_nil
+      info.try(&.custom_title).should eq("my fork title")
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
 end

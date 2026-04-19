@@ -35,7 +35,7 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
       "parent_tool_use_id" => parent_tool_use_id ? JSON::Any.new(parent_tool_use_id) : JSON::Any.new(nil),
     }
     payload["uuid"] = JSON::Any.new(uuid) if uuid
-    payload["should_query"] = JSON::Any.new(false) unless should_query
+    payload["shouldQuery"] = JSON::Any.new(false) unless should_query
     @sent_messages << payload
   end
 
@@ -209,7 +209,7 @@ describe ClaudeAgent::AgentClient do
       client.send_user_message("context only", should_query: false)
 
       user_messages = fake_cli.sent_messages.select { |message| message["type"]?.try(&.as_s?) == "user" }
-      user_messages[0]["should_query"]?.try(&.as_bool).should be_false
+      user_messages[0]["shouldQuery"]?.try(&.as_bool).should be_false
     ensure
       client.stop
     end
@@ -1033,6 +1033,90 @@ describe ClaudeAgent::AgentClient do
       hook_output["permissionDecisionReason"].as_s.should eq("Nope")
       hook_output["updatedInput"].as_h["command"].as_s.should eq("pwd")
       hook_output["additionalContext"].as_s.should eq("Extra context")
+    ensure
+      client.stop
+    end
+  end
+
+  it "replies with a control_response error for unknown control_request subtypes (never hangs the CLI)" do
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+    begin
+      client.start
+
+      request = ClaudeAgent::ControlRequest.from_json({
+        "type"       => JSON::Any.new("control_request"),
+        "request_id" => JSON::Any.new("req-unknown-1"),
+        "request"    => JSON::Any.new({
+          "subtype" => JSON::Any.new("brand_new_subtype"),
+        }),
+      }.to_json)
+
+      client.test_handle_control_request(request)
+
+      response = fake_cli.sent_control_responses.last["response"].as_h
+      response["subtype"].as_s.should eq("error")
+      response["request_id"].as_s.should eq("req-unknown-1")
+      response["error"].as_s.should contain("brand_new_subtype")
+    ensure
+      client.stop
+    end
+  end
+
+  it "forwards title via the initialize control request (never as a CLI flag)" do
+    options = ClaudeAgent::AgentOptions.new(title: "my custom title")
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+    begin
+      client.start
+      initialize_request = fake_cli.sent_messages.first["request"].as_h
+      initialize_request["title"].as_s.should eq("my custom title")
+    ensure
+      client.stop
+    end
+  end
+
+  it "omits title from the initialize request when it is whitespace-only" do
+    options = ClaudeAgent::AgentOptions.new(title: "   ")
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+    begin
+      client.start
+      initialize_request = fake_cli.sent_messages.first["request"].as_h
+      initialize_request.has_key?("title").should be_false
+    ensure
+      client.stop
+    end
+  end
+
+  it "forwards excludeDynamicSections via the initialize control request" do
+    preset = ClaudeAgent::SystemPromptPreset.claude_code("Append", true)
+    options = ClaudeAgent::AgentOptions.new(system_prompt: preset)
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+    begin
+      client.start
+      initialize_request = fake_cli.sent_messages.first["request"].as_h
+      initialize_request["excludeDynamicSections"]?.try(&.as_bool).should be_true
+    ensure
+      client.stop
+    end
+  end
+
+  it "does not forward excludeDynamicSections when the preset flag is false" do
+    preset = ClaudeAgent::SystemPromptPreset.claude_code("Append")
+    options = ClaudeAgent::AgentOptions.new(system_prompt: preset)
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+    begin
+      client.start
+      initialize_request = fake_cli.sent_messages.first["request"].as_h
+      initialize_request.has_key?("excludeDynamicSections").should be_false
     ensure
       client.stop
     end
