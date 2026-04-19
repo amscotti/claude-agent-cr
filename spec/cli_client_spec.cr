@@ -32,6 +32,25 @@ class TestableCLIClient < ClaudeAgent::CLIClient
   end
 end
 
+# Stubs `run_cli_help_probe` with a caller-supplied proc so capability-probe
+# specs never spawn a real subprocess.
+class ProbeSpyCLIClient < ClaudeAgent::CLIClient
+  def initialize(
+    options : ClaudeAgent::AgentOptions?,
+    @probe : Proc(String, Set(String)?),
+  )
+    super(options)
+  end
+
+  protected def run_cli_help_probe(cli_path : String) : Set(String)?
+    @probe.call(cli_path)
+  end
+
+  def test_probe_cli_capabilities(cli_path : String) : Set(String)?
+    probe_cli_capabilities(cli_path)
+  end
+end
+
 describe ClaudeAgent::CLIClient do
   describe "#initialize" do
     it "initializes with no options" do
@@ -199,9 +218,9 @@ describe TestableCLIClient do
       idx.should_not be_nil
       args[idx.as(Int32) + 1].should contain("Skill") if idx
 
-      source_idx = args.index("--setting-sources")
-      source_idx.should_not be_nil
-      args[source_idx.as(Int32) + 1].should eq("user,project") if source_idx
+      # `--setting-sources` is always emitted as a single `=`-joined token
+      # (matches Python SDK canonical form).
+      args.should contain("--setting-sources=user,project")
     end
 
     it "injects Skill(name) entries when given a list" do
@@ -221,9 +240,27 @@ describe TestableCLIClient do
       client = TestableCLIClient.new(options)
       args = client.test_build_cli_args
 
-      idx = args.index("--setting-sources")
-      idx.should_not be_nil
-      args[idx.as(Int32) + 1].should eq("local") if idx
+      args.should contain("--setting-sources=local")
+      args.should_not contain("--setting-sources=user,project")
+    end
+
+    it "skills: [] (empty) is a true no-op and does not mutate setting_sources" do
+      options = ClaudeAgent::AgentOptions.new(skills: [] of String)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      # No `--setting-sources=…` should be emitted since the caller didn't
+      # set one and empty skills should not trigger the user/project default.
+      args.none?(&.starts_with?("--setting-sources=")).should be_true
+    end
+
+    it "skills: \"invalid\" raises ConfigurationError" do
+      options = ClaudeAgent::AgentOptions.new(skills: "none")
+      client = TestableCLIClient.new(options)
+
+      expect_raises(ClaudeAgent::ConfigurationError, /must be \"all\"/) do
+        client.test_build_cli_args
+      end
     end
 
     it "emits single --setting-sources= token for an empty array" do
@@ -232,12 +269,11 @@ describe TestableCLIClient do
       args = client.test_build_cli_args
 
       args.should contain("--setting-sources=")
-      args.should_not contain("--setting-sources")
     end
   end
 
   describe "#build_cli_args with task_budget and title" do
-    it "emits --task-budget and --title flags" do
+    it "emits --task-budget but never --title (title is a session-file mutation)" do
       options = ClaudeAgent::AgentOptions.new(
         task_budget: ClaudeAgent::TaskBudget.new(120_000),
         title: "refactor session",
@@ -247,8 +283,8 @@ describe TestableCLIClient do
 
       args.should contain("--task-budget")
       args.should contain("120000")
-      args.should contain("--title")
-      args.should contain("refactor session")
+      args.should_not contain("--title")
+      args.should_not contain("refactor session")
     end
   end
 
@@ -267,7 +303,7 @@ describe TestableCLIClient do
   end
 
   describe "#build_cli_args SystemPromptPreset with exclude_dynamic_sections" do
-    it "passes --exclude-dynamic-sections when requested" do
+    it "forwards append but never emits a --exclude-dynamic-sections flag" do
       options = ClaudeAgent::AgentOptions.new(
         system_prompt: ClaudeAgent::SystemPromptPreset.claude_code(
           "extra instructions",
@@ -277,7 +313,9 @@ describe TestableCLIClient do
       client = TestableCLIClient.new(options)
       args = client.test_build_cli_args
 
-      args.should contain("--exclude-dynamic-sections")
+      # The Claude Code CLI routes `exclude_dynamic_sections` through the
+      # initialize control request (`excludeDynamicSections`), not argv.
+      args.should_not contain("--exclude-dynamic-sections")
       args.should contain("--append-system-prompt")
       args.should contain("extra instructions")
     end
@@ -293,17 +331,262 @@ describe TestableCLIClient do
       args.should contain("5")
     end
 
-    it "adds --enable-file-checkpointing and --permission-prompt-tool-name flags" do
-      options = ClaudeAgent::AgentOptions.new(
-        enable_file_checkpointing: true,
-        permission_prompt_tool_name: "AskUser",
-      )
+    it "emits --include-hook-events when include_hook_events is true" do
+      options = ClaudeAgent::AgentOptions.new(include_hook_events: true)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--include-hook-events")
+    end
+
+    it "never emits --include-hook-events by default" do
+      options = ClaudeAgent::AgentOptions.new
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should_not contain("--include-hook-events")
+    end
+
+    it "emits failIfUnavailable=true by default when sandbox is enabled" do
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
       client = TestableCLIClient.new(options)
 
+      settings_json = client.test_build_settings_json(options)
+      settings_json.should_not be_nil
+      if settings_json
+        parsed = JSON.parse(settings_json)
+        parsed["sandbox"]["failIfUnavailable"].as_bool.should be_true
+      end
+    end
+
+    it "emits failIfUnavailable=false when the caller opts into graceful degradation" do
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, fail_if_unavailable: false)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+      client = TestableCLIClient.new(options)
+
+      settings_json = client.test_build_settings_json(options)
+      if settings_json
+        parsed = JSON.parse(settings_json)
+        parsed["sandbox"]["failIfUnavailable"].as_bool.should be_false
+      end
+    end
+
+    it "does not emit failIfUnavailable when the sandbox is disabled" do
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: false)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+      client = TestableCLIClient.new(options)
+
+      settings_json = client.test_build_settings_json(options)
+      if settings_json
+        parsed = JSON.parse(settings_json)
+        sandbox_obj = parsed["sandbox"]?
+        sandbox_obj.try(&.as_h?.try(&.has_key?("failIfUnavailable"))).should be_falsey
+      end
+    end
+
+    it "includes SDK MCP servers in --mcp-config with type=sdk" do
+      sdk_server = ClaudeAgent::SDKMCPServer.new("mine", version: "0.1.0")
+      mcp_servers = {"mine" => sdk_server.as(ClaudeAgent::MCPServerConfig)}
+      options = ClaudeAgent::AgentOptions.new(mcp_servers: mcp_servers)
+      client = TestableCLIClient.new(options)
       args = client.test_build_cli_args
-      args.should contain("--enable-file-checkpointing")
-      args.should contain("--permission-prompt-tool-name")
+
+      idx = args.index("--mcp-config")
+      idx.should_not be_nil
+      parsed = JSON.parse(args[idx.as(Int32) + 1])
+      parsed["mcpServers"]["mine"]["type"].as_s.should eq("sdk")
+      parsed["mcpServers"]["mine"]["name"].as_s.should eq("mine")
+      parsed["mcpServers"]["mine"]["version"].as_s.should eq("0.1.0")
+    end
+
+    it "never forwards opts.agents as a --agents CLI flag (initialize-only)" do
+      agents = {
+        "reviewer" => ClaudeAgent::AgentDefinition.new(
+          description: "r", prompt: "p",
+        ),
+      }
+      options = ClaudeAgent::AgentOptions.new(agents: agents)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should_not contain("--agents")
+    end
+
+    it "raises ConfigurationError when resume_session_at is set without resume" do
+      options = ClaudeAgent::AgentOptions.new(resume_session_at: "abc")
+      client = TestableCLIClient.new(options)
+
+      expect_raises(ClaudeAgent::ConfigurationError, /requires AgentOptions#resume/) do
+        client.test_build_cli_args
+      end
+    end
+
+    it "accepts resume_session_at when resume is set" do
+      options = ClaudeAgent::AgentOptions.new(
+        resume: "session-uuid",
+        resume_session_at: "message-uuid",
+      )
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--resume")
+      args.should contain("session-uuid")
+      args.should contain("--resume-session-at")
+      args.should contain("message-uuid")
+    end
+
+    it "emits --betas as separate variadic tokens" do
+      options = ClaudeAgent::AgentOptions.new(betas: ["context-1m-2025-08-07", "experimental"])
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--betas")
+      idx.should_not be_nil
+      # Next two args should be the beta names as SEPARATE tokens, never
+      # a single joined string like "context-1m-2025-08-07 experimental"
+      # or "context-1m-2025-08-07,experimental".
+      if idx
+        args[idx + 1].should eq("context-1m-2025-08-07")
+        args[idx + 2].should eq("experimental")
+      end
+      args.should_not contain("context-1m-2025-08-07 experimental")
+      args.should_not contain("context-1m-2025-08-07,experimental")
+    end
+
+    it "skips --betas entirely when the list is empty" do
+      options = ClaudeAgent::AgentOptions.new(betas: [] of String)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should_not contain("--betas")
+    end
+
+    it "emits --system-prompt \"\" when system_prompt is nil (vanilla SDK behavior)" do
+      options = ClaudeAgent::AgentOptions.new
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--system-prompt")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("") if idx
+    end
+
+    it "does not emit an empty --system-prompt when one is provided" do
+      options = ClaudeAgent::AgentOptions.new(system_prompt: "You are helpful.")
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      # Exactly one --system-prompt token, carrying the provided value.
+      args.count("--system-prompt").should eq(1)
+      idx = args.index("--system-prompt")
+      args[idx.as(Int32) + 1].should eq("You are helpful.") if idx
+    end
+
+    it "emits comma-separated --allowedTools and --disallowedTools" do
+      options = ClaudeAgent::AgentOptions.new(
+        allowed_tools: ["Read", "Glob", "Grep"],
+        disallowed_tools: ["Bash", "Write"],
+      )
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("Read,Glob,Grep")
+      args.should contain("Bash,Write")
+    end
+
+    it "maps --tools ToolsPreset.claude_code to the CLI's canonical \"default\"" do
+      options = ClaudeAgent::AgentOptions.new(tools: ClaudeAgent::ToolsPreset.claude_code)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      idx = args.index("--tools")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("default") if idx
+    end
+
+    it "forwards extra_args as trailing flags (string values and boolean switches)" do
+      extra = {} of String => String?
+      extra["ide"] = nil
+      extra["debug-file"] = "/tmp/claude.log"
+      options = ClaudeAgent::AgentOptions.new(extra_args: extra)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--ide")
+      args.should contain("--debug-file")
+      args.should contain("/tmp/claude.log")
+      # Boolean switch must not be followed by a nil stringification.
+      ide_idx = args.index("--ide").as(Int32)
+      next_token = args[ide_idx + 1]?
+      # Either we hit the end, or the next token is a new flag, never a nil.
+      next_token.nil? || next_token.to_s.starts_with?("--")
+    end
+
+    it "accepts --flag-style keys in extra_args without double-prefixing" do
+      extra = {} of String => String?
+      extra["--custom-flag"] = "x"
+      options = ClaudeAgent::AgentOptions.new(extra_args: extra)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should contain("--custom-flag")
+      args.should_not contain("----custom-flag")
+      args.should contain("x")
+    end
+
+    it "emits --permission-prompt-tool with the tool name" do
+      options = ClaudeAgent::AgentOptions.new(permission_prompt_tool_name: "AskUser")
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      # The real CLI flag is `--permission-prompt-tool`, not the earlier
+      # `--permission-prompt-tool-name`. Asserting the correct wire name
+      # guards against the bug that used to crash subprocess startup.
+      args.should contain("--permission-prompt-tool")
+      args.should_not contain("--permission-prompt-tool-name")
       args.should contain("AskUser")
+    end
+
+    it "emits shouldQuery camelCase (not should_query) on user stream messages" do
+      # Build a no-op client and capture what `send_prompt` writes by
+      # substituting an in-memory IO for the subprocess stdin.
+      client = ClaudeAgent::CLIClient.new
+      buffer = IO::Memory.new
+      client.set_input_for_test(buffer)
+
+      client.send_prompt("hello", should_query: false)
+
+      line = buffer.to_s.strip
+      parsed = JSON.parse(line).as_h
+      parsed["type"].as_s.should eq("user")
+      parsed.has_key?("shouldQuery").should be_true
+      parsed.has_key?("should_query").should be_false
+      parsed["shouldQuery"].as_bool.should be_false
+    end
+
+    it "never emits --enable-file-checkpointing (it's an env var, not a flag)" do
+      options = ClaudeAgent::AgentOptions.new(enable_file_checkpointing: true)
+      client = TestableCLIClient.new(options)
+      args = client.test_build_cli_args
+
+      args.should_not contain("--enable-file-checkpointing")
+    end
+
+    it "sets CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING when file checkpointing is enabled" do
+      options = ClaudeAgent::AgentOptions.new(enable_file_checkpointing: true)
+      client = TestableCLIClient.new(options)
+      env = client.test_build_env
+
+      env.should_not be_nil
+      env.try(&.["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"]?).should eq("true")
+    end
+
+    it "omits CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING by default" do
+      client = TestableCLIClient.new(ClaudeAgent::AgentOptions.new)
+      env = client.test_build_env
+
+      env.try(&.has_key?("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING")).should be_false
     end
   end
 
@@ -447,8 +730,8 @@ describe TestableCLIClient do
       parsed["mcpServers"]["streaming"]["url"].as_s.should eq("https://sse.example.com/events")
     end
 
-    it "excludes SDK MCP servers from JSON" do
-      sdk_server = ClaudeAgent::SDKMCPServer.new("sdk-tools")
+    it "includes SDK MCP servers with type=sdk and metadata (no instance)" do
+      sdk_server = ClaudeAgent::SDKMCPServer.new("sdk-tools", version: "2.5.0")
       external_server = ClaudeAgent::ExternalMCPServerConfig.stdio("node", ["server.js"])
 
       servers = {
@@ -460,18 +743,28 @@ describe TestableCLIClient do
       json = client.test_build_mcp_servers_json(servers)
       parsed = JSON.parse(json)
 
-      # SDK server should not be in the JSON
-      parsed["mcpServers"]["sdk"]?.should be_nil
+      # SDK server must be declared so the CLI knows to route tool calls
+      # back to us via `mcp_message` control requests. Only the metadata
+      # crosses the wire; the instance itself stays in-process.
+      sdk_entry = parsed["mcpServers"]["sdk"]
+      sdk_entry["type"].as_s.should eq("sdk")
+      sdk_entry["name"].as_s.should eq("sdk-tools")
+      sdk_entry["version"].as_s.should eq("2.5.0")
+      sdk_entry.as_h.has_key?("instance").should be_false
+
       parsed["mcpServers"]["external"].should_not be_nil
     end
 
-    it "returns empty string when only SDK servers" do
+    it "emits --mcp-config JSON even when only SDK servers are configured" do
       sdk_server = ClaudeAgent::SDKMCPServer.new("sdk-tools")
       servers = {"sdk" => sdk_server.as(ClaudeAgent::MCPServerConfig)}
 
       client = TestableCLIClient.new
       json = client.test_build_mcp_servers_json(servers)
-      json.should eq("")
+
+      json.should_not eq("")
+      parsed = JSON.parse(json)
+      parsed["mcpServers"]["sdk"]["type"].as_s.should eq("sdk")
     end
   end
 
@@ -642,5 +935,198 @@ describe ClaudeAgent::SystemPromptPreset do
       preset.preset.should eq("claude_code")
       preset.append.should eq("Additional instructions")
     end
+  end
+end
+
+describe "ClaudeAgent::CLIClient capability probe" do
+  describe ".parse_long_flags" do
+    it "extracts long option names from help text" do
+      help = <<-HELP
+        Usage: claude [options]
+
+        Options:
+          --model <id>              Model to use
+          --title <title>           Session title
+          --task-budget <n>         Token budget
+          --max-thinking-tokens <n> Legacy thinking tokens
+          -h, --help                Show help
+        HELP
+
+      flags = ClaudeAgent::CLIClient.parse_long_flags(help)
+      flags.should contain("--model")
+      flags.should contain("--title")
+      flags.should contain("--task-budget")
+      flags.should contain("--max-thinking-tokens")
+      flags.should contain("--help")
+    end
+
+    it "returns an empty set for help text with no long flags" do
+      flags = ClaudeAgent::CLIClient.parse_long_flags("usage: claude\n")
+      flags.should be_empty
+    end
+  end
+
+  describe "#filter_unsupported_flags" do
+    # Shared no-op stderr callback so the filter's "dropped flag" warnings
+    # do not leak into spec output.
+    silent_stderr = ->(_line : String) { }
+
+    it "drops optional flags the CLI does not advertise (space-separated form)" do
+      options = ClaudeAgent::AgentOptions.new(stderr: silent_stderr)
+      client = ClaudeAgent::CLIClient.new(options)
+      args = [
+        "--verbose",
+        "--model", "claude-opus-4-7",
+        "--task-budget", "120000",
+        "--system-prompt-file", "/tmp/prompt.md",
+        "--print",
+      ]
+
+      capabilities = Set{"--verbose", "--model", "--print"}
+      filtered = client.filter_unsupported_flags(args, capabilities)
+
+      filtered.should_not contain("--task-budget")
+      filtered.should_not contain("120000")
+      filtered.should_not contain("--system-prompt-file")
+      filtered.should_not contain("/tmp/prompt.md")
+      filtered.should contain("--model")
+      filtered.should contain("claude-opus-4-7")
+    end
+
+    it "drops --flag=value style tokens without consuming the next arg" do
+      options = ClaudeAgent::AgentOptions.new(stderr: silent_stderr)
+      client = ClaudeAgent::CLIClient.new(options)
+      # `--task-budget=100` is a single token; the following `--model` token
+      # must survive the filter even though `--task-budget` is dropped.
+      args = ["--task-budget=100", "--model", "claude-opus-4-7"]
+
+      capabilities = Set{"--model"}
+      filtered = client.filter_unsupported_flags(args, capabilities)
+
+      filtered.should eq(["--model", "claude-opus-4-7"])
+    end
+
+    it "keeps optional flags that the CLI advertises" do
+      options = ClaudeAgent::AgentOptions.new
+      client = ClaudeAgent::CLIClient.new(options)
+      args = ["--task-budget", "100", "--model", "claude-opus-4-7"]
+
+      capabilities = Set{"--task-budget", "--model"}
+      filtered = client.filter_unsupported_flags(args, capabilities)
+
+      filtered.should eq(args)
+    end
+
+    it "never filters core flags even when not in the capability set" do
+      options = ClaudeAgent::AgentOptions.new
+      client = ClaudeAgent::CLIClient.new(options)
+      args = ["--model", "claude-opus-4-7", "--output-format", "stream-json"]
+
+      # Empty capabilities; only OPTIONAL_CLI_FLAGS get dropped.
+      filtered = client.filter_unsupported_flags(args, Set(String).new)
+
+      filtered.should eq(args)
+    end
+
+    it "passes args through unchanged when capabilities is nil" do
+      options = ClaudeAgent::AgentOptions.new
+      client = ClaudeAgent::CLIClient.new(options)
+      args = ["--task-budget", "100", "--thinking", "adaptive"]
+
+      client.filter_unsupported_flags(args, nil).should eq(args)
+    end
+
+    it "invokes the stderr callback for each dropped flag" do
+      dropped = [] of String
+      callback = ->(line : String) { dropped << line; nil }
+      options = ClaudeAgent::AgentOptions.new(stderr: callback)
+      client = ClaudeAgent::CLIClient.new(options)
+      args = ["--task-budget", "100", "--thinking", "adaptive"]
+
+      client.filter_unsupported_flags(args, Set(String).new)
+
+      dropped.size.should eq(2)
+      dropped.any?(&.includes?("--task-budget")).should be_true
+      dropped.any?(&.includes?("--thinking")).should be_true
+    end
+  end
+
+  describe "#probe_cli_capabilities" do
+    it "returns nil without probing when probe_cli_capabilities is false" do
+      ClaudeAgent::CLIClient.clear_capability_cache
+      options = ClaudeAgent::AgentOptions.new(probe_cli_capabilities: false)
+
+      probed = false
+      probe = ->(_path : String) {
+        probed = true
+        Set(String).new.as(Set(String)?)
+      }
+      client = ProbeSpyCLIClient.new(options, probe)
+
+      client.test_probe_cli_capabilities("/opt/claude").should be_nil
+      probed.should be_false
+    end
+
+    it "caches probe results per cli_path" do
+      ClaudeAgent::CLIClient.clear_capability_cache
+      options = ClaudeAgent::AgentOptions.new
+
+      calls = 0
+      probe = ->(_path : String) {
+        calls += 1
+        Set{"--model", "--title"}.as(Set(String)?)
+      }
+      client = ProbeSpyCLIClient.new(options, probe)
+
+      client.test_probe_cli_capabilities("/opt/claude")
+      client.test_probe_cli_capabilities("/opt/claude")
+      client.test_probe_cli_capabilities("/opt/claude")
+
+      calls.should eq(1)
+    end
+
+    it "uses seeded cache entries without re-probing" do
+      ClaudeAgent::CLIClient.clear_capability_cache
+      ClaudeAgent::CLIClient.seed_capability_cache("/opt/claude", ["--model"])
+
+      calls = 0
+      probe = ->(_path : String) {
+        calls += 1
+        Set(String).new.as(Set(String)?)
+      }
+      client = ProbeSpyCLIClient.new(ClaudeAgent::AgentOptions.new, probe)
+
+      result = client.test_probe_cli_capabilities("/opt/claude")
+      result.should_not be_nil
+      result.try(&.includes?("--model")).should be_true
+      calls.should eq(0)
+    end
+  end
+
+  describe "#detect_unknown_option_error" do
+    it "recognizes the Claude Code stderr signature" do
+      client = ClaudeAgent::CLIClient.new
+      client.record_stderr_for_test("error: unknown option '--title'")
+
+      client.detect_unknown_option_error.should eq("--title")
+    end
+
+    it "returns nil when stderr does not contain the signature" do
+      client = ClaudeAgent::CLIClient.new
+      client.record_stderr_for_test("warning: something")
+
+      client.detect_unknown_option_error.should be_nil
+    end
+  end
+end
+
+describe ClaudeAgent::UnsupportedOptionError do
+  it "builds a helpful default message" do
+    error = ClaudeAgent::UnsupportedOptionError.new("--title", cli_path: "/opt/claude")
+    error.option.should eq("--title")
+    error.cli_path.should eq("/opt/claude")
+    message = error.message.to_s
+    message.should contain("--title")
+    message.should contain("Upgrade the CLI")
   end
 end

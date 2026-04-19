@@ -52,7 +52,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.5.0
+        version: ~> 0.6.0
     ```
 
 2.  Run `shards install`
@@ -430,9 +430,12 @@ Intercept tool usage to block or modify actions. All hook inputs include common 
 | **SubagentStop** | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
 | **SessionStart** | `source` ("startup", "resume", "clear", "compact") |
 | **SessionEnd** | `session_end_reason` ("clear", "logout", etc.) |
+| **TeammateIdle** | `agent_id`, `agent_type` — background agent is idle and available |
+| **TaskCompleted** | `task_id`, `task_status`, `task_summary`, `tool_use_id` |
+| **ConfigChange** | `config_change_source`, `config_change_diff` — settings/permissions changed mid-session |
 
 For local hook callbacks, `permission_mode` is normalized to the CLI-style values such as
-`default`, `acceptEdits`, `plan`, and `bypassPermissions`.
+`default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, and `dontAsk`.
 
 `HookMatcher` also supports an optional `timeout` value in seconds for control-protocol hook registrations.
 
@@ -915,18 +918,69 @@ rescue ex : ClaudeAgent::ConnectionError
   # pending request was cancelled mid-flight.
   STDERR.puts "Connection error: #{ex.message}"
 rescue ex : ClaudeAgent::JSONDecodeError
-  # A stream-json line could not be parsed. `raw_data` preserves the payload.
+  # A stream-json line could not be parsed. `raw_data` preserves the payload
+  # (truncated to 500 chars for diagnostics).
   STDERR.puts "Malformed CLI output: #{ex.raw_data}"
-rescue ex : ClaudeAgent::PermissionDeniedError
-  # A tool request was denied and the SDK surfaced it as a hard error.
-  STDERR.puts "Permission denied for #{ex.tool_name}: #{ex.message}"
 rescue ex : ClaudeAgent::TimeoutError
   STDERR.puts "Timed out waiting for Claude Code: #{ex.message}"
 rescue ex : ClaudeAgent::ConfigurationError
   STDERR.puts "Invalid SDK configuration: #{ex.message}"
+rescue ex : ClaudeAgent::UnsupportedOptionError
+  # An AgentOptions flag was rejected by the installed Claude Code CLI.
+  # `option` is the specific flag (e.g., "--title"); `cli_path` is the
+  # resolved binary. Upgrade the CLI or stop setting that option.
+  STDERR.puts "CLI rejected #{ex.option}: #{ex.message}"
 rescue ex : ClaudeAgent::Error
   # Catch-all for any other SDK-level error.
   STDERR.puts "SDK error: #{ex.message}"
+end
+```
+
+### CLI Capability Probe
+
+Forward-compatible SDK options like `task_budget`, `thinking`, and
+`SystemPromptFile` map to CLI flags that only newer Claude Code releases
+understand. When the SDK hands an unknown flag to an older CLI, the
+subprocess aborts at argv-parse time with
+`error: unknown option '--task-budget'`, which previously surfaced to
+callers as an opaque connection-closed error.
+
+To prevent that, `CLIClient` probes `claude --help` once per `cli_path` at
+start time, caches the advertised flag set, and silently drops any
+forward-compatible optional flag the CLI does not recognize. A short
+warning is emitted through your `stderr` callback (or to standard error)
+whenever a flag is dropped.
+
+- Core flags (`--model`, `--print`, `--output-format`, `--verbose`, etc.)
+  are never filtered. Only the SDK-only forward-compatible flags listed in
+  `CLIClient::OPTIONAL_CLI_FLAGS` are eligible for filtering.
+- `options.title` is not a CLI argument at all. The SDK applies it via the
+  session-file mutation path (`ClaudeAgent.rename_session` / the
+  `generate_session_title` control request). Similarly,
+  `SystemPromptPreset#exclude_dynamic_sections` flows through the
+  `initialize` control request as `excludeDynamicSections`.
+- Set `AgentOptions#probe_cli_capabilities = false` to disable the probe
+  entirely and pass every option through unmodified. Use this when you
+  know the installed CLI supports every flag you configure and you want
+  to avoid the one-time `claude --help` subprocess.
+- If the CLI ever aborts with an `unknown option` stderr line that slips
+  past the probe, the SDK raises a typed `ClaudeAgent::UnsupportedOptionError`
+  with `option` and `cli_path` populated, so callers can recover cleanly
+  instead of parsing error strings.
+
+```crystal
+options = ClaudeAgent::AgentOptions.new(
+  task_budget: ClaudeAgent::TaskBudget.new(120_000),  # dropped on older CLIs
+  thinking: ClaudeAgent::ThinkingConfig.adaptive,     # dropped on older CLIs
+  title: "refactor session",                          # session-file only
+  probe_cli_capabilities: true,                       # default
+  stderr: ->(line : String) { puts "[claude] #{line}" },
+)
+
+begin
+  ClaudeAgent::AgentClient.open(options) { |client| client.query("Hi") }
+rescue ex : ClaudeAgent::UnsupportedOptionError
+  puts "CLI does not support #{ex.option}; upgrade with `claude upgrade`."
 end
 ```
 
@@ -968,6 +1022,7 @@ options = ClaudeAgent::AgentOptions.new(
   max_budget_usd: 1.0,
   task_budget: ClaudeAgent::TaskBudget.new(120_000),  # API-side token budget
   title: "refactor session",                           # fixed session title
+  probe_cli_capabilities: true,                        # default; filters forward-only flags
 
   # --- Extended thinking ---------------------------------------------------
   thinking: ClaudeAgent::ThinkingConfig.adaptive,      # adaptive | enabled(n) | disabled
@@ -1131,6 +1186,96 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.6.0
+
+Hardening release. Surfaced latent bugs across wire protocol, robustness,
+and error handling via a multi-angle audit against the Python SDK + live
+Claude Code CLI v2.1.114, and fixed the high-severity findings.
+
+**Breaking changes** (upgrade notes):
+
+- **Removed `ClaudeAgent::PermissionDeniedError`.** The class was declared in `errors.cr` but never raised anywhere in the SDK. Any `rescue ex : ClaudeAgent::PermissionDeniedError` clauses in consumer code will now fail to compile — the branch was never executing, so it's safe to delete.
+- **`MCPToolAnnotations` fields renamed to MCP-spec `*Hint` keys**:
+  - `#read_only` → `#read_only_hint?` (JSON `readOnly` → `readOnlyHint`)
+  - `#destructive` → `#destructive_hint?` (JSON `destructive` → `destructiveHint`)
+  - `#open_world` → `#open_world_hint?` (JSON `openWorld` → `openWorldHint`)
+  - Plus new `#idempotent_hint?` and `#title`.
+  The old keys were never what the CLI actually emitted; any code reading the old getters was always seeing `nil`.
+- **`QueryIterator#next` now re-raises errors** from the background fiber (CLI not found, subprocess crashed, unsupported option) instead of silently yielding `Iterator::Stop`. Callers iterating `ClaudeAgent.query(prompt)` (the non-block form) must now rescue or propagate.
+- **`AgentOptions#skills` rejects unrecognized strings.** Only `"all"`, an `Array(String)` of skill names, or `nil` are accepted. Passing `"none"`, `"off"`, a single skill name, etc. now raises `ConfigurationError` instead of being silently ignored.
+- **`AgentOptions#resume_session_at` without `resume` now raises** `ConfigurationError` at argv build time. Previously this caused an opaque subprocess crash during handshake.
+- **`AgentOptions#skills: []` is a true no-op.** Empty array no longer defaults `setting_sources` to `["user","project"]` as a side effect. If you were relying on that side effect, set `setting_sources` explicitly.
+- **`AgentOptions#skills: "all"` is no longer emitted on the initialize request.** Matches Python SDK wire format (`"all"` and omitted are equivalent at the wire level). Injection of the `Skill` allow-rule still happens client-side.
+- **`InitMessage#memory_paths` and `MemoryRecallMessage#memory_paths` are `Hash(String, String)`** (namespace → path), not `Array(String)`. Reflects what the CLI actually emits.
+- **`opts.agents` is no longer forwarded as `--agents` on argv.** Agent definitions flow through the `initialize` control request exclusively (matches Python and TypeScript SDKs).
+- **`--setting-sources` always emits a single `=`-joined token** (e.g., `--setting-sources=user,project`). Previously the populated case used the two-token form.
+- **`ClaudeAgent::CLIClient#send_sdk_init` removed.** It was dead code with a broken wire shape (missing `request_id`).
+
+Robustness:
+
+- **Fix**: `CLIClient#stop` now runs a timed terminate → kill cascade (5s graceful, 5s SIGTERM, 2s SIGKILL) instead of blocking forever on `Process#wait`. Fixes the "hang when the CLI is alive but unresponsive" class of bugs.
+- **Fix**: Unknown `control_request` subtypes now parse to a typed `ControlUnknownRequest` fallback and reply with a `control_response` error, instead of silently raising and leaving the CLI waiting forever. New `ControlUnknownRequest` struct added to the `ControlRequestInner` union.
+- **Fix**: `claude --help` probe now has a 5-second timeout and is killed if it hangs (e.g., CLI stuck on an auth prompt).
+- **Fix**: User-supplied hook callbacks (for `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`) are now wrapped in a rescue and log to the `stderr` callback. Previously, a callback that raised crashed the response reader fiber, skipping cleanup of pending control requests and leaking the subprocess.
+- **Fix**: `AgentClient#stop` now closes the message channel **before** stopping the CLI subprocess, so fibers blocked inside `each_response` wake immediately on shutdown.
+- **Fix**: The rolling `stderr_tail` buffer is now cleared on each `start`, so `detect_unknown_option_error` never surfaces a false positive from a previous session.
+- **Fix**: Malformed stream-json lines now route through the configured `stderr` callback (with the offending line included, truncated) instead of raw `STDERR.puts`. The SDK's `JSONDecodeError` class is now actually used to carry the payload.
+
+Wire protocol (non-breaking fixes):
+
+- **Fix**: The capability probe no longer pre-emptively strips flags. The `--help` regex produced false negatives on current CLI versions (`--task-budget`, `--thinking`, `--system-prompt-file` are hidden from help but still accepted). Silently dropping a safety cap like `task_budget` was worse than letting the CLI fail with an actionable `UnsupportedOptionError`. The probe remains for diagnostics and error translation.
+- **Fix**: `ControlResponse.mcp_response` now serializes the optional JSON-RPC `data` field on error responses.
+
+Typed messages / new fields (additive):
+
+- **New**: `AssistantMessageBody` exposes `id`, `usage`, `stop_reason`, `stop_sequence`, `container`, and `context_management`. `AssistantMessage` gains forwarders: `#message_id`, `#usage`, `#stop_reason`, `#stop_sequence`. Previously these fields were silently dropped — breaking token accounting for any SDK user.
+- **New**: `InitMessage` / `ServerInfo` type `tools`, `skills`, `mcp_servers`, `plugins`, `cwd`, `model`, `permission_mode`, `fast_mode_state`, and `claude_code_version`. Raw data remains available via `server_info.raw_data`.
+- **New**: `ControlUnknownRequest` fallback struct in the `ControlRequestInner` union.
+
+Test suite:
+
+- 52 new specs across `spec/stream_parsing_spec.cr` (subprocess buffering edges), `spec/integration_spec.cr` (mocked pipeline, always run in CI), `spec/errors_spec.cr` (error class construction), `spec/meta_spec.cr` (version + CHANGELOG sync health). Total test count: 391.
+
+Documentation:
+
+- Hook-events table in README extended with `TeammateIdle`, `TaskCompleted`, and `ConfigChange`.
+- Permission-mode enumeration in docs now includes `auto` and `dontAsk`.
+
+### 0.5.1
+
+Audit release: validated every SDK option, message field, and control-request
+shape against a live Claude Code CLI (v2.1.114) and the official Python SDK.
+Fixed the wire-format mismatches that were causing subprocess crashes or
+silent data loss.
+
+Argv / CLI flag fixes:
+
+- **Fix**: `options.title` is no longer forwarded as `--title` (that flag has never existed). Titles now flow through the `initialize` control request as the `title` field and are applied via `ClaudeAgent.rename_session` / `generate_session_title` where needed.
+- **Fix**: `SystemPromptPreset#exclude_dynamic_sections` now flows through the `initialize` control request as `excludeDynamicSections` instead of a non-existent `--exclude-dynamic-sections` CLI flag.
+- **Fix**: `permission_prompt_tool_name` now emits `--permission-prompt-tool` (the real CLI flag) instead of the non-existent `--permission-prompt-tool-name`.
+- **Fix**: `enable_file_checkpointing` sets the `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true` environment variable instead of emitting a non-existent `--enable-file-checkpointing` flag.
+- **Fix**: `--betas` is now emitted as separate variadic tokens (e.g., `--betas beta1 beta2`) instead of a joined string, matching the CLI's variadic `<betas...>` parser.
+- **Fix**: `--allowedTools` and `--disallowedTools` now use comma separators (matching the canonical form used by the Python SDK).
+- **Fix**: `ToolsPreset.claude_code` now maps to `--tools default` (the canonical CLI value) instead of the SDK-internal preset name `claude_code`.
+- **Fix**: When `system_prompt` is nil, the SDK emits `--system-prompt ""` so the subprocess runs in vanilla mode (matching Python/TS) rather than falling back to the interactive Claude Code default prompt.
+- **Fix**: SDK MCP servers are now declared in `--mcp-config` with `type: "sdk"` so the CLI knows to route tool calls back as `mcp_message` control requests. Previously, SDK servers were silently dropped from the argv.
+
+Wire-format fixes:
+
+- **Fix**: The `shouldQuery` field on outgoing user messages is emitted in camelCase (matching the TS SDK's `SDKUserMessage.shouldQuery`) instead of snake_case `should_query`.
+- **Fix**: `ControlResponse.mcp_response` now nests the JSON-RPC payload under the standard `response` wrapper (`{subtype, request_id, response: {mcp_response: ...}}`) instead of placing `mcp_response` at the top level.
+- **Fix**: `InitMessage#memory_paths` and `MemoryRecallMessage#memory_paths` now return the correct shape from the CLI (see 0.6.0 for the breaking type change).
+
+New capabilities / fields:
+
+- **New**: `ResultMessage` exposes `api_error_status`, `model_usage`, `permission_denials`, and `fast_mode_state`, matching the fields the CLI actually emits.
+- **New**: `AgentOptions#include_hook_events` maps to `--include-hook-events` and emits hook lifecycle events (`hook_started`, `hook_progress`, `hook_response`) into the output stream.
+- **New**: `AgentOptions#extra_args` accepts a `Hash(String, String?)` of arbitrary CLI flags for forward compatibility with newly-added Claude Code flags the SDK has not yet modeled.
+- **New**: `SandboxSettings#fail_if_unavailable` (default `true`, matching TS v0.2.91+): when sandboxing is enabled but dependencies are missing, the CLI fails fast by default instead of silently running unsandboxed.
+- **New**: `CLIClient` probes the installed CLI with `claude --help` once per `cli_path` and silently drops any forward-compatible SDK-only flag (`--task-budget`, `--thinking`, `--system-prompt-file`) the CLI does not advertise. Core flags are never filtered.
+- **New**: `ClaudeAgent::UnsupportedOptionError` is raised when an "unknown option" stderr message is detected during a connection failure, carrying the offending flag name and the CLI path.
+- **New**: `AgentOptions#probe_cli_capabilities` (default `true`) toggles the capability probe.
 
 ### 0.5.0
 

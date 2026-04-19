@@ -170,6 +170,11 @@ module ClaudeAgent
     property network : SandboxNetworkSettings?
     property ignore_violations : SandboxIgnoreViolations?
     property? enable_weaker_nested_sandbox : Bool = false
+    # Matches TS SDK v0.2.91+: when sandboxing is enabled but dependencies
+    # are missing, should `query()` abort with an error result (true, the
+    # safer default) or silently fall back to running unsandboxed (false).
+    @[JSON::Field(key: "failIfUnavailable")]
+    property? fail_if_unavailable : Bool = true
 
     def initialize(
       @enabled : Bool = false,
@@ -179,6 +184,7 @@ module ClaudeAgent
       @network : SandboxNetworkSettings? = nil,
       @ignore_violations : SandboxIgnoreViolations? = nil,
       @enable_weaker_nested_sandbox : Bool = false,
+      @fail_if_unavailable : Bool = true,
     )
     end
   end
@@ -471,6 +477,9 @@ module ClaudeAgent
 
     # Streaming options
     property? include_partial_messages : Bool = false
+    # Emit all hook lifecycle events (`hook_started`, `hook_progress`,
+    # `hook_response`) into the output stream. Maps to `--include-hook-events`.
+    property? include_hook_events : Bool = false
     property? replay_user_messages : Bool = false # Re-emit user messages for acknowledgment
 
     # Output format (structured outputs)
@@ -492,6 +501,22 @@ module ClaudeAgent
     property? fork_session : Bool = false
     property? no_session_persistence : Bool = false
     property title : String? # Optional session title; skips auto-generation
+
+    # When true (the default), the SDK probes the Claude Code CLI once on
+    # first start (`claude --help`) to learn which option flags it supports,
+    # and silently drops forward-compatible SDK-only options that the CLI
+    # would otherwise reject at argv-parse time (`--title`, `--task-budget`,
+    # `--thinking`, `--system-prompt-file`, `--exclude-dynamic-sections`).
+    # Set to false to force every option through unmodified.
+    property? probe_cli_capabilities : Bool = true
+
+    # Forward arbitrary CLI flags that aren't modeled as typed options.
+    # Use this as an escape hatch for newly-added CLI flags the SDK has
+    # not caught up to yet. Nil values emit the flag without an argument
+    # (boolean switches); string values emit `--flag value` pairs.
+    # Keys must be the flag name *without* the leading `--`.
+    # Example: `{"ide" => nil, "debug-file" => "/tmp/claude.log"}`.
+    property extra_args : Hash(String, String?)?
 
     # File checkpointing
     property? enable_file_checkpointing : Bool = false
@@ -541,6 +566,7 @@ module ClaudeAgent
       @can_use_tool : PermissionCallback? = nil,
       @permission_prompt_tool_name : String? = nil,
       @include_partial_messages : Bool = false,
+      @include_hook_events : Bool = false,
       @replay_user_messages : Bool = false,
       @output_format : OutputFormat? = nil,
       @cli_path : String? = nil,
@@ -554,6 +580,8 @@ module ClaudeAgent
       @fork_session : Bool = false,
       @no_session_persistence : Bool = false,
       @title : String? = nil,
+      @probe_cli_capabilities : Bool = true,
+      @extra_args : Hash(String, String?)? = nil,
       @enable_file_checkpointing : Bool = false,
       @sandbox : SandboxSettings? = nil,
       @user : String? = nil,

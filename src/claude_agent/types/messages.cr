@@ -116,7 +116,14 @@ module ClaudeAgent
     end
 
     private def self.parse_memory_recall(data : MessageData, session_id : String) : Message
-      paths = data["memory_paths"]?.try(&.as_a?).try(&.compact_map(&.as_s?)) || [] of String
+      paths = {} of String => String
+      data["memory_paths"]?.try(&.as_h?).try do |hash|
+        hash.each do |key, value|
+          if path = value.as_s?
+            paths[key] = path
+          end
+        end
+      end
       MemoryRecallMessage.new(session_id, data, paths)
     end
 
@@ -222,6 +229,22 @@ module ClaudeAgent
     getter content : Array(ContentBlock)
 
     getter model : String?
+    # Stable message identifier assigned by the API (not the SDK envelope UUID).
+    getter id : String?
+    # Per-turn usage payload from the Messages API (input_tokens,
+    # output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    # server_tool_use, service_tier, ...). Kept as a raw hash because the
+    # Anthropic API adds fields over time.
+    getter usage : Hash(String, JSON::Any)?
+    # "stop_reason" set by the API on completion (e.g. "end_turn",
+    # "tool_use", "stop_sequence", "max_tokens").
+    getter stop_reason : String?
+    # When `stop_reason == "stop_sequence"`, the exact sequence matched.
+    getter stop_sequence : String?
+    # Container identifier for code-execution tool runs, if any.
+    getter container : JSON::Any?
+    # Context management directives emitted alongside the assistant turn.
+    getter context_management : JSON::Any?
   end
 
   struct AssistantMessageError
@@ -281,6 +304,24 @@ module ClaudeAgent
 
     def model
       message.model
+    end
+
+    # API-assigned id on the inner message (distinct from `uuid` which
+    # is the SDK envelope id).
+    def message_id : String?
+      message.id
+    end
+
+    def usage : Hash(String, JSON::Any)?
+      message.usage
+    end
+
+    def stop_reason : String?
+      message.stop_reason
+    end
+
+    def stop_sequence : String?
+      message.stop_sequence
     end
 
     def text : String
@@ -402,10 +443,60 @@ module ClaudeAgent
       server_info.account
     end
 
-    # List of memory file paths currently loaded in the session.
-    def memory_paths : Array(String)
-      values = data["memory_paths"]?.try(&.as_a?)
-      values ? values.compact_map(&.as_s?) : [] of String
+    # Map of memory namespace (e.g., "auto", "project", "user") to the
+    # on-disk path for memory files loaded in the session. The Claude Code
+    # CLI emits this as an object keyed by namespace, for example
+    # `{"auto":"/Users/alice/.claude/projects/<project>/memory/"}`.
+    def memory_paths : Hash(String, String)
+      data["memory_paths"]?.try(&.as_h?).try do |hash|
+        result = {} of String => String
+        hash.each do |key, value|
+          if path = value.as_s?
+            result[key] = path
+          end
+        end
+        return result
+      end
+
+      {} of String => String
+    end
+
+    # Convenience forwarders so callers never have to reach into
+    # `server_info.raw_data` for fields the CLI emits on init.
+    def tools : Array(String)
+      server_info.tools
+    end
+
+    def skills : Array(String)
+      server_info.skills
+    end
+
+    def mcp_servers : Array(JSON::Any)
+      server_info.mcp_servers
+    end
+
+    def plugins : Array(JSON::Any)
+      server_info.plugins
+    end
+
+    def cwd : String?
+      server_info.cwd
+    end
+
+    def model : String?
+      server_info.model
+    end
+
+    def permission_mode : String?
+      server_info.permission_mode
+    end
+
+    def fast_mode_state : String?
+      server_info.fast_mode_state
+    end
+
+    def claude_code_version : String?
+      server_info.claude_code_version
     end
   end
 
@@ -578,13 +669,15 @@ module ClaudeAgent
   end
 
   # Emitted when the CLI loads additional memory entries into the session.
+  # `memory_paths` maps namespace (e.g. "auto", "project", "user") to the
+  # on-disk directory holding that namespace's memory files.
   struct MemoryRecallMessage < SystemMessage
-    getter memory_paths : Array(String)
+    getter memory_paths : Hash(String, String)
 
     def initialize(
       session_id : String,
       data : MessageData,
-      @memory_paths : Array(String),
+      @memory_paths : Hash(String, String),
     )
       super("memory_recall", session_id, data)
     end
@@ -685,6 +778,17 @@ module ClaudeAgent
     getter total_cost_usd : Float64?
     getter structured_output : JSON::Any?
     getter usage : Hash(String, JSON::Any)?
+    # HTTP status of the final API error, if the run ended with a network
+    # failure. Nil for successful runs.
+    getter api_error_status : Int64?
+    # Per-model usage breakdown keyed by model ID
+    # (e.g., `{"claude-sonnet-4-6": {"input_tokens": ..., ...}}`).
+    @[JSON::Field(key: "modelUsage")]
+    getter model_usage : Hash(String, JSON::Any)?
+    # List of permission denials that occurred during the run.
+    getter permission_denials : Array(JSON::Any)?
+    # Fast-mode state at the time the run completed ("on", "off", ...).
+    getter fast_mode_state : String?
 
     # --- Structured Output Helpers ---
 

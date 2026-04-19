@@ -28,6 +28,45 @@ describe ClaudeAgent::Message do
       end
     end
 
+    it "exposes id, usage, stop_reason, stop_sequence from the inner message" do
+      json = <<-JSON
+      {
+        "type": "assistant",
+        "uuid": "env-uuid",
+        "session_id": "sess-1",
+        "message": {
+          "id": "msg-001",
+          "model": "claude-sonnet-4-6",
+          "role": "assistant",
+          "stop_reason": "end_turn",
+          "stop_sequence": "</finish>",
+          "container": null,
+          "context_management": null,
+          "usage": {
+            "input_tokens": 42,
+            "output_tokens": 7,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+          },
+          "content": [{"type": "text", "text": "ok"}]
+        }
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::AssistantMessage)
+
+      if message.is_a?(ClaudeAgent::AssistantMessage)
+        message.message_id.should eq("msg-001")
+        message.stop_reason.should eq("end_turn")
+        message.stop_sequence.should eq("</finish>")
+        usage = message.usage
+        usage.should_not be_nil
+        usage.try(&.["input_tokens"].as_i).should eq(42)
+        usage.try(&.["output_tokens"].as_i).should eq(7)
+      end
+    end
+
     it "parses AssistantMessage with string error field" do
       json = <<-JSON
       {
@@ -163,6 +202,46 @@ describe ClaudeAgent::Message do
         message.models.first.value.should eq("default")
         message.account.try(&.email).should eq("user@example.com")
         message.server_info.pid.should eq(123)
+      end
+    end
+
+    it "exposes init fields the CLI emits (tools, plugins, cwd, version, etc.)" do
+      json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "sess-1",
+        "cwd": "/tmp/project",
+        "tools": ["Bash", "Read", "Edit"],
+        "mcp_servers": [{"name": "ctx7", "status": "connected"}],
+        "model": "claude-opus-4-7",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.114",
+        "skills": ["git", "playwright"],
+        "plugins": [{"name": "p1", "path": "/x", "source": "remote"}],
+        "memory_paths": {"auto": "/Users/a/.claude/memory/"},
+        "fast_mode_state": "off",
+        "slash_commands": ["init", "review"]
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::InitMessage)
+
+      if message.is_a?(ClaudeAgent::InitMessage)
+        message.cwd.should eq("/tmp/project")
+        message.tools.should eq(["Bash", "Read", "Edit"])
+        message.model.should eq("claude-opus-4-7")
+        message.permission_mode.should eq("default")
+        message.claude_code_version.should eq("2.1.114")
+        message.skills.should eq(["git", "playwright"])
+        message.fast_mode_state.should eq("off")
+        message.memory_paths["auto"].should eq("/Users/a/.claude/memory/")
+        message.plugins.size.should eq(1)
+        message.plugins.first.as_h["name"].as_s.should eq("p1")
+        message.mcp_servers.size.should eq(1)
+        message.mcp_servers.first.as_h["status"].as_s.should eq("connected")
       end
     end
 

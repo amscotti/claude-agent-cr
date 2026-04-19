@@ -33,18 +33,28 @@ module ClaudeAgent
     end
   end
 
-  # Permission denied
-  class PermissionDeniedError < Error
-    getter tool_name : String
-
-    def initialize(@tool_name : String, message : String? = nil)
-      super(message || "Permission denied for tool: #{tool_name}")
-    end
-  end
-
   # Timeout error
   class TimeoutError < Error; end
 
   # Configuration error
   class ConfigurationError < Error; end
+
+  # Raised when the Claude Code CLI rejects an option flag that the SDK
+  # forwarded because the installed CLI version predates that flag.
+  # Typically surfaced during `start` after `claude` exits with stderr like
+  # `error: unknown option '--title'`. Upgrade the CLI or avoid setting the
+  # corresponding `AgentOptions` field.
+  class UnsupportedOptionError < Error
+    getter option : String
+    getter cli_path : String?
+
+    def initialize(
+      @option : String,
+      message : String? = nil,
+      @cli_path : String? = nil,
+    )
+      super(message || "Claude Code CLI does not recognize option '#{option}'. " \
+                       "Upgrade the CLI or avoid setting this option in AgentOptions.")
+    end
+  end
 end
