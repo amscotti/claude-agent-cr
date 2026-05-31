@@ -31,7 +31,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **Transcript Controls**: `should_query: false` to append user messages without triggering a turn; `include_system_messages` on `get_session_messages`.
 *   **File Checkpointing**: Track and rewind file changes.
 *   **Sandbox Support**: Configure sandboxed execution environments.
-*   **Extended Thinking**: `ThinkingConfig.adaptive` / `enabled` / `disabled`, plus fine-grained `effort` tiers (`Low`, `Medium`, `High`, `Xhigh`, `Max`) — `xhigh` is the default Claude Code tier for Opus 4.7.
+*   **Extended Thinking**: `ThinkingConfig.adaptive` / `enabled` / `disabled` (with `display` support for `"summarized"` / `"omitted"` thinking blocks), plus fine-grained `effort` tiers (`Low`, `Medium`, `High`, `Xhigh`, `Max`) — `xhigh` is the default Claude Code tier for Opus 4.7.
 *   **Pre-warming**: `ClaudeAgent.startup` spins up the CLI subprocess ahead of the first query.
 *   **Tracing**: Automatic W3C trace context propagation (`TRACEPARENT` / `TRACESTATE`) when present in the caller's environment.
 *   **Streaming**: Real-time message streaming using Crystal's native fibers.
@@ -52,7 +52,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.6.0
+        version: ~> 0.7.0
     ```
 
 2.  Run `shards install`
@@ -293,10 +293,15 @@ options = ClaudeAgent::AgentOptions.new(
 
 ### Custom Tools (SDK MCP Servers)
 
-Define custom tools that run in-process using the SDK MCP server architecture.
+Define custom tools that run in-process using the SDK MCP server architecture. This allows you to expose Crystal-native methods directly to the Claude agent, running in the same process without external network calls or separate tool processes.
+
+#### 1. Designing and Defining Tools
+
+Tools are defined using `ClaudeAgent.tool`, which takes a name, description, and an input validation schema constructed via the type-safe `Schema` builder. 
 
 ```crystal
-# 1. Define tools using Schema builder
+require "claude-agent-cr"
+
 greet_tool = ClaudeAgent.tool(
   name: "greet",
   description: "Greet a user by name",
@@ -304,42 +309,125 @@ greet_tool = ClaudeAgent.tool(
     "name" => ClaudeAgent::Schema.string("The name to greet"),
   }, required: ["name"])
 ) do |args|
+  # Access typed arguments from the parsed input hash
   name = args["name"].as_s
   ClaudeAgent::ToolResult.text("Hello, #{name}!")
 end
+```
 
-calculator_tool = ClaudeAgent.tool(
-  name: "add",
-  description: "Add two numbers",
+#### 2. Robust In-Tool Error Handling
+
+When writing custom tools, **never let unhandled exceptions escape the tool block**. An unhandled exception inside a tool handler will crash the background reader fiber, causing the control-protocol connection to sever and aborting the session. 
+
+Instead, always capture internal exceptions and return a structured tool error response using `is_error: true`. This notifies the Claude model of the failure, allowing it to correct the arguments or report the issue back to the user cleanly.
+
+```crystal
+require "json"
+require "claude-agent-cr"
+
+fetch_data_tool = ClaudeAgent.tool(
+  name: "fetch_data",
+  description: "Fetch JSON data from a mock service",
   schema: ClaudeAgent::Schema.object({
-    "a" => ClaudeAgent::Schema.number("First number"),
-    "b" => ClaudeAgent::Schema.number("Second number"),
-  }, required: ["a", "b"])
+    "id" => ClaudeAgent::Schema.string("The record identifier to retrieve"),
+  }, required: ["id"])
 ) do |args|
-  a = args["a"].as_f
-  b = args["b"].as_f
-  ClaudeAgent::ToolResult.text("#{a} + #{b} = #{a + b}")
+  record_id = args["id"].as_s
+  
+  begin
+    # Simulate an operation that could fail (e.g. database lookup or network call)
+    if record_id == "404"
+      raise "Record #{record_id} not found in database"
+    end
+    
+    data = {"id" => record_id, "status" => "active", "timestamp" => Time.local.to_s}
+    ClaudeAgent::ToolResult.text(data.to_json)
+  rescue ex
+    # Capture any error and safely return it as a tool error
+    ClaudeAgent::ToolResult.text(
+      content: "Failed to fetch data: #{ex.message}",
+      is_error: true
+    )
+  end
+end
+```
+
+#### 3. Complete End-to-End Working Example
+
+Below is a complete, copy-pasteable script demonstrating how to import the SDK, define a custom calculator tool, handle tool failures safely, bundle them into an SDK MCP server, and execute an agent turn with comprehensive parent-level error handling.
+
+```crystal
+require "json"
+require "claude-agent-cr"
+
+# 1. Define a tool with strict schema and internal error handling
+divide_tool = ClaudeAgent.tool(
+  name: "divide",
+  description: "Divide two numbers",
+  schema: ClaudeAgent::Schema.object({
+    "numerator"   => ClaudeAgent::Schema.number("The top number"),
+    "denominator" => ClaudeAgent::Schema.number("The bottom number"),
+  }, required: ["numerator", "denominator"])
+) do |args|
+  begin
+    num = args["numerator"].as_f
+    den = args["denominator"].as_f
+    
+    if den == 0.0
+      raise "Cannot divide by zero"
+    end
+    
+    result = num / den
+    ClaudeAgent::ToolResult.text("#{num} / #{den} = #{result}")
+  rescue ex
+    # Return error back to Claude so it knows not to divide by zero next time
+    ClaudeAgent::ToolResult.text("Error: #{ex.message}", is_error: true)
+  end
 end
 
-# 2. Bundle tools into an SDK MCP server
-server = ClaudeAgent.create_sdk_mcp_server(
-  name: "my-tools",
-  tools: [greet_tool, calculator_tool]
+# 2. Bundle the tool into an SDK MCP server config
+sdk_server = ClaudeAgent.create_sdk_mcp_server(
+  name: "math-engine",
+  tools: [divide_tool]
 )
 
-# 3. Configure the agent with the server
 mcp_servers = {} of String => ClaudeAgent::MCPServerConfig
-mcp_servers["my-tools"] = server
+mcp_servers["math-engine"] = sdk_server
 
+# 3. Configure the Agent options
 options = ClaudeAgent::AgentOptions.new(
+  model: "claude-sonnet-4-5",
   mcp_servers: mcp_servers,
-  # Tool names follow pattern: mcp__<server>__<tool>
-  allowed_tools: ["mcp__my-tools__greet", "mcp__my-tools__add"]
+  # Tool names follow the namespacing rule: mcp__<server_name>__<tool_name>
+  allowed_tools: ["mcp__math-engine__divide"],
+  permission_mode: ClaudeAgent::PermissionMode::AcceptEdits
 )
 
-# 4. Use the agent - tools run in your Crystal process
-ClaudeAgent.query("Greet Alice and calculate 2 + 3", options) do |msg|
-  puts msg if msg.is_a?(ClaudeAgent::AssistantMessage)
+# 4. Start the agent client and execute with robust connection/CLI error handling
+begin
+  puts "Booting Claude Agent with custom tools..."
+  
+  ClaudeAgent::AgentClient.open(options) do |client|
+    client.query("Divide 10 by 2, and then divide 5 by 0.")
+    
+    client.each_response do |message|
+      case message
+      when ClaudeAgent::AssistantMessage
+        # Print Claude's reasoning and responses
+        print message.text if message.has_text?
+      when ClaudeAgent::ResultMessage
+        puts "\n[Result] Turn finished with status: #{message.subtype}"
+      end
+    end
+  end
+rescue ex : ClaudeAgent::CLINotFoundError
+  STDERR.puts "Fatal: Claude Code CLI is not installed or not in PATH."
+rescue ex : ClaudeAgent::UnsupportedOptionError
+  STDERR.puts "Fatal: CLI rejected options: #{ex.option}. Try running `claude upgrade`."
+rescue ex : ClaudeAgent::ProcessError
+  STDERR.puts "Fatal: Claude process exited unexpectedly: #{ex.stderr}"
+rescue ex : ClaudeAgent::Error
+  STDERR.puts "Fatal: SDK error occurred: #{ex.message}"
 end
 ```
 
@@ -1100,6 +1188,16 @@ end
 > features that require newer CLI versions are gracefully no-op or surface a
 > clear error on older CLIs.
 
+## Deployment
+
+For production deployments, the SDK supports executing agents and in-process tools across multiple transport models: **Stdio**, **HTTP (webhooks)**, and **SSE (Server-Sent Events)**.
+
+Refer to the dedicated [Deployment Guide](DEPLOYMENT.md) for:
+- Environment configuration and path isolation (`CLAUDE_CONFIG_DIR`).
+- Non-interactive shell and authentication setups (`ANTHROPIC_API_KEY`).
+- Complete production-ready code examples using Kemal (HTTP) and standard HTTP servers (SSE/Stdio).
+- Production deployment security checklists.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | One-shot queries | ✅ Working | Single-turn queries work reliably |
@@ -1186,6 +1284,19 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.7.0
+
+Feature release aligned with Claude Code CLI **v2.1.158** and official Python/TypeScript SDKs.
+
+**New features**:
+- **Adaptive Thinking Display**: Added `display` option to `ThinkingConfig.adaptive` and `ThinkingConfig.enabled` (supporting `"summarized"` and `"omitted"`). Forwarded via `--thinking-display` CLI flag.
+- **Hook Lifecycle Event Streaming**: Implemented `HookEventMessage` which parses `system` messages with subtypes `hook_started` and `hook_response`, yielding streamed CLI hook events when `include_hook_events` is enabled.
+- **Post-Tool Output Overriding**: Added `updated_tool_output` to `HookSpecificOutput` mapped as `"updatedToolOutput"` inside the control protocol, enabling `PostToolUse` hooks to replace tool outputs before reaching the model.
+- **Richer Permission Context**: Added `decision_reason`, `title`, `display_name`, and `description` to `PermissionContext` and `ControlPermissionRequest` to support highly detailed permission prompt callbacks.
+- **Deferred Tool Execution**: Added `DeferredToolUse` struct and mapped it to the `deferred_tool_use` field on `ResultMessage` to support `"defer"` hook decisions and deferred tool execution.
+- **Server Tool Blocks**: Added `ServerToolUseBlock` and `ServerToolResultBlock` to parse and expose server-side tool calls and advisor results without dropping them.
+- **Sandbox Network Properties**: Added `allowedDomains`, `deniedDomains`, `allowManagedDomainsOnly`, and `allowMachLookup` properties to `SandboxNetworkSettings` to reflect sandbox networking constraints.
 
 ### 0.6.0
 

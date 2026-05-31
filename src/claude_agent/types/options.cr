@@ -136,6 +136,14 @@ module ClaudeAgent
     property? allow_all_unix_sockets : Bool = false
     property http_proxy_port : Int32?
     property socks_proxy_port : Int32?
+    @[JSON::Field(key: "allowedDomains")]
+    property allowed_domains : Array(String)?
+    @[JSON::Field(key: "deniedDomains")]
+    property denied_domains : Array(String)?
+    @[JSON::Field(key: "allowManagedDomainsOnly")]
+    property? allow_managed_domains_only : Bool?
+    @[JSON::Field(key: "allowMachLookup")]
+    property allow_mach_lookup : Array(String)?
 
     def initialize(
       @allow_local_binding : Bool = false,
@@ -143,6 +151,10 @@ module ClaudeAgent
       @allow_all_unix_sockets : Bool = false,
       @http_proxy_port : Int32? = nil,
       @socks_proxy_port : Int32? = nil,
+      @allowed_domains : Array(String)? = nil,
+      @denied_domains : Array(String)? = nil,
+      @allow_managed_domains_only : Bool? = nil,
+      @allow_mach_lookup : Array(String)? = nil,
     )
     end
   end
@@ -362,12 +374,16 @@ module ClaudeAgent
       nil
     end
 
-    def self.adaptive : ThinkingConfigAdaptive
-      ThinkingConfigAdaptive.new
+    def display : String?
+      nil
     end
 
-    def self.enabled(budget_tokens : Int32) : ThinkingConfigEnabled
-      ThinkingConfigEnabled.new(budget_tokens)
+    def self.adaptive(display : String? = nil) : ThinkingConfigAdaptive
+      ThinkingConfigAdaptive.new(display)
+    end
+
+    def self.enabled(budget_tokens : Int32, display : String? = nil) : ThinkingConfigEnabled
+      ThinkingConfigEnabled.new(budget_tokens, display)
     end
 
     def self.disabled : ThinkingConfigDisabled
@@ -376,15 +392,18 @@ module ClaudeAgent
   end
 
   struct ThinkingConfigAdaptive < ThinkingConfig
-    def initialize
+    getter display : String?
+
+    def initialize(@display : String? = nil)
       super("adaptive")
     end
   end
 
   struct ThinkingConfigEnabled < ThinkingConfig
     getter budget_tokens : Int32
+    getter display : String?
 
-    def initialize(@budget_tokens : Int32)
+    def initialize(@budget_tokens : Int32, @display : String? = nil)
       super("enabled")
     end
   end

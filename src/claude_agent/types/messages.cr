@@ -79,6 +79,12 @@ module ClaudeAgent
       raise Error.new("System message missing 'subtype' field") unless subtype
       raise Error.new("System message missing 'session_id' field") unless session_id
 
+      parsed = parse_known_system_message?(subtype, message, session_id)
+      parsed || GenericSystemMessage.new(subtype, session_id, message)
+    end
+
+    # ameba:disable Metrics/CyclomaticComplexity
+    private def self.parse_known_system_message?(subtype : String, message : MessageData, session_id : String) : Message?
       case subtype
       when "init"
         InitMessage.new(session_id, message, ServerInfo.from_data(message))
@@ -98,8 +104,10 @@ module ClaudeAgent
         parse_memory_recall(message, session_id)
       when "status"
         parse_status_message(message, session_id)
+      when "hook_started", "hook_response"
+        parse_hook_event(message, session_id)
       else
-        GenericSystemMessage.new(subtype, session_id, message)
+        nil
       end
     end
 
@@ -220,6 +228,18 @@ module ClaudeAgent
       return GenericSystemMessage.new("elicitation_complete", session_id, data) unless uuid && server_name && elicitation_id
 
       ElicitationCompleteMessage.new(session_id, data, uuid, server_name, elicitation_id)
+    end
+
+    private def self.parse_hook_event(data : MessageData, session_id : String) : Message
+      uuid = data["uuid"]?.try(&.as_s?)
+      subtype = data["subtype"]?.try(&.as_s) || "unknown"
+      hook_event_name = (
+        data["hook_event"]?.try(&.as_s?) ||
+        data["hook_name"]?.try(&.as_s?) ||
+        data["hook_event_name"]?.try(&.as_s?) ||
+        ""
+      )
+      HookEventMessage.new(session_id, data, uuid, subtype, hook_event_name)
     end
   end
 
@@ -753,6 +773,29 @@ module ClaudeAgent
     end
   end
 
+  # Hook event message - emitted when CLI hooks trigger (if include_hook_events is true)
+  struct HookEventMessage < SystemMessage
+    getter uuid : String?
+    getter hook_event_name : String
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @uuid : String?,
+      subtype : String,
+      @hook_event_name : String,
+    )
+      super(subtype, session_id, data)
+    end
+  end
+
+  struct DeferredToolUse
+    include JSON::Serializable
+    getter id : String
+    getter name : String
+    getter input : Hash(String, JSON::Any)
+  end
+
   # Final result message
   struct ResultMessage < Message
     include JSON::Serializable
@@ -789,6 +832,8 @@ module ClaudeAgent
     getter permission_denials : Array(JSON::Any)?
     # Fast-mode state at the time the run completed ("on", "off", ...).
     getter fast_mode_state : String?
+    @[JSON::Field(key: "deferred_tool_use")]
+    getter deferred_tool_use : DeferredToolUse?
 
     # --- Structured Output Helpers ---
 

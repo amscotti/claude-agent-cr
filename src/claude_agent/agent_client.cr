@@ -1116,6 +1116,10 @@ module ClaudeAgent
                           tool_use_id: req.tool_use_id,
                           agent_id: req.agent_id,
                           blocked_path: req.blocked_path,
+                          decision_reason: req.decision_reason,
+                          title: req.title,
+                          display_name: req.display_name,
+                          description: req.description,
                         )
                         permission_result_to_response(callback.call(context), req.input)
                       else
@@ -1557,6 +1561,9 @@ module ClaudeAgent
       output.updated_input.try { |value| response["updatedInput"] = JSON::Any.new(value) }
       output.additional_context.try do |value|
         response["additionalContext"] = JSON::Any.new(value)
+      end
+      output.updated_tool_output.try do |value|
+        response["updatedToolOutput"] = value
       end
       output.updated_mcp_tool_output.try do |value|
         response["updatedMCPToolOutput"] = value

@@ -691,6 +691,55 @@ describe ClaudeAgent::Message do
         message.tool_use_result.try(&.as_s).should eq("ok")
       end
     end
+
+    it "parses ResultMessage with deferred_tool_use" do
+      json = <<-JSON
+      {
+        "type": "result",
+        "uuid": "res-123",
+        "session_id": "sess-456",
+        "subtype": "success",
+        "deferred_tool_use": {
+          "id": "tool-def",
+          "name": "Bash",
+          "input": {"command": "ls"}
+        }
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::ResultMessage)
+
+      if message.is_a?(ClaudeAgent::ResultMessage)
+        message.deferred_tool_use.should_not be_nil
+        if deferred = message.deferred_tool_use
+          deferred.id.should eq("tool-def")
+          deferred.name.should eq("Bash")
+          deferred.input["command"].as_s.should eq("ls")
+        end
+      end
+    end
+
+    it "parses HookEventMessage system message" do
+      json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "hook_started",
+        "session_id": "sess-456",
+        "hook_event": "PreToolUse",
+        "uuid": "hook-123"
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::HookEventMessage)
+
+      if message.is_a?(ClaudeAgent::HookEventMessage)
+        message.subtype.should eq("hook_started")
+        message.hook_event_name.should eq("PreToolUse")
+        message.uuid.should eq("hook-123")
+      end
+    end
   end
 end
 
@@ -750,5 +799,26 @@ describe ClaudeAgent::ContentBlock do
     unknown.type.should eq("future_block")
     unknown.raw_json.should contain("future_block")
     unknown.raw_json.should contain("some_value")
+  end
+
+  it "parses ServerToolUseBlock" do
+    json = %({"type": "server_tool_use", "id": "st1", "name": "web_search", "input": {"query": "anthropic"}})
+    block = ClaudeAgent::ContentBlockConverter.from_json(JSON::PullParser.new(json))
+    block.should be_a(ClaudeAgent::ServerToolUseBlock)
+
+    tool = block.as(ClaudeAgent::ServerToolUseBlock)
+    tool.id.should eq("st1")
+    tool.name.should eq("web_search")
+    tool.input["query"].as_s.should eq("anthropic")
+  end
+
+  it "parses ServerToolResultBlock" do
+    json = %({"type": "advisor_tool_result", "tool_use_id": "st1", "content": {"results": []}})
+    block = ClaudeAgent::ContentBlockConverter.from_json(JSON::PullParser.new(json))
+    block.should be_a(ClaudeAgent::ServerToolResultBlock)
+
+    result = block.as(ClaudeAgent::ServerToolResultBlock)
+    result.tool_use_id.should eq("st1")
+    result.content["results"].as_a.should eq([] of JSON::Any)
   end
 end
