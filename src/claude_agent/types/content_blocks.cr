@@ -1,7 +1,7 @@
 require "json"
 
 module ClaudeAgent
-  alias ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock | UnknownBlock
+  alias ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | ThinkingBlock | RedactedThinkingBlock | ServerToolUseBlock | ServerToolResultBlock | UnknownBlock
 
   struct TextBlock
     include JSON::Serializable
@@ -43,6 +43,23 @@ module ClaudeAgent
     getter data : String
   end
 
+  struct ServerToolUseBlock
+    include JSON::Serializable
+
+    getter type : String = "server_tool_use"
+    getter id : String
+    getter name : String
+    getter input : Hash(String, JSON::Any)
+  end
+
+  struct ServerToolResultBlock
+    include JSON::Serializable
+
+    getter type : String = "advisor_tool_result"
+    getter tool_use_id : String
+    getter content : Hash(String, JSON::Any)
+  end
+
   struct UnknownBlock
     include JSON::Serializable
 
@@ -71,6 +88,10 @@ module ClaudeAgent
         ThinkingBlock.from_json(json)
       when "redacted_thinking"
         RedactedThinkingBlock.from_json(json)
+      when "server_tool_use"
+        ServerToolUseBlock.from_json(json)
+      when "advisor_tool_result"
+        ServerToolResultBlock.from_json(json)
       else
         block = UnknownBlock.from_json(json)
         UnknownBlock.new(type: block.type, raw_json: json)

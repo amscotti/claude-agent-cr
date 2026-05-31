@@ -613,8 +613,14 @@ module ClaudeAgent
         case thinking
         when ThinkingConfigAdaptive
           args << "--thinking" << "adaptive"
+          if display = thinking.display
+            args << "--thinking-display" << display
+          end
         when ThinkingConfigEnabled
           args << "--max-thinking-tokens" << thinking.budget_tokens.to_s
+          if display = thinking.display
+            args << "--thinking-display" << display
+          end
         when ThinkingConfigDisabled
           args << "--thinking" << "disabled"
         end

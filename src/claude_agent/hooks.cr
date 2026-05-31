@@ -207,11 +207,12 @@ module ClaudeAgent
   struct HookSpecificOutput
     include JSON::Serializable
     property hook_event_name : String
-    property permission_decision : String? # "allow" | "deny" | "ask"
+    property permission_decision : String? # "allow" | "deny" | "ask" | "defer"
     property permission_decision_reason : String?
     property decision : Hash(String, JSON::Any)?      # PermissionRequest decision payload
     property updated_input : Hash(String, JSON::Any)? # Modified tool input
     property additional_context : String?             # Additional context for Claude
+    property updated_tool_output : JSON::Any?         # Replaces tool output before it goes to model
     property updated_mcp_tool_output : JSON::Any?
     property action : String?
     property content : Hash(String, JSON::Any)?
@@ -223,6 +224,7 @@ module ClaudeAgent
       @decision : Hash(String, JSON::Any)? = nil,
       @updated_input : Hash(String, JSON::Any)? = nil,
       @additional_context : String? = nil,
+      @updated_tool_output : JSON::Any? = nil,
       @updated_mcp_tool_output : JSON::Any? = nil,
       @action : String? = nil,
       @content : Hash(String, JSON::Any)? = nil,

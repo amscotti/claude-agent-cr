@@ -118,6 +118,12 @@ module ClaudeAgent
     getter agent_id : String?
     @[JSON::Field(key: "blocked_path")]
     getter blocked_path : String?
+    @[JSON::Field(key: "decision_reason")]
+    getter decision_reason : String?
+    getter title : String?
+    @[JSON::Field(key: "display_name")]
+    getter display_name : String?
+    getter description : String?
   end
 
   # Interrupt request

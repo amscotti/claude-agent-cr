@@ -155,6 +155,14 @@ module ClaudeAgent
     # For file-write permission requests, the blocked path the caller tried
     # to access. Useful for building `addRules` suggestions.
     property blocked_path : String?
+    # Explains why this permission request was triggered
+    property decision_reason : String?
+    # Full permission prompt sentence (e.g. "Claude wants to read foo.txt")
+    property title : String?
+    # Short noun phrase for the tool action (e.g. "Read file")
+    property display_name : String?
+    # Human-readable subtitle for the permission UI
+    property description : String?
 
     def initialize(
       @tool_name : String,
@@ -164,6 +172,10 @@ module ClaudeAgent
       @tool_use_id : String? = nil,
       @agent_id : String? = nil,
       @blocked_path : String? = nil,
+      @decision_reason : String? = nil,
+      @title : String? = nil,
+      @display_name : String? = nil,
+      @description : String? = nil,
     )
     end
   end
