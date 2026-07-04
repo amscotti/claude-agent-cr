@@ -96,6 +96,8 @@ module ClaudeAgent
         parse_task_progress(message, session_id)
       when "task_notification"
         parse_task_notification(message, session_id)
+      when "task_updated"
+        parse_task_updated(message, session_id)
       when "elicitation_complete"
         parse_elicitation_complete(message, session_id)
       when "api_retry"
@@ -209,6 +211,31 @@ module ClaudeAgent
       )
     end
 
+    # Background tasks can finish *only* via a `system/task_updated` event
+    # (e.g. a task stopped via `TaskStop` reports `status: "killed"` here).
+    # Without this parser, consumers tracking active task IDs would hang
+    # waiting for a `task_notification` that never arrives. Mirrors the
+    # Python SDK's `TaskUpdatedMessage` (0.2.101).
+    private def self.parse_task_updated(data : MessageData, session_id : String) : Message
+      task_id = data["task_id"]?.try(&.as_s)
+      return GenericSystemMessage.new("task_updated", session_id, data) unless task_id
+
+      patch = data["patch"]?.try(&.as_h?) || {} of String => JSON::Any
+      # Terminal-ness derives from `patch.status` only (matching the
+      # Python SDK): a patch carrying just end_time/result/error is left
+      # non-terminal; the full patch stays available on `#patch`.
+      status = patch["status"]?.try(&.as_s?)
+
+      TaskUpdatedMessage.new(
+        session_id,
+        data,
+        task_id,
+        patch,
+        status,
+        data["uuid"]?.try(&.as_s?),
+      )
+    end
+
     private def self.parse_rate_limit_event(data : MessageData) : Message
       uuid = data["uuid"]?.try(&.as_s)
       session_id = data["session_id"]?.try(&.as_s)
@@ -243,6 +270,96 @@ module ClaudeAgent
     end
   end
 
+  # Display-friendly metadata for one `tool_use` block on an assistant
+  # message, sourced from MCP server directory metadata. The CLI emits
+  # `tool_use_meta` as an *array* of these entries (snake_case keys),
+  # each referencing its block via `id`. Optional fields are absent for
+  # tools without directory entries.
+  struct ToolUseMeta
+    include JSON::Serializable
+
+    # The `tool_use` block id this metadata belongs to.
+    getter id : String
+    # Human-readable label for the tool call (e.g. "Search GitHub").
+    getter display_name : String
+    # Display name of the MCP server providing the tool, if any.
+    getter server_display_name : String?
+    # Absolute URL of an icon the SDK consumer can render for the call.
+    getter icon_url : String?
+
+    def initialize(
+      @id : String,
+      @display_name : String,
+      @server_display_name : String? = nil,
+      @icon_url : String? = nil,
+    )
+    end
+  end
+
+  # Structured refusal detail paired with `stop_reason: "refusal"`.
+  # Mirrors the API's `BetaRefusalStopDetails`. All fields are nullable
+  # on the wire; `category` is an open string ("cyber", "bio", ...) —
+  # new categories ship ahead of schema updates.
+  struct StopDetails
+    include JSON::Serializable
+
+    # Policy category that triggered the refusal, when known.
+    getter category : String?
+    # Human-readable explanation. Unstable prose — display only.
+    getter explanation : String?
+    # Opaque token refunding the cache-miss cost when retrying the
+    # refused request on a fallback model.
+    getter fallback_credit_token : String?
+
+    def initialize(
+      @category : String? = nil,
+      @explanation : String? = nil,
+      @fallback_credit_token : String? = nil,
+    )
+    end
+  end
+
+  # What triggered a message/result. Wire shape is a discriminated
+  # object: `{"kind": "human"}`, `{"kind": "task-notification"}`,
+  # `{"kind": "peer", "from": ..., "name": ...}`, etc. Only `kind` is
+  # always present; the other fields are variant-specific.
+  struct MessageOrigin
+    include JSON::Serializable
+
+    # Origin kind: "human", "channel", "peer", "task-notification",
+    # "coordinator", "observer", "auto-continuation", ... (open set).
+    getter kind : String
+    # For "channel": the originating server name.
+    getter server : String?
+    # For "peer"/"observer": the sending session/agent identifier.
+    getter from : String?
+    # For "peer": optional display name of the sender.
+    getter name : String?
+    # For "peer"/"observer": task id of the in-process background
+    # subagent that sent the message.
+    @[JSON::Field(key: "senderTaskId")]
+    getter sender_task_id : String?
+
+    def initialize(
+      @kind : String,
+      @server : String? = nil,
+      @from : String? = nil,
+      @name : String? = nil,
+      @sender_task_id : String? = nil,
+    )
+    end
+
+    # True when this result was triggered by a human-authored prompt.
+    def human? : Bool
+      kind == "human"
+    end
+
+    # True when this result is a background-task followup.
+    def task_notification? : Bool
+      kind == "task-notification"
+    end
+  end
+
   struct AssistantMessageBody
     include JSON::Serializable
     @[JSON::Field(converter: ClaudeAgent::ContentBlockArrayConverter)]
@@ -261,6 +378,12 @@ module ClaudeAgent
     getter stop_reason : String?
     # When `stop_reason == "stop_sequence"`, the exact sequence matched.
     getter stop_sequence : String?
+    # Structured detail paired with `stop_reason: "refusal"` so consumers
+    # can detect why generation stopped without text-matching the error
+    # content. Wire shape matches the API's `BetaRefusalStopDetails`
+    # (category/explanation/fallback_credit_token). Nil for non-refusal
+    # stops and on older CLIs. Matches the TS SDK's `stop_details` (0.3.162).
+    getter stop_details : StopDetails?
     # Container identifier for code-execution tool runs, if any.
     getter container : JSON::Any?
     # Context management directives emitted alongside the assistant turn.
@@ -318,6 +441,16 @@ module ClaudeAgent
 
     getter parent_tool_use_id : String?
 
+    # Optional display-metadata sidecar for this message's `tool_use`
+    # blocks. The CLI (v2.1.179+) emits an array of entries (each
+    # referencing its block via `id`) with human-readable labels and an
+    # `icon_url` sourced from MCP server directory metadata, so SDK
+    # consumers can render friendly tool-call chips instead of raw wire
+    # names. Absent on older CLIs and when no tool has directory
+    # metadata. Sits on the envelope (sibling to `message`). Matches the
+    # TS SDK's `tool_use_meta` (0.3.179 / 0.3.181).
+    getter tool_use_meta : Array(ToolUseMeta)?
+
     def content
       message.content
     end
@@ -342,6 +475,23 @@ module ClaudeAgent
 
     def stop_sequence : String?
       message.stop_sequence
+    end
+
+    # Structured refusal detail paired with `stop_reason: "refusal"`.
+    def stop_details : StopDetails?
+      message.stop_details
+    end
+
+    # True when the assistant turn ended because the model refused. Lets
+    # consumers branch on refusals without text-matching the content.
+    def refusal? : Bool
+      message.stop_reason == "refusal"
+    end
+
+    # Look up display metadata for a specific `tool_use` block id.
+    # Nil when the CLI did not emit the sidecar or the id has no entry.
+    def tool_use_meta_for(tool_use_id : String) : ToolUseMeta?
+      tool_use_meta.try(&.find { |meta| meta.id == tool_use_id })
     end
 
     def text : String
@@ -612,6 +762,53 @@ module ClaudeAgent
     end
   end
 
+  # Task statuses that mean the task has finished and should be cleared
+  # from any "active task" tracking. This set spans both lifecycle
+  # vocabularies: `task_notification` reports `stopped` (the CLI's mapped
+  # form of a killed task) while `task_updated` reports the raw `killed`.
+  # Consumers should treat the `status` of a `TaskNotificationMessage` and
+  # a `TaskUpdatedMessage` the same way. Matches the Python SDK's
+  # `TERMINAL_TASK_STATUSES` frozenset (0.2.101).
+  TERMINAL_TASK_STATUSES = Set{"completed", "failed", "stopped", "killed"}
+
+  # Emitted when a background task's state changes. The CLI emits
+  # `system`/`task_updated` events as a task moves through its lifecycle.
+  # `patch` carries the changed fields (e.g. `status`, `end_time`); when
+  # `patch.status` is terminal (see `TERMINAL_TASK_STATUSES`) the task has
+  # finished.
+  #
+  # Lifecycle note: a background task's terminal state can arrive *only*
+  # as a `TaskUpdatedMessage` with no accompanying `TaskNotificationMessage`
+  # — for example a task stopped via `TaskStop` reports `status="killed"`
+  # here. Consumers that track active task IDs should therefore clear them
+  # on a terminal status from *either* message type.
+  struct TaskUpdatedMessage < SystemMessage
+    getter task_id : String
+    getter patch : MessageData
+    getter status : String?
+    getter uuid : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @task_id : String,
+      @patch : MessageData,
+      @status : String? = nil,
+      @uuid : String? = nil,
+    )
+      super("task_updated", session_id, data)
+    end
+
+    # True when this update reports a terminal status. Safe to call even
+    # when `status` is nil (returns false). Consumers tracking active tasks
+    # should clear the task from their bookkeeping when this is true.
+    def terminal? : Bool
+      status = @status
+      return false unless status
+      TERMINAL_TASK_STATUSES.includes?(status)
+    end
+  end
+
   struct RateLimitInfo
     getter status : String
     getter resets_at : Int64?
@@ -650,6 +847,21 @@ module ClaudeAgent
       )
     end
   end
+
+  # Recognized `rateLimitType` values emitted by the CLI. The Crystal SDK
+  # keeps `rate_limit_type` as an open `String?` for forward compatibility,
+  # but this set documents the values the CLI is known to emit — useful for
+  # `case` dispatch or UI labeling. See
+  # https://docs.claude.com/en/docs/claude-code/rate-limits.
+  RATE_LIMIT_TYPES = Set{
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    # Per-model weekly overage/pay-as-you-go window (TS SDK 0.3.191).
+    "seven_day_overage_included",
+    "overage",
+  }
 
   struct RateLimitEvent < Message
     getter type : String = "rate_limit_event"
@@ -804,6 +1016,13 @@ module ClaudeAgent
     getter uuid : String
     getter session_id : String
     getter subtype : String
+    # What triggered this result, forwarded from the originating message's
+    # `origin` field. Wire shape is a `{"kind": ...}` object (e.g.
+    # `{"kind": "human"}`, `{"kind": "task-notification"}`) — use
+    # `origin.try(&.kind)` or the `human?`/`task_notification?` predicates
+    # to distinguish user-prompted results from background-task followups.
+    # Absent on older CLIs. Matches the TS SDK's `origin` (0.2.126).
+    getter origin : MessageOrigin?
     getter result : String?
     getter cost_usd : Float64?
     getter duration_ms : Int64?

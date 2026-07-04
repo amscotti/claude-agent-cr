@@ -222,3 +222,52 @@ describe ClaudeAgent::AgentDefinition do
     parsed.model.should eq("sonnet")
   end
 end
+
+describe ClaudeAgent::PluginConfig do
+  it "defaults to local type and round-trips skip_mcp_discovery" do
+    plugin = ClaudeAgent::PluginConfig.new("/path/to/plugin", skip_mcp_discovery: true)
+    plugin.type.should eq("local")
+    plugin.path.should eq("/path/to/plugin")
+    plugin.skip_mcp_discovery?.should be_true
+
+    parsed = ClaudeAgent::PluginConfig.from_json(plugin.to_json)
+    parsed.path.should eq("/path/to/plugin")
+    parsed.skip_mcp_discovery?.should be_true
+  end
+
+  it "serializes skip_mcp_discovery under the camelCase wire key" do
+    json = ClaudeAgent::PluginConfig.new("/p", skip_mcp_discovery: true).to_json
+    JSON.parse(json)["skipMcpDiscovery"].as_bool.should be_true
+  end
+end
+
+describe "new AgentOptions fields (managed_settings, forward_subagent_text, sandbox.credentials)" do
+  it "accepts managed_settings, forward_subagent_text, and sandbox credentials" do
+    inner = {} of String => JSON::Any
+    inner["deny"] = JSON::Any.new([JSON::Any.new("Bash(rm:*)")] of JSON::Any)
+    permissions = {} of String => JSON::Any
+    permissions["permissions"] = JSON::Any.new(inner)
+    creds = ClaudeAgent::SandboxCredentialsSettings.new(
+      env_vars: [
+        ClaudeAgent::SandboxCredentialEnvVar.new("OPENAI_API_KEY", mode: "mask"),
+      ],
+    )
+    sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, credentials: creds)
+
+    options = ClaudeAgent::AgentOptions.new(
+      managed_settings: permissions,
+      forward_subagent_text: true,
+      sandbox: sandbox,
+    )
+
+    options.managed_settings.should eq(permissions)
+    options.forward_subagent_text?.should be_true
+    env_var = options.sandbox.try(&.credentials).try(&.env_vars).try(&.first)
+    env_var.try(&.name).should eq("OPENAI_API_KEY")
+    env_var.try(&.mode).should eq("mask")
+  end
+
+  it "defaults forward_subagent_text to false" do
+    ClaudeAgent::AgentOptions.new.forward_subagent_text?.should be_false
+  end
+end

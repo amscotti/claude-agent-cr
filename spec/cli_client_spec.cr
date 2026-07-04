@@ -846,8 +846,8 @@ describe TestableCLIClient do
       )
       options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
 
-      client = TestableCLIClient.new
-      json = client.test_build_settings_json(options)
+      client = TestableCLIClient
+      json = client.new.test_build_settings_json(options)
 
       if json
         parsed = JSON.parse(json)
@@ -855,6 +855,103 @@ describe TestableCLIClient do
         violations["file"].as_a.map(&.as_s).should eq(["/tmp/*", "/var/log/*"])
         violations["network"].as_a.map(&.as_s).should eq(["*.example.com"])
       end
+    end
+
+    it "builds JSON for sandbox.credentials (deny file + env var)" do
+      creds = ClaudeAgent::SandboxCredentialsSettings.new(
+        files: [ClaudeAgent::SandboxCredentialFile.new("~/.aws/credentials")],
+        env_vars: [ClaudeAgent::SandboxCredentialEnvVar.new("AWS_SECRET_ACCESS_KEY")],
+      )
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, credentials: creds)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+
+      if json
+        parsed = JSON.parse(json)
+        c = parsed["sandbox"]["credentials"]
+        file = c["files"].as_a.first
+        file["path"].as_s.should eq("~/.aws/credentials")
+        file["mode"].as_s.should eq("deny")
+        env_var = c["envVars"].as_a.first
+        env_var["name"].as_s.should eq("AWS_SECRET_ACCESS_KEY")
+        env_var["mode"].as_s.should eq("deny")
+      end
+    end
+
+    it "builds JSON for sandbox.credentials (mask mode with injectHosts)" do
+      creds = ClaudeAgent::SandboxCredentialsSettings.new(
+        env_vars: [
+          ClaudeAgent::SandboxCredentialEnvVar.new(
+            "AWS_SECRET_ACCESS_KEY",
+            mode: "mask",
+            inject_hosts: ["*.amazonaws.com"],
+          ),
+        ],
+      )
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, credentials: creds)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+
+      if json
+        parsed = JSON.parse(json)
+        env_var = parsed["sandbox"]["credentials"]["envVars"].as_a.first
+        env_var["mode"].as_s.should eq("mask")
+        env_var["injectHosts"].as_a.map(&.as_s).should eq(["*.amazonaws.com"])
+      end
+    end
+  end
+
+  describe "#build_cli_args new options" do
+    it "does NOT emit --forward-subagent-text (initialize-only)" do
+      options = ClaudeAgent::AgentOptions.new(forward_subagent_text: true)
+      rendered = TestableCLIClient.new(options).test_build_cli_args.join(" ")
+      rendered.should_not contain("--forward-subagent-text")
+    end
+
+    it "emits --managed-settings with the JSON payload" do
+      inner = {} of String => JSON::Any
+      inner["allow"] = JSON::Any.new([JSON::Any.new("Bash")] of JSON::Any)
+      managed = {"permissions" => JSON::Any.new(inner)} of String => JSON::Any
+      options = ClaudeAgent::AgentOptions.new(managed_settings: managed)
+      args = TestableCLIClient.new(options).test_build_cli_args
+      idx = args.index("--managed-settings")
+      idx.should_not be_nil
+      value = args[idx ? idx + 1 : -1]
+      JSON.parse(value)["permissions"]["allow"].as_a.first.as_s.should eq("Bash")
+    end
+
+    it "does not emit --managed-settings by default" do
+      rendered = TestableCLIClient.new.test_build_cli_args.join(" ")
+      rendered.should_not contain("--managed-settings")
+    end
+
+    it "emits --plugin-dir for each string plugin" do
+      options = ClaudeAgent::AgentOptions.new(plugins: ["/a", "/b"])
+      rendered = TestableCLIClient.new(options).test_build_cli_args.join(" ")
+      rendered.should contain("--plugin-dir /a")
+      rendered.should contain("--plugin-dir /b")
+    end
+
+    it "emits --plugin-dir-no-mcp for PluginConfig with skip_mcp_discovery" do
+      options = ClaudeAgent::AgentOptions.new(
+        plugins: [ClaudeAgent::PluginConfig.new("/p", skip_mcp_discovery: true)]
+      )
+      rendered = TestableCLIClient.new(options).test_build_cli_args.join(" ")
+      rendered.should contain("--plugin-dir-no-mcp /p")
+      rendered.should_not contain("--plugin-dir /p")
+    end
+
+    it "emits --plugin-dir for PluginConfig without skip_mcp_discovery" do
+      options = ClaudeAgent::AgentOptions.new(
+        plugins: [ClaudeAgent::PluginConfig.new("/p")]
+      )
+      rendered = TestableCLIClient.new(options).test_build_cli_args.join(" ")
+      rendered.should contain("--plugin-dir /p")
+      rendered.should_not contain("--plugin-dir-no-mcp")
     end
   end
 end

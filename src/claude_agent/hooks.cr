@@ -152,6 +152,10 @@ module ClaudeAgent
     # ConfigChange hook fields
     property config_change_source : String? # e.g. "settings", "permissions"
     property config_change_diff : Hash(String, JSON::Any)?
+    # Stable identifier for the current prompt, emitted by the CLI so hooks
+    # can correlate their events with OpenTelemetry prompt-level spans.
+    # Matches the TS SDK's `prompt_id` (0.3.196). Absent on older CLIs.
+    property prompt_id : String?
 
     def initialize(
       @session_id : String? = nil,
@@ -192,6 +196,7 @@ module ClaudeAgent
       @task_summary : String? = nil,
       @config_change_source : String? = nil,
       @config_change_diff : Hash(String, JSON::Any)? = nil,
+      @prompt_id : String? = nil,
     )
     end
   end

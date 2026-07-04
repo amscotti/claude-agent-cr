@@ -192,6 +192,18 @@ describe ClaudeAgent::HookInput do
     input.hook_event_name.should eq("Stop")
   end
 
+  it "deserializes prompt_id from JSON (OpenTelemetry correlation)" do
+    json = %({"hook_event_name":"PreToolUse","prompt_id":"prompt-abc-123"})
+    input = ClaudeAgent::HookInput.from_json(json)
+    input.prompt_id.should eq("prompt-abc-123")
+  end
+
+  it "round-trips prompt_id through the initializer" do
+    input = ClaudeAgent::HookInput.new(hook_event_name: "Stop", prompt_id: "p1")
+    input.prompt_id.should eq("p1")
+    ClaudeAgent::HookInput.from_json(input.to_json).prompt_id.should eq("p1")
+  end
+
   it "supports PreToolUse fields" do
     input = ClaudeAgent::HookInput.new(
       hook_event_name: "PreToolUse",
