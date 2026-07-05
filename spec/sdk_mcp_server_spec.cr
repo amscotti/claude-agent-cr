@@ -456,6 +456,32 @@ describe "Control Message Parsing" do
     end
   end
 
+  it "parses ControlRequest with rewind_conversation subtype" do
+    json = <<-JSON
+    {
+      "type": "control_request",
+      "request_id": "req-rewind-conv-001",
+      "request": {
+        "subtype": "rewind_conversation",
+        "user_message_uuid": "msg-uuid-999",
+        "dry_run": true
+      }
+    }
+    JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::ControlRequest)
+
+    if message.is_a?(ClaudeAgent::ControlRequest)
+      message.request.should be_a(ClaudeAgent::ControlRewindConversationRequest)
+
+      if req = message.request.as?(ClaudeAgent::ControlRewindConversationRequest)
+        req.user_message_uuid.should eq("msg-uuid-999")
+        req.dry_run?.should be_true
+      end
+    end
+  end
+
   it "parses unknown control_request subtype as ControlUnknownRequest (never raises)" do
     json = <<-JSON
     {

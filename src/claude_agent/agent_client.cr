@@ -141,8 +141,16 @@ module ClaudeAgent
     end
 
     private def populate_initialize_flags(request : Hash(String, JSON::Any))
-      request["promptSuggestions"] = JSON::Any.new(true) if @options.try(&.prompt_suggestions?)
-      request["agentProgressSummaries"] = JSON::Any.new(true) if @options.try(&.agent_progress_summaries?)
+      opts = @options
+      return unless opts
+
+      request["promptSuggestions"] = JSON::Any.new(true) if opts.prompt_suggestions?
+      request["agentProgressSummaries"] = JSON::Any.new(true) if opts.agent_progress_summaries?
+
+      # Stream subagent text/thinking blocks as assistant/user messages
+      # with `parent_tool_use_id` set. Delivered via initialize (not argv),
+      # matching the TS SDK's `forwardSubagentText` (0.2.119).
+      request["forwardSubagentText"] = JSON::Any.new(true) if opts.forward_subagent_text?
     end
 
     # Forward `skills` to the CLI so a supporting CLI can filter which
@@ -381,6 +389,19 @@ module ClaudeAgent
     def rewind_files(user_message_id : String, *, dry_run : Bool = false) : Hash(String, JSON::Any)
       send_control_request({
         "subtype"         => JSON::Any.new("rewind_files"),
+        "user_message_id" => JSON::Any.new(user_message_id),
+        "dry_run"         => JSON::Any.new(dry_run),
+      })
+    end
+
+    # Rewind the conversation transcript to a previous user message and
+    # establish a durable resume anchor there. A subsequent `resume` of the
+    # returned session continues from the rewound point. Pass `dry_run: true`
+    # to preview the would-be-rewound state without mutating the transcript.
+    # Matches the TS SDK's `rewind_conversation` control request (0.3.186).
+    def rewind_conversation(user_message_id : String, *, dry_run : Bool = false) : Hash(String, JSON::Any)
+      send_control_request({
+        "subtype"         => JSON::Any.new("rewind_conversation"),
         "user_message_id" => JSON::Any.new(user_message_id),
         "dry_run"         => JSON::Any.new(dry_run),
       })

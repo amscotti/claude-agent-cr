@@ -644,7 +644,18 @@ module ClaudeAgent
       add_tools_option_args(args, opts)
 
       opts.add_dirs.try(&.each { |dir| args << "--add-dir" << dir })
-      opts.plugins.try(&.each { |plugin| args << "--plugin-dir" << plugin })
+      opts.plugins.try(&.each do |plugin|
+        case plugin
+        when String
+          args << "--plugin-dir" << plugin
+        when PluginConfig
+          # `skip_mcp_discovery` selects the flag itself: the CLI loads
+          # `--plugin-dir-no-mcp` plugins without reading their .mcp.json.
+          # Matches the TS SDK's argv emission (0.3.172).
+          flag = plugin.skip_mcp_discovery? ? "--plugin-dir-no-mcp" : "--plugin-dir"
+          args << flag << plugin.path
+        end
+      end)
 
       add_mcp_args(args, opts)
 
@@ -855,6 +866,12 @@ module ClaudeAgent
       elsif path = opts.settings_path
         args << "--settings" << path
       end
+
+      # Policy-tier settings honored below IT-controlled managed sources.
+      # Emitted as `--managed-settings <json>` — a real CLI flag that is
+      # hidden from `claude --help` (the TS SDK emits it the same way).
+      # Matches the TS SDK's `managedSettings` (0.2.118).
+      opts.managed_settings.try { |managed| args << "--managed-settings" << managed.to_json }
     end
 
     private def build_settings_json(opts : AgentOptions) : String?
@@ -897,6 +914,13 @@ module ClaudeAgent
         sandbox_obj["ignoreViolations"] = JSON::Any.new(ignore_obj) unless ignore_obj.empty?
       end
 
+      sandbox.credentials.try do |creds|
+        # The structs carry the wire-format keys (path/mode, name/mode/
+        # injectHosts, allowPlaintextInject) via JSON::Serializable, so a
+        # serialize round-trip is the least error-prone way to attach them.
+        sandbox_obj["credentials"] = JSON.parse(creds.to_json)
+      end
+
       settings["sandbox"] = JSON::Any.new(sandbox_obj) unless sandbox_obj.empty?
 
       return nil if settings.empty?
@@ -908,6 +932,9 @@ module ClaudeAgent
       args << "--include-partial-messages" if opts.include_partial_messages?
       args << "--include-hook-events" if opts.include_hook_events?
       args << "--replay-user-messages" if opts.replay_user_messages?
+      # NOTE: `forward_subagent_text` is NOT a CLI argv flag — it flows
+      # through the `initialize` control request as `forwardSubagentText`
+      # (see AgentClient#populate_initialize_flags), matching the TS SDK.
       # NOTE: file checkpointing is enabled via the
       # `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true` environment variable
       # (see `#build_env`), NOT a CLI flag. The CLI does not accept any

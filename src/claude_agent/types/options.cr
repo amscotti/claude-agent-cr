@@ -172,6 +172,58 @@ module ClaudeAgent
     end
   end
 
+  # A credential file or directory to protect inside the sandbox.
+  # `mode: "deny"` (the only supported mode for files) blocks reads.
+  struct SandboxCredentialFile
+    include JSON::Serializable
+    property path : String
+    property mode : String = "deny"
+
+    def initialize(@path : String, @mode : String = "deny")
+    end
+  end
+
+  # An environment variable to protect inside the sandbox.
+  # `"deny"` unsets the variable for sandboxed commands; `"mask"` shows
+  # sandboxed commands a sentinel value and the host proxy swaps
+  # sentinel -> real on egress to `inject_hosts`.
+  struct SandboxCredentialEnvVar
+    include JSON::Serializable
+    property name : String
+    property mode : String = "deny"
+    # Only meaningful when `mode` is "mask": hosts the real value may be
+    # injected into. Defaults to `network.allowedDomains` when unset.
+    @[JSON::Field(key: "injectHosts")]
+    property inject_hosts : Array(String)?
+
+    def initialize(@name : String, @mode : String = "deny", @inject_hosts : Array(String)? = nil)
+    end
+  end
+
+  # Credential handling for sandboxed commands. Controls how credential
+  # files and environment variables are denied or masked when bash runs
+  # inside the sandbox. Wire shape matches the TS SDK's
+  # `sandbox.credentials` settings (0.3.187 / 0.3.199).
+  struct SandboxCredentialsSettings
+    include JSON::Serializable
+    # Credential files/directories to deny inside the sandbox.
+    property files : Array(SandboxCredentialFile)?
+    # Environment variables to deny or mask inside the sandbox.
+    @[JSON::Field(key: "envVars")]
+    property env_vars : Array(SandboxCredentialEnvVar)?
+    # Allow sentinel -> real substitution on the plain-HTTP proxy path.
+    # Defaults to false; only enable for trusted-network test fixtures.
+    @[JSON::Field(key: "allowPlaintextInject")]
+    property? allow_plaintext_inject : Bool?
+
+    def initialize(
+      @files : Array(SandboxCredentialFile)? = nil,
+      @env_vars : Array(SandboxCredentialEnvVar)? = nil,
+      @allow_plaintext_inject : Bool? = nil,
+    )
+    end
+  end
+
   # Sandbox configuration matching official SDKs
   struct SandboxSettings
     include JSON::Serializable
@@ -182,6 +234,9 @@ module ClaudeAgent
     property network : SandboxNetworkSettings?
     property ignore_violations : SandboxIgnoreViolations?
     property? enable_weaker_nested_sandbox : Bool = false
+    # Credential file/env-var denial (or masking) for sandboxed commands.
+    # Matches the TS SDK's `sandbox.credentials` (0.3.187 / 0.3.199).
+    property credentials : SandboxCredentialsSettings?
     # Matches TS SDK v0.2.91+: when sandboxing is enabled but dependencies
     # are missing, should `query()` abort with an error result (true, the
     # safer default) or silently fall back to running unsandboxed (false).
@@ -196,6 +251,7 @@ module ClaudeAgent
       @network : SandboxNetworkSettings? = nil,
       @ignore_violations : SandboxIgnoreViolations? = nil,
       @enable_weaker_nested_sandbox : Bool = false,
+      @credentials : SandboxCredentialsSettings? = nil,
       @fail_if_unavailable : Bool = true,
     )
     end
@@ -219,6 +275,29 @@ module ClaudeAgent
       new("default")
     end
   end
+
+  # Plugin configuration. Currently only local plugins (a directory path)
+  # are supported. When the host already manages a plugin's MCP connections
+  # itself, set `skip_mcp_discovery: true` so the engine loads the plugin's
+  # skills/hooks without re-reading its `.mcp.json`. Matches the TS SDK's
+  # per-plugin `skipMcpDiscovery` (0.3.172).
+  struct PluginConfig
+    include JSON::Serializable
+    property type : String = "local"
+    property path : String
+    @[JSON::Field(key: "skipMcpDiscovery")]
+    property? skip_mcp_discovery : Bool = false
+
+    def initialize(@path : String, @skip_mcp_discovery : Bool = false)
+      @type = "local"
+    end
+  end
+
+  # A plugin may be a bare path (local plugin) or a full PluginConfig.
+  # Arrays are invariant in Crystal, so `plugins` accepts either a
+  # homogeneous list of paths or a homogeneous list of configs (matches
+  # how the Python/TS SDKs serialize them).
+  alias PluginEntry = String | PluginConfig
 
   # System prompt preset configuration
   struct SystemPromptPreset
@@ -467,7 +546,7 @@ module ClaudeAgent
     property add_dirs : Array(String)?
 
     # Plugins
-    property plugins : Array(String)?
+    property plugins : Array(String) | Array(PluginConfig) | Nil
 
     # Session configuration
     property cwd : String?
@@ -500,6 +579,11 @@ module ClaudeAgent
     # `hook_response`) into the output stream. Maps to `--include-hook-events`.
     property? include_hook_events : Bool = false
     property? replay_user_messages : Bool = false # Re-emit user messages for acknowledgment
+    # Stream subagent text/thinking blocks as assistant/user messages with
+    # `parent_tool_use_id` set, so consumers can render a nested subagent
+    # transcript live. Forwarded via the `initialize` control request as
+    # `forwardSubagentText` (not a CLI flag). Matches the TS SDK (0.2.119).
+    property? forward_subagent_text : Bool = false
 
     # Output format (structured outputs)
     property output_format : OutputFormat?
@@ -511,6 +595,15 @@ module ClaudeAgent
     # Setting sources
     property setting_sources : Array(String)?
     property settings_path : String? # Path to settings file
+    # Policy-tier settings passed to the CLI in-memory via the
+    # `--managed-settings <json>` flag (a real flag hidden from
+    # `claude --help`), honored *below* IT-controlled managed sources.
+    # Restrictive-only: non-allowlisted keys are dropped by the CLI.
+    # Useful for embedders that want to enforce defaults without writing a
+    # managed-settings file to disk. Matches the TS SDK's `managedSettings`
+    # (0.2.118).
+    @[JSON::Field(ignore: true)]
+    property managed_settings : Hash(String, JSON::Any)?
 
     # Session management
     property? continue_conversation : Bool = false
@@ -572,7 +665,7 @@ module ClaudeAgent
       @betas : Array(String)? = nil,
       @skills : SkillsOption? = nil,
       @add_dirs : Array(String)? = nil,
-      @plugins : Array(String)? = nil,
+      @plugins : Array(String) | Array(PluginConfig) | Nil = nil,
       @cwd : String? = nil,
       @mcp_servers : Hash(String, MCPServerConfig)? = nil,
       @strict_mcp_config : Bool = false,
@@ -587,11 +680,13 @@ module ClaudeAgent
       @include_partial_messages : Bool = false,
       @include_hook_events : Bool = false,
       @replay_user_messages : Bool = false,
+      @forward_subagent_text : Bool = false,
       @output_format : OutputFormat? = nil,
       @cli_path : String? = nil,
       @env : Hash(String, String)? = nil,
       @setting_sources : Array(String)? = nil,
       @settings_path : String? = nil,
+      @managed_settings : Hash(String, JSON::Any)? = nil,
       @continue_conversation : Bool = false,
       @resume : String? = nil,
       @resume_session_at : String? = nil,

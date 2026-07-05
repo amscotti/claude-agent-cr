@@ -383,6 +383,27 @@ describe ClaudeAgent::AgentClient do
     end
   end
 
+  it "sends a rewind_conversation control request" do
+    fake_cli = FakeCLIClient.new(
+      control_responses: {"rewind_conversation" => {"session_id" => JSON::Any.new("sess-rewound")}},
+    )
+    client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+    begin
+      client.start
+      result = client.rewind_conversation("msg-uuid-1", dry_run: true)
+
+      sent = fake_cli.sent_messages[-1]
+      req = sent["request"].as_h
+      req["subtype"].as_s.should eq("rewind_conversation")
+      req["user_message_id"].as_s.should eq("msg-uuid-1")
+      req["dry_run"].as_bool.should be_true
+      result["session_id"].as_s.should eq("sess-rewound")
+    ensure
+      client.stop
+    end
+  end
+
   it "returns a typed ContextUsageResponse from get_context_usage" do
     fake_cli = FakeCLIClient.new(
       control_responses: {
@@ -835,6 +856,33 @@ describe ClaudeAgent::AgentClient do
       request = fake_cli.sent_messages.first["request"].as_h
       request["promptSuggestions"].as_bool.should be_true
       request["agentProgressSummaries"].as_bool.should be_true
+    ensure
+      client.stop
+    end
+  end
+
+  it "forwards forwardSubagentText via initialize (not managedSettings or plugins)" do
+    inner = {} of String => JSON::Any
+    inner["allow"] = JSON::Any.new([JSON::Any.new("Bash")] of JSON::Any)
+    managed = {"permissions" => JSON::Any.new(inner)} of String => JSON::Any
+    options = ClaudeAgent::AgentOptions.new(
+      forward_subagent_text: true,
+      managed_settings: managed,
+      plugins: [ClaudeAgent::PluginConfig.new("/p", skip_mcp_discovery: true)],
+    )
+    fake_cli = FakeCLIClient.new
+    client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+    begin
+      client.start
+
+      request = fake_cli.sent_messages.first["request"].as_h
+      request["forwardSubagentText"].as_bool.should be_true
+
+      # managed_settings and plugins travel on argv (--managed-settings /
+      # --plugin-dir-no-mcp), never in the initialize request.
+      request.has_key?("managedSettings").should be_false
+      request.has_key?("plugins").should be_false
     ensure
       client.stop
     end

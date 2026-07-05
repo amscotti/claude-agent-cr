@@ -318,6 +318,25 @@ module ClaudeAgent
     getter user_message_uuid : String
   end
 
+  # Rewind the whole conversation to a previous point. Unlike
+  # `rewind_files` (which restores file state to a checkpoint), this
+  # truncates the transcript itself and establishes a durable resume
+  # anchor so a subsequent `resume` continues from the rewound point.
+  # Matches the TS SDK's `rewind_conversation` (0.3.186).
+  struct ControlRewindConversationRequest
+    include JSON::Serializable
+
+    getter subtype : String = "rewind_conversation"
+    @[JSON::Field(key: "user_message_uuid")]
+    getter user_message_uuid : String
+    # When true, compute and return the would-be-rewound state without
+    # mutating the transcript. Useful for previewing in a UI.
+    getter? dry_run : Bool = false
+
+    def initialize(@user_message_uuid : String, @dry_run : Bool = false)
+    end
+  end
+
   # Union type for control request inner payload
   # Note: Crystal doesn't have true union types for JSON, so we parse manually
   alias ControlRequestInner = ControlInitializeRequest |
@@ -345,6 +364,7 @@ module ClaudeAgent
                               ControlElicitationRequest |
                               ControlHookCallbackRequest |
                               ControlRewindFilesRequest |
+                              ControlRewindConversationRequest |
                               ControlUnknownRequest
 
   # Converter for parsing control request inner based on subtype
@@ -375,6 +395,7 @@ module ClaudeAgent
       "elicitation"             => ->(json : String) { ControlElicitationRequest.from_json(json).as(ControlRequestInner) },
       "hook_callback"           => ->(json : String) { ControlHookCallbackRequest.from_json(json).as(ControlRequestInner) },
       "rewind_files"            => ->(json : String) { ControlRewindFilesRequest.from_json(json).as(ControlRequestInner) },
+      "rewind_conversation"     => ->(json : String) { ControlRewindConversationRequest.from_json(json).as(ControlRequestInner) },
     }
 
     def self.from_json(pull : JSON::PullParser) : ControlRequestInner

@@ -29,13 +29,16 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **Session Management**: Resume, fork, delete, and continue conversations with precise message-level resume.
 *   **Session History & Subagents**: List saved sessions, fork a session branch (`fork_session`), list subagents (`list_subagents`), read subagent transcripts (`get_subagent_messages`), delete sessions (`delete_session`).
 *   **Transcript Controls**: `should_query: false` to append user messages without triggering a turn; `include_system_messages` on `get_session_messages`.
-*   **File Checkpointing**: Track and rewind file changes.
-*   **Sandbox Support**: Configure sandboxed execution environments.
+*   **File Checkpointing**: Track and rewind file changes, plus `rewind_conversation` to truncate the transcript itself.
+*   **Sandbox Support**: Configure sandboxed execution environments, including credential masking/denial via `sandbox.credentials`.
+*   **Managed Settings**: Pass policy-tier settings to the CLI in-memory via `managed_settings` (honored below IT-controlled managed sources).
+*   **Subagent Streaming**: `forward_subagent_text` streams subagent text deltas into the SDK message stream.
+*   **Plugin Configs**: `PluginConfig` with per-plugin `skip_mcp_discovery` for hosts that manage a plugin's MCP connections themselves.
 *   **Extended Thinking**: `ThinkingConfig.adaptive` / `enabled` / `disabled` (with `display` support for `"summarized"` / `"omitted"` thinking blocks), plus fine-grained `effort` tiers (`Low`, `Medium`, `High`, `Xhigh`, `Max`) — `xhigh` is the default Claude Code tier for Opus 4.7.
 *   **Pre-warming**: `ClaudeAgent.startup` spins up the CLI subprocess ahead of the first query.
 *   **Tracing**: Automatic W3C trace context propagation (`TRACEPARENT` / `TRACESTATE`) when present in the caller's environment.
 *   **Streaming**: Real-time message streaming using Crystal's native fibers.
-*   **Type Safety**: Fully typed message and event structures, including new `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, and `MirrorErrorMessage`, with graceful handling of unknown content types.
+*   **Type Safety**: Fully typed message and event structures, including `TaskUpdatedMessage` (with `TERMINAL_TASK_STATUSES`), `tool_use_meta` sidecar, `stop_details`/`refusal?`, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, and `MirrorErrorMessage`, with graceful handling of unknown content types.
 
 ## Prerequisites
 
@@ -52,7 +55,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.7.0
+        version: ~> 0.8.0
     ```
 
 2.  Run `shards install`
@@ -153,18 +156,47 @@ ClaudeAgent::AgentClient.open do |client|
       puts "Task tokens: #{message.usage.total_tokens}"
     when ClaudeAgent::TaskNotificationMessage
       puts "Task status: #{message.status}"
+    when ClaudeAgent::TaskUpdatedMessage
+      # Background tasks can finish ONLY via this message (e.g. a task
+      # stopped via TaskStop reports status="killed" here, with no
+      # TaskNotification). Clear active-task bookkeeping on a terminal status.
+      puts "Task updated: #{message.task_id} status=#{message.status} " \
+           "(terminal=#{message.terminal?})"
     when ClaudeAgent::RateLimitEvent
       puts "Rate limit status: #{message.rate_limit_info.status}"
     when ClaudeAgent::ElicitationCompleteMessage
       puts "Elicitation complete for #{message.mcp_server_name}"
     when ClaudeAgent::PromptSuggestionMessage
       puts "Suggestion: #{message.suggestion}"
+    when ClaudeAgent::AssistantMessage
+      # Refusal detection without text-matching the content:
+      if message.refusal?
+        details = message.stop_details
+        puts "Refused: #{details.try(&.category)} — #{details.try(&.explanation)}"
+      end
+
+      # Display-friendly labels for tool calls (CLI v2.1.179+). The
+      # sidecar is an array of per-block entries; use #tool_use_meta_for
+      # to look one up by tool_use block id.
+      message.tool_use_meta.try &.each do |meta|
+        puts "Tool call: #{meta.display_name} (#{meta.id})"
+      end
+    when ClaudeAgent::ResultMessage
+      # What triggered this result — an object like {"kind": "human"} or
+      # {"kind": "task-notification"}:
+      puts "Done: #{message.subtype} (origin=#{message.origin.try(&.kind) || "unknown"})"
     when ClaudeAgent::UnknownMessage
       puts "Unknown event type: #{message.type}"
     end
   end
 end
 ```
+
+> **Background task lifecycle:** a task's terminal state can arrive *only* as a
+> `TaskUpdatedMessage` with no accompanying `TaskNotificationMessage`. Use
+> `message.terminal?` or the `ClaudeAgent::TERMINAL_TASK_STATUSES` set
+> (`completed`, `failed`, `stopped`, `killed`) to clear active-task tracking
+> from either message type.
 
 ### Server Info
 
@@ -751,6 +783,21 @@ ClaudeAgent::AgentClient.open do |client|
 end
 ```
 
+Plugins can be loaded as bare paths or as `PluginConfig` entries. Set
+`skip_mcp_discovery: true` on a plugin when the host already manages that
+plugin's MCP connections — the engine loads the plugin's skills/hooks without
+re-reading its `.mcp.json`. Such plugins are passed to the CLI via
+`--plugin-dir-no-mcp` instead of `--plugin-dir`:
+
+```crystal
+options = ClaudeAgent::AgentOptions.new(
+  plugins: [
+    ClaudeAgent::PluginConfig.new("./plugins/my-plugin", skip_mcp_discovery: true),
+    "./plugins/other-plugin", # bare path still works
+  ],
+)
+```
+
 ### Transcript Controls
 
 ```crystal
@@ -855,6 +902,12 @@ ClaudeAgent::AgentClient.open(options) do |client|
 
   # Later: rewind to checkpoint
   client.rewind_files(checkpoint_uuid.not_nil!) if checkpoint_uuid
+
+  # Rewind the conversation transcript itself (not just file state) to a
+  # previous user message, establishing a durable resume anchor there. A
+  # subsequent `resume` continues from the rewound point. Pass dry_run to
+  # preview without mutating.
+  client.rewind_conversation(checkpoint_uuid.not_nil!) if checkpoint_uuid
 end
 ```
 
@@ -870,13 +923,33 @@ sandbox = ClaudeAgent::SandboxSettings.new(
   network: ClaudeAgent::SandboxNetworkSettings.new(
     allow_local_binding: true,
     http_proxy_port: 8080
-  )
+  ),
+  # Credential handling for sandboxed commands (CLI v2.1.187+):
+  credentials: ClaudeAgent::SandboxCredentialsSettings.new(
+    files: [
+      # "deny" blocks reads of credential files inside the sandbox.
+      ClaudeAgent::SandboxCredentialFile.new("~/.aws/credentials"),
+    ],
+    env_vars: [
+      # "deny" unsets the variable; "mask" shows a sentinel inside the
+      # sandbox and injects the real value only on egress to inject_hosts.
+      ClaudeAgent::SandboxCredentialEnvVar.new(
+        "AWS_SECRET_ACCESS_KEY",
+        mode: "mask",
+        inject_hosts: ["*.amazonaws.com"],
+      ),
+    ],
+  ),
 )
 
 options = ClaudeAgent::AgentOptions.new(
   sandbox: sandbox
 )
 ```
+
+Credential `files` support `mode: "deny"` only; `env_vars` support `"deny"`
+(unset inside the sandbox) or `"mask"` (sentinel value inside the sandbox,
+swapped for the real secret at the proxy for `inject_hosts` destinations).
 
 ### Extended Thinking
 
@@ -1145,6 +1218,7 @@ options = ClaudeAgent::AgentOptions.new(
   agent_progress_summaries: true,
   include_partial_messages: true,                      # + fine-grained streaming
   replay_user_messages: false,
+  forward_subagent_text: true,                         # stream subagent text deltas
 
   # --- Output & structured responses --------------------------------------
   output_format: nil,                                  # OutputFormat.json_schema(...)
@@ -1154,7 +1228,11 @@ options = ClaudeAgent::AgentOptions.new(
   env: {"CLAUDE_AGENT_TRACING" => "1"},
   betas: ["extended-thinking-2025-01-24"],
   add_dirs: ["./vendor"],
-  plugins: ["./plugins/my-plugin"],
+  # Plugins accept bare paths OR PluginConfig entries:
+  plugins: [
+    ClaudeAgent::PluginConfig.new("./plugins/my-plugin", skip_mcp_discovery: true),
+    "./plugins/other",
+  ],
   cwd: Dir.current,
   user: "alice",
   stderr: ->(line : String) { STDERR.puts(line) },     # observe CLI stderr
@@ -1163,6 +1241,7 @@ options = ClaudeAgent::AgentOptions.new(
   # --- Settings sources ----------------------------------------------------
   setting_sources: ["user", "project"],                # [] disables all
   settings_path: nil,                                  # explicit settings.json
+  managed_settings: nil,                               # policy-tier settings (in-memory, below IT-managed)
 
   # --- Session management --------------------------------------------------
   continue_conversation: false,
@@ -1174,7 +1253,12 @@ options = ClaudeAgent::AgentOptions.new(
 
   # --- Safety & checkpointing ---------------------------------------------
   enable_file_checkpointing: true,
-  sandbox: ClaudeAgent::SandboxSettings.new(enabled: true),
+  sandbox: ClaudeAgent::SandboxSettings.new(
+    enabled: true,
+    credentials: ClaudeAgent::SandboxCredentialsSettings.new(
+      env_vars: [ClaudeAgent::SandboxCredentialEnvVar.new("AWS_SECRET_ACCESS_KEY", mode: "mask")],
+    ),
+  ),
 )
 
 ClaudeAgent.query("Review the current directory.", options) do |message|
@@ -1184,7 +1268,7 @@ end
 
 ## Status
 
-> Developed against Claude Code CLI **v2.1.84+**. The SDK is forward-compatible:
+> Developed against Claude Code CLI **v2.1.201**. The SDK is forward-compatible:
 > features that require newer CLI versions are gracefully no-op or surface a
 > clear error on older CLIs.
 
@@ -1284,6 +1368,25 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.8.0
+
+Parity release aligned with Claude Code CLI **v2.1.201** and the official Python (`0.2.110`) / TypeScript (`0.3.201`) SDKs. Brings over features added since 0.7.0, verified end-to-end against the live CLI.
+
+**New features**:
+- **`TaskUpdatedMessage` + `TERMINAL_TASK_STATUSES`**: Background tasks can finish *only* via a `system/task_updated` event (e.g. a task stopped via `TaskStop` reports `status="killed"` here with no `TaskNotification`). The new `TaskUpdatedMessage` parses these, `#terminal?` reports terminal status, and the `TERMINAL_TASK_STATUSES` set (`completed`, `failed`, `stopped`, `killed`) covers both lifecycle vocabularies — fixing a class of hangs in active-task tracking. Matches Python `0.2.101`.
+- **`tool_use_meta` sidecar**: `AssistantMessage#tool_use_meta` exposes the CLI's display-metadata array — per-`tool_use`-block entries with `id`, `display_name`, `server_display_name`, and `icon_url` — plus a `#tool_use_meta_for(tool_use_id)` lookup, so SDK consumers can render human-readable tool-call chips instead of raw wire names. CLI v2.1.179+. New `ToolUseMeta` struct.
+- **`origin` on `ResultMessage`**: Typed `MessageOrigin` (`kind` plus variant fields, with `human?` / `task_notification?` predicates) forwarded from the triggering message, so consumers can distinguish user-prompted results from background-task followups. TS `0.2.126`.
+- **`rewind_conversation` control request**: `AgentClient#rewind_conversation(user_message_id, dry_run:)` truncates the transcript to a previous user message and establishes a durable resume anchor (distinct from `rewind_files`, which restores file state). New `ControlRewindConversationRequest`. TS `0.3.186`.
+- **`stop_details` + `#refusal?`**: `AssistantMessage#stop_details` exposes the structured refusal detail (`category`, `explanation`, `fallback_credit_token`) paired with `stop_reason: "refusal"`; `#refusal?` lets consumers branch on refusals without text-matching. New `StopDetails` struct. TS `0.3.162`.
+- **`managed_settings` option**: Pass policy-tier settings to the CLI in-memory via `--managed-settings <json>` (a real flag hidden from `claude --help`), honored below IT-controlled managed sources. TS `0.2.118`.
+- **`forward_subagent_text` option**: Stream subagent text/thinking blocks as messages with `parent_tool_use_id` set. Forwarded via the `initialize` control request. TS `0.2.119`.
+- **`sandbox.credentials` settings**: `SandboxCredentialsSettings` with typed `SandboxCredentialFile` (`path`, `mode: "deny"`) and `SandboxCredentialEnvVar` (`name`, `mode: "deny"|"mask"`, `inject_hosts`) entries controls how credential files and env vars are protected in sandboxed commands. Serialized under `sandbox.credentials` in the settings JSON. TS `0.3.187` / `0.3.199`.
+- **`PluginConfig` + `skip_mcp_discovery`**: `plugins` now accepts `PluginConfig` entries alongside bare paths. `skip_mcp_discovery: true` emits `--plugin-dir-no-mcp` so the engine loads the plugin's skills/hooks without reading its `.mcp.json` when the host manages MCP itself. TS `0.3.172`.
+- **`prompt_id` on `HookInput`**: Stable identifier for the current prompt so hooks can correlate events with OpenTelemetry prompt-level spans. TS `0.3.196`.
+- **`RATE_LIMIT_TYPES` constant**: Documents the `rateLimitType` values the CLI emits, including the new `seven_day_overage_included` per-model weekly overage window. TS `0.3.191`.
+
+**New example**: `examples/42_fruit_template.cr` — a showcase exercising the new message fields and options end-to-end.
 
 ### 0.7.0
 
@@ -1453,7 +1556,7 @@ New capabilities / fields:
 
 ## Verified Examples
 
-The following examples have been tested and verified with CLI v2.1.84:
+The following examples have been tested and verified with CLI v2.1.201:
 
 - One-shot queries and streaming (examples 01, 02, 03)
 - Tool restrictions and permission modes (examples 04, 05)
@@ -1477,6 +1580,8 @@ The following examples have been tested and verified with CLI v2.1.84:
 - `get_context_usage` + `startup` pre-warming (example 38)
 - New hook events — TeammateIdle, TaskCompleted, ConfigChange (example 39)
 - Runtime MCP + plugin controls (example 40)
+- Adaptive thinking display (example 41)
+- New-features showcase — `TaskUpdatedMessage`, `tool_use_meta`, `refusal?`, `origin`, `forward_subagent_text`, `managed_settings`, sandbox credentials (example 42, the fruit template)
 
 Examples with environment-dependent behavior:
 
@@ -1485,10 +1590,11 @@ Examples with environment-dependent behavior:
 - `examples/23_hook_permission_request.cr` only shows the hook when Claude would actually prompt for permission in the current environment
 - `examples/32_elicitation_support.cr` requires `ELICITATION_MCP_URL` and a compatible MCP server that actually requests user input
 - `examples/38_context_usage.cr`, `examples/39_new_hooks.cr`, and `examples/40_mcp_runtime.cr` exercise features that require a newer Claude Code CLI; older CLIs degrade gracefully
+- `examples/42_fruit_template.cr` exercises `tool_use_meta` and `sandbox.credentials` paths that only surface on CLI v2.1.179+/v2.1.187+; the rest degrades gracefully
 
 Quick guide:
 
-- Best local/default examples: `01`, `02`, `07`, `14`, `16`, `25`, `26`, `27`, `28`, `29`, `31`, `33`, `36`, `37`
+- Best local/default examples: `01`, `02`, `07`, `14`, `16`, `25`, `26`, `27`, `28`, `29`, `31`, `33`, `36`, `37`, `42`
 - Best hook-focused examples: `13`, `20`, `21`, `22`, `23`, `28`, `39`
 - Best MCP-focused examples: `06_sdk_mcp_server`, `12`, `17`, `18`, `19`, `40`
 - Best session-focused examples: `25`, `30`, `33`, `36`

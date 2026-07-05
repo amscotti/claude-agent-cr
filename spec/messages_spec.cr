@@ -150,6 +150,63 @@ describe ClaudeAgent::Message do
       end
     end
 
+    it "exposes tool_use_meta sidecar, stop_details, and refusal? on AssistantMessage" do
+      json = <<-JSON
+      {
+        "type": "assistant",
+        "uuid": "env-uuid",
+        "session_id": "sess-1",
+        "message": {
+          "id": "msg-001",
+          "model": "claude-sonnet-4-6",
+          "stop_reason": "refusal",
+          "stop_details": {
+            "category": "cyber",
+            "explanation": "Refused: unsafe operation",
+            "fallback_credit_token": null
+          },
+          "content": [
+            {"type": "tool_use", "id": "tool-1", "name": "mcp__github__search", "input": {}}
+          ]
+        },
+        "tool_use_meta": [
+          {
+            "id": "tool-1",
+            "display_name": "Search GitHub",
+            "server_display_name": "GitHub",
+            "icon_url": "https://example.com/icon.png"
+          }
+        ]
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::AssistantMessage)
+
+      if message.is_a?(ClaudeAgent::AssistantMessage)
+        message.stop_reason.should eq("refusal")
+        message.refusal?.should be_true
+
+        details = message.stop_details
+        details.should_not be_nil
+        details.try(&.category).should eq("cyber")
+        details.try(&.explanation).should eq("Refused: unsafe operation")
+        details.try(&.fallback_credit_token).should be_nil
+
+        meta = message.tool_use_meta
+        meta.should_not be_nil
+        meta.try(&.size).should eq(1)
+
+        entry = message.tool_use_meta_for("tool-1")
+        entry.should_not be_nil
+        entry.try(&.display_name).should eq("Search GitHub")
+        entry.try(&.server_display_name).should eq("GitHub")
+        entry.try(&.icon_url).should eq("https://example.com/icon.png")
+
+        message.tool_use_meta_for("missing-id").should be_nil
+      end
+    end
+
     it "parses UserMessage" do
       json = <<-JSON
       {
@@ -439,6 +496,57 @@ describe ClaudeAgent::Message do
       end
     end
 
+    it "parses TaskUpdatedMessage with terminal killed status" do
+      json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "task_updated",
+        "uuid": "task-upd-123",
+        "session_id": "sess-456",
+        "task_id": "task-123",
+        "patch": {"status": "killed", "end_time": 1234}
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::TaskUpdatedMessage)
+
+      if message.is_a?(ClaudeAgent::TaskUpdatedMessage)
+        message.task_id.should eq("task-123")
+        message.status.should eq("killed")
+        message.patch["end_time"]?.try(&.as_i64).should eq(1234_i64)
+        message.terminal?.should be_true
+      end
+    end
+
+    it "parses TaskUpdatedMessage with non-terminal running status" do
+      json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "task_updated",
+        "uuid": "task-upd-456",
+        "session_id": "sess-456",
+        "task_id": "task-456",
+        "patch": {"status": "running"}
+      }
+      JSON
+
+      message = ClaudeAgent::Message.parse(json)
+      message.should be_a(ClaudeAgent::TaskUpdatedMessage)
+
+      if message.is_a?(ClaudeAgent::TaskUpdatedMessage)
+        message.status.should eq("running")
+        message.terminal?.should be_false
+      end
+    end
+
+    it "exposes TERMINAL_TASK_STATUSES covering both vocabularies" do
+      ClaudeAgent::TERMINAL_TASK_STATUSES.should contain("completed")
+      ClaudeAgent::TERMINAL_TASK_STATUSES.should contain("failed")
+      ClaudeAgent::TERMINAL_TASK_STATUSES.should contain("stopped")
+      ClaudeAgent::TERMINAL_TASK_STATUSES.should contain("killed")
+    end
+
     it "parses ResultMessage" do
       json = <<-JSON
       {
@@ -446,6 +554,7 @@ describe ClaudeAgent::Message do
         "uuid": "result-123",
         "session_id": "sess-456",
         "subtype": "success",
+        "origin": {"kind": "human"},
         "result": "Task completed",
         "cost_usd": 0.001,
         "duration_ms": 1500,
@@ -464,6 +573,9 @@ describe ClaudeAgent::Message do
       if message.is_a?(ClaudeAgent::ResultMessage)
         message.uuid.should eq("result-123")
         message.subtype.should eq("success")
+        message.origin.try(&.kind).should eq("human")
+        message.origin.try(&.human?).should be_true
+        message.origin.try(&.task_notification?).should be_false
         message.result.should eq("Task completed")
         message.cost_usd.should eq(0.001)
         message.duration_ms.should eq(1500)
