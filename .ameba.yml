@@ -20,6 +20,9 @@ Excluded:
   - lib
   - tmp
   - bin
+  # Reference adapters require optional redis/pg shards; not part of the core library.
+  - examples/session-stores/redis_session_store.cr
+  - examples/session-stores/postgres_session_store.cr
 
 # Rule configuration
 #

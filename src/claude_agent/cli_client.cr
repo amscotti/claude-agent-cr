@@ -50,6 +50,14 @@ module ClaudeAgent
       @sdk_mcp_servers = extract_sdk_servers
     end
 
+    # Replace options after construction (e.g. session_store resume
+    # materialization rewrites env/resume). AgentOptions is a struct, so
+    # callers must push the updated copy here before `#start`.
+    def replace_options(options : AgentOptions?) : Nil
+      @options = options
+      @sdk_mcp_servers = extract_sdk_servers
+    end
+
     # Get SDK MCP server by name (for routing control requests)
     def get_sdk_server(name : String) : SDKMCPServer?
       @sdk_mcp_servers[name]?
@@ -86,6 +94,10 @@ module ClaudeAgent
     def start
       return if @running
 
+      # Advisory only: emit once per connect when can_use_tool is shadowed
+      # by whole-tool allowed_tools entries or bypassPermissions.
+      emit_can_use_tool_shadowed_warning
+
       cli_path = find_cli_path
       args = build_cli_args
 
@@ -118,11 +130,30 @@ module ClaudeAgent
       end
     end
 
+    # Emit CanUseToolShadowedWarning via the caller-supplied stderr callback
+    # (or STDERR) when options shadow `can_use_tool`. Non-fatal.
+    private def emit_can_use_tool_shadowed_warning : Nil
+      message = @options.try(&.can_use_tool_shadowed_warning)
+      return unless message
+
+      log_message("[claude-agent-cr] #{message}\n")
+    end
+
     private def build_env : Hash(String, String)?
+      # options.env overlays onto the parent process environment (Process.new
+      # merges when clear_env is false). We start from a copy of options.env
+      # so callers can inject/override vars without mutating their hash.
       base_env = @options.try(&.env).try(&.dup) || {} of String => String
 
       # SDK entrypoint identifier used by Claude Code to distinguish clients.
       base_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cr"
+
+      # Always stamp the SDK version for User-Agent / telemetry unless the
+      # caller already set it in options.env. Matches the TS SDK: the version
+      # is never dropped when a custom env map is supplied.
+      unless base_env.has_key?("CLAUDE_AGENT_SDK_VERSION")
+        base_env["CLAUDE_AGENT_SDK_VERSION"] = VERSION
+      end
 
       if @options.try(&.include_partial_messages?)
         base_env["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
@@ -130,6 +161,12 @@ module ClaudeAgent
 
       if @options.try(&.enable_file_checkpointing?)
         base_env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true"
+      end
+
+      # AskUserQuestion preview format (TS toolConfig.askUserQuestion.previewFormat).
+      # The CLI reads this via CLAUDE_CODE_QUESTION_PREVIEW_FORMAT, not settings.
+      if format = @options.try(&.tool_config).try(&.ask_user_question).try(&.preview_format)
+        base_env["CLAUDE_CODE_QUESTION_PREVIEW_FORMAT"] = format
       end
 
       # User identifier for tracking
@@ -520,6 +557,10 @@ module ClaudeAgent
     # Escape-hatch for CLI flags that aren't modeled as typed options (yet).
     # Added last so a caller can override behavior or forward newly-added
     # Claude Code CLI flags without waiting for an SDK release.
+    #
+    # When a value starts with `-`, emit a single `--flag=value` token so a
+    # dash-leading value is never misparsed as a separate CLI flag (matches
+    # Python 0.2.121+ / TS 0.3.208+).
     private def add_extra_args(args : Array(String), opts : AgentOptions)
       extra = opts.extra_args
       return unless extra
@@ -528,6 +569,8 @@ module ClaudeAgent
         flag = key.starts_with?("--") ? key : "--#{key}"
         if value.nil?
           args << flag
+        elsif value.starts_with?("-")
+          args << "#{flag}=#{value}"
         else
           args << flag << value
         end
@@ -563,6 +606,24 @@ module ClaudeAgent
           args << "--betas"
           betas.each { |beta| args << beta }
         end
+      end
+
+      add_debug_args(args, opts)
+    end
+
+    # `--debug-file` takes precedence over `--debug` (the file form also
+    # enables debug mode). Matches the TS SDK's `debug` / `debugFile`
+    # options (0.2.30+). Dash-leading paths use equals form so they are
+    # not misparsed as a separate CLI flag.
+    private def add_debug_args(args : Array(String), opts : AgentOptions)
+      if path = opts.debug_file
+        if path.starts_with?("-")
+          args << "--debug-file=#{path}"
+        else
+          args << "--debug-file" << path
+        end
+      elsif opts.debug?
+        args << "--debug"
       end
     end
 
@@ -824,8 +885,13 @@ module ClaudeAgent
       # --continue to continue most recent conversation
       args << "--continue" if opts.continue_conversation?
 
-      # --resume takes a session ID, not just a flag
-      opts.resume.try { |id| args << "--resume" << id }
+      # Pass --resume / --session-id / --resume-session-at as single
+      # `--flag=value` tokens. The CLI declares some of these with optional
+      # values, so in the two-token form a dash-leading value is not bound to
+      # the flag and is instead parsed as a separate CLI flag — letting an
+      # untrusted value inject arbitrary flags. The equals form always binds.
+      # Matches Python 0.2.121–0.2.124 / TS 0.3.208–0.3.212.
+      opts.resume.try { |id| args << "--resume=#{id}" }
 
       if uuid = opts.resume_session_at
         # CLI rejects `--resume-session-at` when `--resume` isn't present.
@@ -837,11 +903,11 @@ module ClaudeAgent
             "be set to the session ID to resume.",
           )
         end
-        args << "--resume-session-at" << uuid
+        args << "--resume-session-at=#{uuid}"
       end
 
       args << "--fork-session" if opts.fork_session?
-      opts.session_id.try { |id| args << "--session-id" << id }
+      opts.session_id.try { |id| args << "--session-id=#{id}" }
 
       # Disable session persistence
       args << "--no-session-persistence" if opts.no_session_persistence?
@@ -875,56 +941,84 @@ module ClaudeAgent
     end
 
     private def build_settings_json(opts : AgentOptions) : String?
-      sandbox = opts.sandbox
-      return nil unless sandbox
-
       settings = {} of String => JSON::Any
 
-      # Build sandbox settings object
-      sandbox_obj = {} of String => JSON::Any
-      sandbox_obj["enabled"] = JSON::Any.new(sandbox.enabled?) if sandbox.enabled?
-      sandbox_obj["autoAllowBashIfSandboxed"] = JSON::Any.new(sandbox.auto_allow_bash_if_sandboxed?) if sandbox.auto_allow_bash_if_sandboxed?
-      sandbox_obj["allowUnsandboxedCommands"] = JSON::Any.new(sandbox.allow_unsandboxed_commands?) if sandbox.allow_unsandboxed_commands?
-      sandbox_obj["enableWeakerNestedSandbox"] = JSON::Any.new(sandbox.enable_weaker_nested_sandbox?) if sandbox.enable_weaker_nested_sandbox?
-      # Always emit failIfUnavailable explicitly when the sandbox is enabled
-      # so callers who rely on the default (fail fast) behavior get it even
-      # on CLIs that historically defaulted to silent fallback.
-      if sandbox.enabled?
-        sandbox_obj["failIfUnavailable"] = JSON::Any.new(sandbox.fail_if_unavailable?)
+      if sandbox = opts.sandbox
+        # Build sandbox settings object
+        sandbox_obj = {} of String => JSON::Any
+        sandbox_obj["enabled"] = JSON::Any.new(sandbox.enabled?) if sandbox.enabled?
+        sandbox_obj["autoAllowBashIfSandboxed"] = JSON::Any.new(sandbox.auto_allow_bash_if_sandboxed?) if sandbox.auto_allow_bash_if_sandboxed?
+        sandbox_obj["allowUnsandboxedCommands"] = JSON::Any.new(sandbox.allow_unsandboxed_commands?) if sandbox.allow_unsandboxed_commands?
+        sandbox_obj["enableWeakerNestedSandbox"] = JSON::Any.new(sandbox.enable_weaker_nested_sandbox?) if sandbox.enable_weaker_nested_sandbox?
+        # Always emit failIfUnavailable explicitly when the sandbox is enabled
+        # so callers who rely on the default (fail fast) behavior get it even
+        # on CLIs that historically defaulted to silent fallback.
+        if sandbox.enabled?
+          sandbox_obj["failIfUnavailable"] = JSON::Any.new(sandbox.fail_if_unavailable?)
+        end
+
+        sandbox.excluded_commands.try do |cmds|
+          sandbox_obj["excludedCommands"] = JSON::Any.new(cmds.map { |cmd| JSON::Any.new(cmd) })
+        end
+
+        sandbox.network.try do |net|
+          net_obj = build_sandbox_network_json(net)
+          sandbox_obj["network"] = JSON::Any.new(net_obj) unless net_obj.empty?
+        end
+
+        sandbox.ignore_violations.try do |ignore|
+          ignore_obj = {} of String => JSON::Any
+          ignore.file.try { |files| ignore_obj["file"] = JSON::Any.new(files.map { |path| JSON::Any.new(path) }) }
+          ignore.network.try { |networks| ignore_obj["network"] = JSON::Any.new(networks.map { |pattern| JSON::Any.new(pattern) }) }
+          sandbox_obj["ignoreViolations"] = JSON::Any.new(ignore_obj) unless ignore_obj.empty?
+        end
+
+        sandbox.credentials.try do |creds|
+          # The structs carry the wire-format keys (path/mode, name/mode/
+          # injectHosts, allowPlaintextInject) via JSON::Serializable, so a
+          # serialize round-trip is the least error-prone way to attach them.
+          sandbox_obj["credentials"] = JSON.parse(creds.to_json)
+        end
+
+        settings["sandbox"] = JSON::Any.new(sandbox_obj) unless sandbox_obj.empty?
       end
 
-      sandbox.excluded_commands.try do |cmds|
-        sandbox_obj["excludedCommands"] = JSON::Any.new(cmds.map { |cmd| JSON::Any.new(cmd) })
+      # Top-level settings key for the advisory Dynamic workflow size guideline
+      # (TS SDK 0.3.219). Emitted even when sandbox is unset.
+      opts.workflow_size_guideline.try do |guideline|
+        settings["workflowSizeGuideline"] = JSON::Any.new(guideline)
       end
-
-      sandbox.network.try do |net|
-        net_obj = {} of String => JSON::Any
-        net_obj["allowLocalBinding"] = JSON::Any.new(net.allow_local_binding?) if net.allow_local_binding?
-        net_obj["allowAllUnixSockets"] = JSON::Any.new(net.allow_all_unix_sockets?) if net.allow_all_unix_sockets?
-        net.allow_unix_sockets.try { |sockets| net_obj["allowUnixSockets"] = JSON::Any.new(sockets.map { |sock| JSON::Any.new(sock) }) }
-        net.http_proxy_port.try { |port| net_obj["httpProxyPort"] = JSON::Any.new(port.to_i64) }
-        net.socks_proxy_port.try { |port| net_obj["socksProxyPort"] = JSON::Any.new(port.to_i64) }
-        sandbox_obj["network"] = JSON::Any.new(net_obj) unless net_obj.empty?
-      end
-
-      sandbox.ignore_violations.try do |ignore|
-        ignore_obj = {} of String => JSON::Any
-        ignore.file.try { |files| ignore_obj["file"] = JSON::Any.new(files.map { |path| JSON::Any.new(path) }) }
-        ignore.network.try { |networks| ignore_obj["network"] = JSON::Any.new(networks.map { |pattern| JSON::Any.new(pattern) }) }
-        sandbox_obj["ignoreViolations"] = JSON::Any.new(ignore_obj) unless ignore_obj.empty?
-      end
-
-      sandbox.credentials.try do |creds|
-        # The structs carry the wire-format keys (path/mode, name/mode/
-        # injectHosts, allowPlaintextInject) via JSON::Serializable, so a
-        # serialize round-trip is the least error-prone way to attach them.
-        sandbox_obj["credentials"] = JSON.parse(creds.to_json)
-      end
-
-      settings["sandbox"] = JSON::Any.new(sandbox_obj) unless sandbox_obj.empty?
 
       return nil if settings.empty?
       settings.to_json
+    end
+
+    private def build_sandbox_network_json(net : SandboxNetworkSettings) : Hash(String, JSON::Any)
+      net_obj = {} of String => JSON::Any
+      net_obj["allowLocalBinding"] = JSON::Any.new(net.allow_local_binding?) if net.allow_local_binding?
+      net_obj["allowAllUnixSockets"] = JSON::Any.new(net.allow_all_unix_sockets?) if net.allow_all_unix_sockets?
+      net.allow_unix_sockets.try do |sockets|
+        net_obj["allowUnixSockets"] = JSON::Any.new(sockets.map { |sock| JSON::Any.new(sock) })
+      end
+      net.http_proxy_port.try { |port| net_obj["httpProxyPort"] = JSON::Any.new(port.to_i64) }
+      net.socks_proxy_port.try { |port| net_obj["socksProxyPort"] = JSON::Any.new(port.to_i64) }
+      net.allowed_domains.try do |domains|
+        net_obj["allowedDomains"] = JSON::Any.new(domains.map { |domain| JSON::Any.new(domain) })
+      end
+      net.denied_domains.try do |domains|
+        net_obj["deniedDomains"] = JSON::Any.new(domains.map { |domain| JSON::Any.new(domain) })
+      end
+      if (managed_only = net.allow_managed_domains_only?).is_a?(Bool)
+        net_obj["allowManagedDomainsOnly"] = JSON::Any.new(managed_only)
+      end
+      net.allow_mach_lookup.try do |names|
+        net_obj["allowMachLookup"] = JSON::Any.new(names.map { |name| JSON::Any.new(name) })
+      end
+      # Emit strictAllowlist whenever explicitly set (true or false).
+      if (strict = net.strict_allowlist?).is_a?(Bool)
+        net_obj["strictAllowlist"] = JSON::Any.new(strict)
+      end
+      net_obj
     end
 
     private def add_session_streaming_args(args : Array(String), opts : AgentOptions)
@@ -932,6 +1026,9 @@ module ClaudeAgent
       args << "--include-partial-messages" if opts.include_partial_messages?
       args << "--include-hook-events" if opts.include_hook_events?
       args << "--replay-user-messages" if opts.replay_user_messages?
+      # SessionStore live mirror: CLI emits transcript_mirror frames that the
+      # SDK peels off and appends to the adapter (Python/TS --session-mirror).
+      args << "--session-mirror" if opts.session_store
       # NOTE: `forward_subagent_text` is NOT a CLI argv flag — it flows
       # through the `initialize` control request as `forwardSubagentText`
       # (see AgentClient#populate_initialize_flags), matching the TS SDK.

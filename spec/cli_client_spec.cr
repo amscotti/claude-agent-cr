@@ -422,7 +422,7 @@ describe TestableCLIClient do
       end
     end
 
-    it "accepts resume_session_at when resume is set" do
+    it "accepts resume_session_at when resume is set (equals-form argv)" do
       options = ClaudeAgent::AgentOptions.new(
         resume: "session-uuid",
         resume_session_at: "message-uuid",
@@ -430,10 +430,41 @@ describe TestableCLIClient do
       client = TestableCLIClient.new(options)
       args = client.test_build_cli_args
 
-      args.should contain("--resume")
-      args.should contain("session-uuid")
-      args.should contain("--resume-session-at")
-      args.should contain("message-uuid")
+      args.should contain("--resume=session-uuid")
+      args.should contain("--resume-session-at=message-uuid")
+      # Must be single tokens, not flag+value pairs.
+      args.should_not contain("--resume")
+      args.should_not contain("--resume-session-at")
+    end
+
+    it "emits --session-id as a single equals-form token" do
+      options = ClaudeAgent::AgentOptions.new(session_id: "550e8400-e29b-41d4-a716-446655440000")
+      args = TestableCLIClient.new(options).test_build_cli_args
+      args.should contain("--session-id=550e8400-e29b-41d4-a716-446655440000")
+      args.should_not contain("--session-id")
+    end
+
+    it "emits --session-mirror when session_store is set" do
+      options = ClaudeAgent::AgentOptions.new(
+        session_store: ClaudeAgent::InMemorySessionStore.new,
+      )
+      args = TestableCLIClient.new(options).test_build_cli_args
+      args.should contain("--session-mirror")
+    end
+
+    it "omits --session-mirror without session_store" do
+      args = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_cli_args
+      args.should_not contain("--session-mirror")
+    end
+
+    it "binds dash-leading resume/session_id values via equals form" do
+      options = ClaudeAgent::AgentOptions.new(resume: "--evil", session_id: "-r")
+      args = TestableCLIClient.new(options).test_build_cli_args
+      args.should contain("--resume=--evil")
+      args.should contain("--session-id=-r")
+      # The raw dash-leading values must not appear as separate argv tokens.
+      args.should_not contain("--evil")
+      args.should_not contain("-r")
     end
 
     it "emits --betas as separate variadic tokens" do
@@ -523,6 +554,32 @@ describe TestableCLIClient do
       next_token.nil? || next_token.to_s.starts_with?("--")
     end
 
+    it "uses equals form for dash-leading extra_args values" do
+      extra = {} of String => String?
+      extra["future-flag"] = "--evil"
+      options = ClaudeAgent::AgentOptions.new(extra_args: extra)
+      args = TestableCLIClient.new(options).test_build_cli_args
+
+      args.should contain("--future-flag=--evil")
+      args.should_not contain("--evil")
+      # Plain two-token form must not be used for dash-leading values.
+      future_idx = args.index("--future-flag")
+      future_idx.should be_nil
+    end
+
+    it "keeps two-token form for plain extra_args values" do
+      extra = {} of String => String?
+      extra["future-flag"] = "plain"
+      extra["bool-flag"] = nil
+      options = ClaudeAgent::AgentOptions.new(extra_args: extra)
+      args = TestableCLIClient.new(options).test_build_cli_args
+
+      args.should contain("--future-flag")
+      args.should contain("plain")
+      args.should contain("--bool-flag")
+      args.should_not contain("--future-flag=plain")
+    end
+
     it "accepts --flag-style keys in extra_args without double-prefixing" do
       extra = {} of String => String?
       extra["--custom-flag"] = "x"
@@ -606,6 +663,85 @@ describe TestableCLIClient do
       env = client.test_build_env
       env.should_not be_nil
       env.try(&.["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"]?).should be_nil
+    end
+
+    it "always sets CLAUDE_AGENT_SDK_VERSION to ClaudeAgent::VERSION" do
+      client = TestableCLIClient.new(ClaudeAgent::AgentOptions.new)
+      env = client.test_build_env
+
+      env.should_not be_nil
+      env.try(&.["CLAUDE_AGENT_SDK_VERSION"]?).should eq(ClaudeAgent::VERSION)
+    end
+
+    it "preserves CLAUDE_AGENT_SDK_VERSION when options.env already sets it" do
+      options = ClaudeAgent::AgentOptions.new(
+        env: {"CLAUDE_AGENT_SDK_VERSION" => "custom-version", "OTHER" => "kept"},
+      )
+      env = TestableCLIClient.new(options).test_build_env
+
+      env.try(&.["CLAUDE_AGENT_SDK_VERSION"]?).should eq("custom-version")
+      env.try(&.["OTHER"]?).should eq("kept")
+      env.try(&.["CLAUDE_CODE_ENTRYPOINT"]?).should eq("sdk-cr")
+    end
+
+    it "still sets CLAUDE_AGENT_SDK_VERSION when options.env is provided without it" do
+      options = ClaudeAgent::AgentOptions.new(env: {"FOO" => "bar"})
+      env = TestableCLIClient.new(options).test_build_env
+
+      env.try(&.["FOO"]?).should eq("bar")
+      env.try(&.["CLAUDE_AGENT_SDK_VERSION"]?).should eq(ClaudeAgent::VERSION)
+    end
+
+    it "sets CLAUDE_CODE_QUESTION_PREVIEW_FORMAT from tool_config" do
+      tool_config = ClaudeAgent::ToolConfig.new(
+        ask_user_question: ClaudeAgent::AskUserQuestionConfig.new(preview_format: "html"),
+      )
+      options = ClaudeAgent::AgentOptions.new(tool_config: tool_config)
+      env = TestableCLIClient.new(options).test_build_env
+
+      env.try(&.["CLAUDE_CODE_QUESTION_PREVIEW_FORMAT"]?).should eq("html")
+    end
+
+    it "omits CLAUDE_CODE_QUESTION_PREVIEW_FORMAT when tool_config is unset" do
+      env = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_env
+      env.try(&.has_key?("CLAUDE_CODE_QUESTION_PREVIEW_FORMAT")).should be_false
+    end
+  end
+
+  describe "debug CLI flags" do
+    it "emits --debug when debug is true" do
+      options = ClaudeAgent::AgentOptions.new(debug: true)
+      args = TestableCLIClient.new(options).test_build_cli_args
+
+      args.should contain("--debug")
+      args.should_not contain("--debug-file")
+    end
+
+    it "does not emit --debug by default" do
+      args = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_cli_args
+      args.should_not contain("--debug")
+      args.should_not contain("--debug-file")
+    end
+
+    it "emits --debug-file and omits --debug when debug_file is set" do
+      options = ClaudeAgent::AgentOptions.new(
+        debug: true,
+        debug_file: "/tmp/claude-debug.log",
+      )
+      args = TestableCLIClient.new(options).test_build_cli_args
+
+      args.should contain("--debug-file")
+      args.should contain("/tmp/claude-debug.log")
+      args.should_not contain("--debug")
+    end
+
+    it "uses equals form for dash-leading debug_file paths" do
+      options = ClaudeAgent::AgentOptions.new(debug_file: "--evil-path")
+      args = TestableCLIClient.new(options).test_build_cli_args
+
+      args.should contain("--debug-file=--evil-path")
+      args.should_not contain("--evil-path")
+      args.index("--debug-file").should be_nil
     end
   end
 
@@ -832,6 +968,78 @@ describe TestableCLIClient do
         net["allowUnixSockets"].as_a.map(&.as_s).should eq(["/tmp/socket1", "/tmp/socket2"])
         net["httpProxyPort"].as_i.should eq(8080)
         net["socksProxyPort"].as_i.should eq(1080)
+      end
+    end
+
+    it "builds JSON for sandbox.network.strictAllowlist and domain allowlists" do
+      network = ClaudeAgent::SandboxNetworkSettings.new(
+        allowed_domains: ["api.example.com", "*.cdn.example.com"],
+        denied_domains: ["evil.example.com"],
+        allow_managed_domains_only: true,
+        allow_mach_lookup: ["com.apple.*"],
+        strict_allowlist: true,
+      )
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, network: network)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+
+      if json
+        net = JSON.parse(json)["sandbox"]["network"]
+        net["allowedDomains"].as_a.map(&.as_s).should eq(["api.example.com", "*.cdn.example.com"])
+        net["deniedDomains"].as_a.map(&.as_s).should eq(["evil.example.com"])
+        net["allowManagedDomainsOnly"].as_bool.should be_true
+        net["allowMachLookup"].as_a.map(&.as_s).should eq(["com.apple.*"])
+        net["strictAllowlist"].as_bool.should be_true
+      end
+    end
+
+    it "emits strictAllowlist false when explicitly disabled" do
+      network = ClaudeAgent::SandboxNetworkSettings.new(strict_allowlist: false)
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, network: network)
+      options = ClaudeAgent::AgentOptions.new(sandbox: sandbox)
+
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        JSON.parse(json)["sandbox"]["network"]["strictAllowlist"].as_bool.should be_false
+      end
+    end
+
+    it "emits workflowSizeGuideline without sandbox" do
+      options = ClaudeAgent::AgentOptions.new(workflow_size_guideline: "medium")
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        parsed = JSON.parse(json)
+        parsed["workflowSizeGuideline"].as_s.should eq("medium")
+        parsed.as_h.has_key?("sandbox").should be_false
+      end
+    end
+
+    it "merges workflowSizeGuideline with sandbox settings" do
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true)
+      options = ClaudeAgent::AgentOptions.new(
+        sandbox: sandbox,
+        workflow_size_guideline: "small",
+      )
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        parsed = JSON.parse(json)
+        parsed["workflowSizeGuideline"].as_s.should eq("small")
+        parsed["sandbox"]["enabled"].as_bool.should be_true
+      end
+    end
+
+    it "passes workflowSizeGuideline via --settings CLI arg" do
+      options = ClaudeAgent::AgentOptions.new(workflow_size_guideline: "large")
+      args = TestableCLIClient.new(options).test_build_cli_args
+      idx = args.index("--settings")
+      idx.should_not be_nil
+      if idx
+        JSON.parse(args[idx + 1])["workflowSizeGuideline"].as_s.should eq("large")
       end
     end
 

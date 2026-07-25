@@ -28,7 +28,11 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **Permission Modes**: `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk`.
 *   **Session Management**: Resume, fork, delete, and continue conversations with precise message-level resume.
 *   **Session History & Subagents**: List saved sessions, fork a session branch (`fork_session`), list subagents (`list_subagents`), read subagent transcripts (`get_subagent_messages`), delete sessions (`delete_session`).
+*   **SessionStore**: Mirror transcripts to external storage (`InMemorySessionStore`, `FileSessionStore`, or a custom adapter). Live CLI `--session-mirror` via `TranscriptMirrorBatcher`; resume materialization from the store; `SessionStoreConformance` suite for adapter authors.
+*   **Models**: Free-form model strings plus `ClaudeAgent::Models::*` convenience constants (Sonnet/Opus/Haiku 4.x–5.x, Fable, Mythos — no `claude-mythos-preview`).
+*   **Tool Output Helpers**: Optional parsers for Bash / Agent / Skill / NotebookEdit / MCP resource / WebSearch tool results (`BuiltinTools` name constants).
 *   **Transcript Controls**: `should_query: false` to append user messages without triggering a turn; `include_system_messages` on `get_session_messages`.
+*   **Debug / Telemetry**: `debug` / `debug_file` CLI flags; always stamp `CLAUDE_AGENT_SDK_VERSION` on the subprocess.
 *   **File Checkpointing**: Track and rewind file changes, plus `rewind_conversation` to truncate the transcript itself.
 *   **Sandbox Support**: Configure sandboxed execution environments, including credential masking/denial via `sandbox.credentials`.
 *   **Managed Settings**: Pass policy-tier settings to the CLI in-memory via `managed_settings` (honored below IT-controlled managed sources).
@@ -55,7 +59,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.8.0
+        version: ~> 0.9.0
     ```
 
 2.  Run `shards install`
@@ -211,6 +215,12 @@ ClaudeAgent::AgentClient.open do |client|
     puts "Commands available: #{info.commands.size}"
     puts "Output style: #{info.output_style || "default"}"
     puts "Supported agents: #{client.supported_agents.map(&.name).join(", ")}"
+    puts "Fast mode: #{info.fast_mode_state || "(unknown)"}"
+    puts "  disabled reason: #{info.fast_mode_disabled_reason}" if info.fast_mode_disabled_reason
+    info.plugin_infos.each do |plugin|
+      version = plugin.version || "(no version)"
+      puts "Plugin #{plugin.name} #{version}"
+    end
   end
 end
 ```
@@ -295,6 +305,45 @@ options = ClaudeAgent::AgentOptions.new(
 
 ClaudeAgent.query("List files", options) { |msg| puts msg }
 ```
+
+### Model IDs
+
+`AgentOptions#model` and `AgentClient#set_model` accept free-form strings. The
+CLI decides which IDs are available for your account; the SDK does not restrict
+them to an enum. Common IDs (and convenience constants under
+`ClaudeAgent::Models`) include:
+
+| Constant | Model ID | Notes |
+| --- | --- | --- |
+| `Models::SONNET_5` | `claude-sonnet-5` | Claude 5 Sonnet |
+| `Models::OPUS_5` | `claude-opus-5` | Claude 5 Opus |
+| `Models::FABLE_5` | `claude-fable-5` | Claude 5 Fable (`Models::FABLE` → `"fable"` alias) |
+| `Models::MYTHOS_5` | `claude-mythos-5` | Claude 5 Mythos (`Models::MYTHOS` → `"mythos"` alias) |
+| `Models::OPUS_4_8` | `claude-opus-4-8` | Opus 4.8 |
+| `Models::OPUS_4_7` | `claude-opus-4-7` | Opus 4.7 (common default in examples) |
+| `Models::OPUS_4_6` | `claude-opus-4-6` | Opus 4.6 |
+| `Models::OPUS_4_5` | `claude-opus-4-5` | Opus 4.5 |
+| `Models::SONNET_4_6` | `claude-sonnet-4-6` | Sonnet 4.6 |
+| `Models::SONNET_4_5` | `claude-sonnet-4-5` | Sonnet 4.5 |
+| `Models::HAIKU_4_5` | `claude-haiku-4-5` | Haiku 4.5 (good fallback) |
+
+```crystal
+options = ClaudeAgent::AgentOptions.new(
+  model: ClaudeAgent::Models::OPUS_4_7,
+  fallback_model: ClaudeAgent::Models::HAIKU_4_5,
+)
+
+ClaudeAgent::AgentClient.open(options) do |client|
+  client.query("Summarize this repo in one sentence.")
+  client.each_response { |message| puts message }
+
+  # Swap models live when the CLI supports the target ID
+  client.set_model(ClaudeAgent::Models::SONNET_4_6)
+end
+```
+
+Use `client.get_server_info.try(&.models)` to list models the connected CLI
+actually advertises (including capability flags such as `supports_fast_mode?`).
 
 ### Preset Types
 
@@ -878,6 +927,86 @@ ClaudeAgent.tag_session("session-uuid-here", "experiment", directory: Dir.curren
 ClaudeAgent.tag_session("session-uuid-here", nil, directory: Dir.current)
 ```
 
+### SessionStore (external transcript mirror)
+
+Mirror session JSONL to an external adapter while the CLI still writes locally.
+When `session_store` is set, the SDK passes `--session-mirror`, peels
+`transcript_mirror` frames off the stream (they are **not** yielded to
+`each_response`), and appends them via `TranscriptMirrorBatcher`.
+
+Built-in adapters:
+
+| Adapter | Use |
+| --- | --- |
+| `InMemorySessionStore` | Tests and short-lived demos |
+| `FileSessionStore` | Durable on-disk store (zero extra deps) |
+
+Custom adapters implement `SessionStore` (`append` / `load` required; optional
+`list_sessions`, `delete`, `list_subkeys`, summaries). Validate with:
+
+```crystal
+ClaudeAgent::SessionStoreConformance.run(my_store)
+```
+
+```crystal
+store = ClaudeAgent::FileSessionStore.new("/var/lib/claude-sessions")
+
+options = ClaudeAgent::AgentOptions.new(
+  session_store: store,
+  session_store_flush: "batched", # or "eager" (flush every mirror frame)
+  # resume: existing_session_id,  # materializes JSONL into a temp CLAUDE_CONFIG_DIR
+  max_turns: 5,
+)
+
+ClaudeAgent::AgentClient.open(options) do |client|
+  client.query("Refactor the README intro")
+  client.each_response do |message|
+    case message
+    when ClaudeAgent::ResultMessage
+      puts "done: #{message.subtype} terminal=#{message.terminal_reason}"
+      # Typed per-model billing breakdown (breaking in 0.9.0)
+      message.model_usage.try(&.each) do |model_id, usage|
+        puts "#{model_id}: $#{usage.cost_usd} canonical=#{usage.canonical_model}"
+      end
+    when ClaudeAgent::MirrorErrorMessage
+      STDERR.puts "store append failed: #{message.error}"
+    end
+  end
+end
+
+# Offline helpers (no live CLI)
+ClaudeAgent.import_session_to_store("session-uuid", store, directory: Dir.current)
+sessions = ClaudeAgent.list_sessions_from_store(store, directory: Dir.current)
+```
+
+See `examples/44_session_store.cr` and `examples/session-stores/` (file demo +
+Redis/Postgres **reference** adapters — optional `redis` / `pg` shards).
+
+**Notes:**
+- `session_store` cannot be combined with `enable_file_checkpointing`.
+- `continue_conversation` with a store requires `list_sessions` on the adapter.
+- Resume materialization copies a redacted `.credentials.json` (refresh token
+  stripped) and `.claude.json` into the temp config dir when present.
+
+### Tool result / tool_use sidecars
+
+```crystal
+# Assistant tool chips (CLI v2.1.179+)
+if msg.is_a?(ClaudeAgent::AssistantMessage)
+  msg.tool_use_meta_for("toolu_…").try(&.display_name)
+end
+
+# Non-executed tool results (denied / interrupted). CLI emits an *array*
+# of entries with `id`, `non_execution_kind`, `user_feedback` (v2.1.220+).
+if msg.is_a?(ClaudeAgent::UserMessage)
+  msg.tool_result_meta_for("toolu_…").try(&.non_execution_kind)
+end
+
+# Optional structured parsers for known tool_use_result JSON:
+ClaudeAgent::BashToolOutput.parse(result_json).try(&.timed_out_after_ms)
+ClaudeAgent::BuiltinTools::READ  # "Read"
+```
+
 ### File Checkpointing
 
 Track and rewind file changes.
@@ -1155,8 +1284,8 @@ require "claude-agent-cr"
 
 options = ClaudeAgent::AgentOptions.new(
   # --- Core model + system prompt ----------------------------------------
-  model: "claude-opus-4-7",              # alias or full model ID
-  fallback_model: "claude-haiku-4-5",    # used on rate-limit or model failure
+  model: ClaudeAgent::Models::OPUS_4_7,  # free-form String or Models::* constant
+  fallback_model: ClaudeAgent::Models::HAIKU_4_5, # used on rate-limit or model failure
   system_prompt: "You are a helpful assistant.", # String, preset, or file:
   # system_prompt: ClaudeAgent::SystemPromptPreset.claude_code(
   #   "Always use Crystal best practices.",
@@ -1268,7 +1397,7 @@ end
 
 ## Status
 
-> Developed against Claude Code CLI **v2.1.201**. The SDK is forward-compatible:
+> Developed against Claude Code CLI **v2.1.220**. The SDK is forward-compatible:
 > features that require newer CLI versions are gracefully no-op or surface a
 > clear error on older CLIs.
 
@@ -1306,6 +1435,9 @@ Refer to the dedicated [Deployment Guide](DEPLOYMENT.md) for:
 | Hook Propagation | ✅ Working | Hook callbacks can modify inputs and return CLI hook outputs |
 | Permission Propagation | ✅ Working | Permission callbacks can update input, permissions, interrupt; context now exposes `tool_use_id`, `agent_id`, `blocked_path` |
 | Session History | ✅ Working | List, inspect, rename, and tag local sessions |
+| SessionStore | ✅ Working | InMemory + File adapters, live `--session-mirror`, resume materialize, conformance suite |
+| Models helpers | ✅ Working | `ClaudeAgent::Models::*` constants; free-form model strings |
+| Tool output helpers | ✅ Working | Bash/Agent/Skill/Notebook/MCP resource/WebSearch parsers |
 | File Checkpointing | ✅ Working | Track and rewind file changes |
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
 | Extended Thinking | ✅ Working | `thinking` (adaptive/enabled/disabled), `effort` (including `xhigh`), `max_thinking_tokens` |
@@ -1368,6 +1500,38 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.9.0
+
+Parity release aligned with Claude Code CLI **v2.1.220** and the official Python (`0.2.128`) / TypeScript (`0.3.220`) SDKs. Brings typed result/usage surfaces, control-protocol interrupt receipts, transport hardening, and new lifecycle hooks.
+
+**Breaking changes**:
+- **`ResultMessage#model_usage`**: now `Hash(String, ModelUsage)?` instead of `Hash(String, JSON::Any)?`. Use typed fields (`input_tokens`, `cost_usd`, `canonical_model`, `provider`, …) instead of hash key indexing.
+- **`ResultMessage#permission_denials`**: now `Array(PermissionDenial)?` instead of `Array(JSON::Any)?`.
+
+**New features**:
+- **Typed `ModelUsage`**: per-model token/cost breakdown with optional `canonical_model` and `provider` for billing lookups (TS `0.3.218` / Py `0.2.126`).
+- **Result metadata**: `fast_mode_disabled_reason`, `user_message_uuid`, `request_sent_wall_ms`; expanded `TERMINAL_REASONS` docs.
+- **Message envelope**: `UserMessage#tool_result_meta` as an **array** of `{id, non_execution_kind, user_feedback}` entries (CLI 2.1.220 wire shape; single-object still accepted); helpers `tool_result_meta_for(id)`. `AssistantMessage#timestamp` / `#aborted`; `MessageOrigin#subkind` / `#body`.
+- **Lifecycle system messages**: `CommandLifecycleMessage`, `BackgroundTasksChangedMessage`, `ModelFallbackMessage`, `WorkerShuttingDownMessage`, `ToolProgressMessage` (with `subagent_type` / `subagent_retry` / `blocked`).
+- **Rate limits**: `error_code`, purchase/payment fields, `model_scoped` windows; typed `PermissionDenial` reasons; alpha `USAGE_LIMIT_ERROR_PREFIXES` (+ warning/transition/org-policy lists).
+- **Interrupt receipts**: `AgentClient#interrupt(cancel_queued:)` returns `InterruptReceipt` with `still_queued` and optional `cancelled` UUIDs (TS `0.3.205` / `0.3.219`).
+- **`reinitialize`**: re-send initialize after a transport gap and re-advertise hooks/agents (hook registry guarded by mutex).
+- **Permission OOB**: `PermissionContext#request_id`; `PermissionResult.suppress` skips the automatic control response; `AgentClient#respond_to_permission` completes the later allow/deny reply.
+- **`seed_read_state`**: seed `readFileState` `{path, mtime}` so `Edit` works after a `Read` left context.
+- **MCP timeouts**: optional per-server `request_timeout_ms` on `set_mcp_servers`.
+- **Permission mode `"manual"`**: alias for `"default"`; unknown modes raise.
+- **Background-task aware `each_response`**: keeps reading while local agents/workflows are in flight.
+- **Sandbox / settings**: `sandbox.network.strictAllowlist`; `workflow_size_guideline`; equals-form `--resume=` / `--session-id=` / dash-safe `extra_args`.
+- **`can_use_tool` shadow warning**: non-fatal warning when the callback is shadowed by `allowed_tools` or `bypassPermissions`.
+- **Hooks**: `MessageDisplay` and `DirectoryAdded` (initialize payload + callback dispatch).
+- **Server info**: typed `ServerPluginInfo` via `#plugin_infos` (manifest `version`); `fast_mode_disabled_reason` on init.
+- **Sessions**: `SessionMessage#parent_agent_id` for depth-2+ agent trees.
+- **SessionStore**: `SessionStore` + `InMemorySessionStore` + **`FileSessionStore`**; options `session_store` / `session_store_flush` / `load_timeout_ms`; import/via-store helpers; **`SessionStoreConformance`**; live `--session-mirror` + `TranscriptMirrorBatcher` + `MirrorErrorMessage`; resume materialize (subkeys, redacted credentials, `.claude.json`, retry cleanup). Examples: `44_session_store.cr`, `examples/session-stores/`.
+- **Tool output helpers**: `BashToolOutput`, `AgentToolCompletedOutput` / `AgentToolQueuedOutput`, `SkillToolOutput`, `NotebookEditOutput`, `ReadMcpResourceDirOutput`, `ReadMcpResourceOutput`, `WebSearchToolOutput`, `BuiltinTools` name constants.
+- **CLI/debug**: `debug` / `debug_file`; always set `CLAUDE_AGENT_SDK_VERSION` in subprocess env; `tool_config.ask_user_question.preview_format` via `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT`.
+- **User message meta**: `is_meta` / `is_synthetic` / `file_attachments`; `isSynthetic` maps to `is_meta`.
+- **Models**: `ClaudeAgent::Models::*` convenience constants (no `claude-mythos-preview`); example `examples/43_models.cr`.
 
 ### 0.8.0
 
@@ -1556,7 +1720,7 @@ New capabilities / fields:
 
 ## Verified Examples
 
-The following examples have been tested and verified with CLI v2.1.201:
+The following examples have been tested and verified with CLI v2.1.220:
 
 - One-shot queries and streaming (examples 01, 02, 03)
 - Tool restrictions and permission modes (examples 04, 05)
@@ -1582,6 +1746,9 @@ The following examples have been tested and verified with CLI v2.1.201:
 - Runtime MCP + plugin controls (example 40)
 - Adaptive thinking display (example 41)
 - New-features showcase — `TaskUpdatedMessage`, `tool_use_meta`, `refusal?`, `origin`, `forward_subagent_text`, `managed_settings`, sandbox credentials (example 42, the fruit template)
+- Model ID constants and live `set_model` (example 43)
+- SessionStore offline helpers (`InMemorySessionStore`, import/rename/tag/delete) (example 44)
+- SessionStore adapters under `examples/session-stores/` — File demo + conformance, Redis/Postgres reference implementations
 
 Examples with environment-dependent behavior:
 
@@ -1591,13 +1758,15 @@ Examples with environment-dependent behavior:
 - `examples/32_elicitation_support.cr` requires `ELICITATION_MCP_URL` and a compatible MCP server that actually requests user input
 - `examples/38_context_usage.cr`, `examples/39_new_hooks.cr`, and `examples/40_mcp_runtime.cr` exercise features that require a newer Claude Code CLI; older CLIs degrade gracefully
 - `examples/42_fruit_template.cr` exercises `tool_use_meta` and `sandbox.credentials` paths that only surface on CLI v2.1.179+/v2.1.187+; the rest degrades gracefully
+- `examples/43_models.cr` / live SessionStore mirror require a logged-in CLI; model IDs depend on account/CLI support
+- `examples/session-stores/redis_session_store.cr` and `postgres_session_store.cr` are **reference** adapters (optional `redis` / `pg` shards); not run as part of the default example set
 
 Quick guide:
 
-- Best local/default examples: `01`, `02`, `07`, `14`, `16`, `25`, `26`, `27`, `28`, `29`, `31`, `33`, `36`, `37`, `42`
+- Best local/default examples: `01`, `02`, `07`, `14`, `16`, `25`, `26`, `27`, `28`, `29`, `31`, `33`, `36`, `37`, `42`, `43`
 - Best hook-focused examples: `13`, `20`, `21`, `22`, `23`, `28`, `39`
 - Best MCP-focused examples: `06_sdk_mcp_server`, `12`, `17`, `18`, `19`, `40`
-- Best session-focused examples: `25`, `30`, `33`, `36`
+- Best session-focused examples: `25`, `30`, `33`, `36`, `44`, `session-stores/file_demo`
 
 ## Optional Live E2E Specs
 

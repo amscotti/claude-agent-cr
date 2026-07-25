@@ -12,12 +12,13 @@ module ClaudeAgent
       "assistant" => ->(json : String, _data : MessageData) { AssistantMessage.from_json(json).as(Message) },
       # mirror_error intentionally handled in parse_special_message so we can
       # derive defaults when fields are missing.
-      "user"               => ->(json : String, _data : MessageData) { UserMessage.from_json(json).as(Message) },
+      "user"               => ->(json : String, data : MessageData) { UserMessage.parse_envelope(json, data).as(Message) },
       "result"             => ->(json : String, _data : MessageData) { ResultMessage.from_json(json).as(Message) },
       "permission_request" => ->(json : String, _data : MessageData) { PermissionRequest.from_json(json).as(Message) },
       "prompt_suggestion"  => ->(json : String, _data : MessageData) { PromptSuggestionMessage.from_json(json).as(Message) },
       "user_question"      => ->(json : String, _data : MessageData) { UserQuestion.from_json(json).as(Message) },
       "stream_event"       => ->(json : String, _data : MessageData) { StreamEvent.from_json(json).as(Message) },
+      "tool_progress"      => ->(json : String, _data : MessageData) { ToolProgressMessage.from_json(json).as(Message) },
       "control_request"    => ->(json : String, _data : MessageData) { ControlRequest.from_json(json).as(Message) },
       "control_response"   => ->(json : String, _data : MessageData) { ControlResponseMessage.from_json(json).as(Message) },
     }
@@ -108,6 +109,14 @@ module ClaudeAgent
         parse_status_message(message, session_id)
       when "hook_started", "hook_response"
         parse_hook_event(message, session_id)
+      when "command_lifecycle"
+        parse_command_lifecycle(message, session_id)
+      when "background_tasks_changed"
+        parse_background_tasks_changed(message, session_id)
+      when "model_fallback"
+        parse_model_fallback(message, session_id)
+      when "worker_shutting_down"
+        parse_worker_shutting_down(message, session_id)
       else
         nil
       end
@@ -268,6 +277,80 @@ module ClaudeAgent
       )
       HookEventMessage.new(session_id, data, uuid, subtype, hook_event_name)
     end
+
+    # Reports a uuid-stamped command/message's lifecycle state
+    # (queued/started/completed/cancelled/discarded). Matches the TS SDK's
+    # command_lifecycle frames (0.3.206+).
+    private def self.parse_command_lifecycle(data : MessageData, session_id : String) : Message
+      uuid = data["uuid"]?.try(&.as_s)
+      state = data["state"]?.try(&.as_s)
+      return GenericSystemMessage.new("command_lifecycle", session_id, data) unless uuid && state
+
+      CommandLifecycleMessage.new(
+        session_id,
+        data,
+        uuid,
+        state,
+        data["message_uuid"]?.try(&.as_s?) || data["messageUuid"]?.try(&.as_s?),
+      )
+    end
+
+    # Full-set membership of live background tasks (REPLACE semantics).
+    # Matches the TS SDK's `SDKBackgroundTasksChangedMessage` (0.3.203+).
+    private def self.parse_background_tasks_changed(data : MessageData, session_id : String) : Message
+      tasks_raw = data["tasks"]?.try(&.as_a?)
+      return GenericSystemMessage.new("background_tasks_changed", session_id, data) unless tasks_raw
+
+      tasks = tasks_raw.compact_map do |entry|
+        hash = entry.as_h?
+        next unless hash
+        task_id = hash["task_id"]?.try(&.as_s?) || hash["taskId"]?.try(&.as_s?)
+        next unless task_id
+        BackgroundTaskEntry.new(
+          task_id: task_id,
+          task_type: hash["task_type"]?.try(&.as_s?) || hash["taskType"]?.try(&.as_s?),
+          description: hash["description"]?.try(&.as_s?),
+        )
+      end
+
+      BackgroundTasksChangedMessage.new(
+        session_id,
+        data,
+        tasks,
+        data["uuid"]?.try(&.as_s?),
+      )
+    end
+
+    # Model fallback trigger (distinct from model_refusal_fallback).
+    # Triggers: model_not_found, permission_denied, overloaded,
+    # server_error, last_resort. Matches TS SDK 0.3.174+.
+    private def self.parse_model_fallback(data : MessageData, session_id : String) : Message
+      trigger = data["trigger"]?.try(&.as_s)
+      return GenericSystemMessage.new("model_fallback", session_id, data) unless trigger
+
+      ModelFallbackMessage.new(
+        session_id,
+        data,
+        trigger,
+        data["original_model"]?.try(&.as_s?) || data["originalModel"]?.try(&.as_s?),
+        data["fallback_model"]?.try(&.as_s?) || data["fallbackModel"]?.try(&.as_s?),
+        data["uuid"]?.try(&.as_s?),
+      )
+    end
+
+    # Remote Control worker graceful exit notice. Matches the TS SDK's
+    # `SDKWorkerShuttingDownMessage` (0.3.178+).
+    private def self.parse_worker_shutting_down(data : MessageData, session_id : String) : Message
+      reason = data["reason"]?.try(&.as_s)
+      return GenericSystemMessage.new("worker_shutting_down", session_id, data) unless reason
+
+      WorkerShuttingDownMessage.new(
+        session_id,
+        data,
+        reason,
+        data["uuid"]?.try(&.as_s?),
+      )
+    end
   end
 
   # Display-friendly metadata for one `tool_use` block on an assistant
@@ -339,6 +422,14 @@ module ClaudeAgent
     # subagent that sent the message.
     @[JSON::Field(key: "senderTaskId")]
     getter sender_task_id : String?
+    # For "task-notification": e.g. "scheduled-trigger" when the delivery
+    # is the fired prompt of a user-configured scheduled task. Matches
+    # the TS SDK's `SDKMessageOrigin` subkind (0.3.214+).
+    getter subkind : String?
+    # For "peer": decoded message body with the peer envelope stripped.
+    # Present only when the turn is a harness-formed envelope; render
+    # this instead of re-parsing the message text. Matches TS 0.3.205+.
+    getter body : String?
 
     def initialize(
       @kind : String,
@@ -346,6 +437,8 @@ module ClaudeAgent
       @from : String? = nil,
       @name : String? = nil,
       @sender_task_id : String? = nil,
+      @subkind : String? = nil,
+      @body : String? = nil,
     )
     end
 
@@ -357,6 +450,11 @@ module ClaudeAgent
     # True when this result is a background-task followup.
     def task_notification? : Bool
       kind == "task-notification"
+    end
+
+    # True when this is a scheduled-task fired prompt delivery.
+    def scheduled_trigger? : Bool
+      subkind == "scheduled-trigger"
     end
   end
 
@@ -451,6 +549,19 @@ module ClaudeAgent
     # TS SDK's `tool_use_meta` (0.3.179 / 0.3.181).
     getter tool_use_meta : Array(ToolUseMeta)?
 
+    # ISO-8601 timestamp of when this content finished on the originating
+    # process. One API assistant turn may produce several assistant
+    # messages sharing a message.id, each with its own timestamp. Older
+    # emitters omit it; consumers should fall back to receive time.
+    # Matches the TS SDK's `SDKAssistantMessage.timestamp` (0.3.211+).
+    getter timestamp : String?
+
+    # True when this assistant message was truncated by an interrupt/abort
+    # before the stream completed (`stop_reason` was never received and
+    # content may end mid-word). Absent on normally completed messages.
+    # Matches the TS SDK's `aborted` (0.3.214+).
+    getter aborted : Bool?
+
     def content
       message.content
     end
@@ -486,6 +597,11 @@ module ClaudeAgent
     # consumers branch on refusals without text-matching the content.
     def refusal? : Bool
       message.stop_reason == "refusal"
+    end
+
+    # True when the message was truncated mid-stream by interrupt/abort.
+    def aborted? : Bool
+      aborted == true
     end
 
     # Look up display metadata for a specific `tool_use` block id.
@@ -538,6 +654,105 @@ module ClaudeAgent
     getter suggestion : String
   end
 
+  # Sidecar classifying a non-executed tool_result (denied, interrupted,
+  # cancelled, etc.) so consumers can avoid string-matching result prose.
+  # The CLI emits an *array* of these entries (keyed by tool use `id`),
+  # same shape as `tool_use_meta`. Matches the TS SDK's `tool_result_meta`
+  # (0.3.216+).
+  struct ToolResultMeta
+    include JSON::Serializable
+
+    # Tool-use block id this meta entry refers to.
+    getter id : String?
+    # Why the tool did not execute, e.g. "denied", "interrupted",
+    # "cancelled", "deferred". Open string for forward compatibility.
+    getter non_execution_kind : String?
+    # Optional user-facing feedback accompanying the non-execution
+    # (e.g. the deny message shown to the model).
+    getter user_feedback : String?
+
+    def initialize(
+      @id : String? = nil,
+      @non_execution_kind : String? = nil,
+      @user_feedback : String? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : ToolResultMeta?
+      data = value.as_h?
+      return nil unless data
+
+      new(
+        id: data["id"]?.try(&.as_s?),
+        non_execution_kind: data["non_execution_kind"]?.try(&.as_s?) ||
+                            data["nonExecutionKind"]?.try(&.as_s?),
+        user_feedback: data["user_feedback"]?.try(&.as_s?) ||
+                       data["userFeedback"]?.try(&.as_s?),
+      )
+    end
+
+    def self.from_any_array(value : JSON::Any?) : Array(ToolResultMeta)?
+      return nil unless value
+
+      if arr = value.as_a?
+        result = arr.compact_map { |entry| from_any(entry) }
+        return result.empty? ? nil : result
+      end
+
+      # Older sketches used a single object instead of an array.
+      if single = from_any(value)
+        return [single]
+      end
+
+      nil
+    end
+  end
+
+  # Optional file attachment on a live user message (or user-message
+  # replay). Wire shapes vary; only common fields are typed. Extra keys
+  # remain available via `raw`. Matches TS SDK `file_attachments` (0.3.181+).
+  struct FileAttachment
+    include JSON::Serializable
+
+    getter path : String?
+    getter name : String?
+    @[JSON::Field(key: "media_type")]
+    getter media_type : String?
+    @[JSON::Field(ignore: true)]
+    getter raw : Hash(String, JSON::Any)?
+
+    def initialize(
+      @path : String? = nil,
+      @name : String? = nil,
+      @media_type : String? = nil,
+      @raw : Hash(String, JSON::Any)? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : FileAttachment?
+      data = value.as_h?
+      return nil unless data
+
+      new(
+        path: data["path"]?.try(&.as_s?),
+        name: data["name"]?.try(&.as_s?) || data["filename"]?.try(&.as_s?),
+        media_type: data["media_type"]?.try(&.as_s?) ||
+                    data["mediaType"]?.try(&.as_s?) ||
+                    data["mime_type"]?.try(&.as_s?) ||
+                    data["mimeType"]?.try(&.as_s?),
+        raw: data,
+      )
+    end
+
+    def self.from_any_array(value : JSON::Any?) : Array(FileAttachment)?
+      arr = value.try(&.as_a?)
+      return nil unless arr
+
+      result = arr.compact_map { |entry| from_any(entry) }
+      result.empty? ? nil : result
+    end
+  end
+
   # Message from the user
   struct UserMessage < Message
     include JSON::Serializable
@@ -548,6 +763,82 @@ module ClaudeAgent
     getter message : Hash(String, JSON::Any)
     getter parent_tool_use_id : String?
     getter tool_use_result : JSON::Any?
+    # Sidecar array for non-executed tool calls (one entry per tool_use id).
+    # Absent when tools ran normally or on older CLIs. CLI v2.1.220 emits an
+    # array (same pattern as `tool_use_meta`). Matches TS SDK 0.3.216+.
+    @[JSON::Field(ignore: true)]
+    getter tool_result_meta : Array(ToolResultMeta)?
+    # True when this envelope is metadata/synthetic (not a real user
+    # prompt). Wire keys: `isMeta`, `is_meta`, or `isSynthetic` (mapped
+    # into `is_meta` on parse — TS SDK 0.3.198+).
+    getter is_meta : Bool?
+    # Optional explicit synthetic flag when the wire uses `isSynthetic`
+    # without also setting `isMeta`. Prefer `meta?` for classification.
+    getter is_synthetic : Bool?
+    # Optional file attachments on live / replayed user messages.
+    # Matches TS SDK `file_attachments` (0.3.181+).
+    getter file_attachments : Array(FileAttachment)?
+
+    def initialize(
+      @uuid : String? = nil,
+      @session_id : String = "",
+      @message : Hash(String, JSON::Any) = {} of String => JSON::Any,
+      @parent_tool_use_id : String? = nil,
+      @tool_use_result : JSON::Any? = nil,
+      @tool_result_meta : Array(ToolResultMeta)? = nil,
+      @is_meta : Bool? = nil,
+      @is_synthetic : Bool? = nil,
+      @file_attachments : Array(FileAttachment)? = nil,
+    )
+      @type = "user"
+    end
+
+    # True when this user envelope is meta/synthetic (not a real prompt).
+    def meta? : Bool
+      is_meta == true || is_synthetic == true
+    end
+
+    # Look up non-execution meta for a specific tool_use id.
+    def tool_result_meta_for(tool_use_id : String) : ToolResultMeta?
+      tool_result_meta.try(&.find { |meta| meta.id == tool_use_id })
+    end
+
+    # Parse a user envelope, normalizing dual wire keys and mapping
+    # `isSynthetic` → `is_meta` when `isMeta`/`is_meta` are absent.
+    def self.parse_envelope(json : String, data : MessageData) : UserMessage
+      base = from_json(json)
+
+      is_synthetic = data["isSynthetic"]?.try(&.as_bool?)
+      is_synthetic = data["is_synthetic"]?.try(&.as_bool?) if is_synthetic.nil?
+      is_synthetic = base.is_synthetic if is_synthetic.nil?
+
+      is_meta = data["isMeta"]?.try(&.as_bool?)
+      is_meta = data["is_meta"]?.try(&.as_bool?) if is_meta.nil?
+      is_meta = base.is_meta if is_meta.nil?
+      # TS SDK maps isSynthetic → isMeta on ingestion (0.3.198).
+      is_meta = is_synthetic if is_meta.nil? && !is_synthetic.nil?
+
+      # Prefer manual parse so mediaType / filename dual keys are handled.
+      attachments = FileAttachment.from_any_array(data["file_attachments"]?)
+      attachments = base.file_attachments if attachments.nil?
+
+      # CLI emits an array of meta entries (and historically may emit a
+      # single object). Never go through JSON::Serializable for this field.
+      meta = ToolResultMeta.from_any_array(data["tool_result_meta"]?)
+      meta = ToolResultMeta.from_any_array(data["toolResultMeta"]?) if meta.nil?
+
+      new(
+        uuid: base.uuid,
+        session_id: base.session_id,
+        message: base.message,
+        parent_tool_use_id: base.parent_tool_use_id,
+        tool_use_result: base.tool_use_result,
+        tool_result_meta: meta,
+        is_meta: is_meta,
+        is_synthetic: is_synthetic,
+        file_attachments: attachments,
+      )
+    end
   end
 
   # Base type for system messages emitted by the CLI
@@ -809,6 +1100,32 @@ module ClaudeAgent
     end
   end
 
+  # Per-model weekly rate-limit window entry (camelCase or snake_case).
+  # Appears on rate-limit / usage payloads as `model_scoped`.
+  struct ModelScopedRateLimit
+    getter display_name : String?
+    getter utilization : Float64?
+    getter resets_at : String?
+
+    def initialize(
+      @display_name : String? = nil,
+      @utilization : Float64? = nil,
+      @resets_at : String? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : ModelScopedRateLimit?
+      data = value.as_h?
+      return nil unless data
+
+      new(
+        display_name: data["display_name"]?.try(&.as_s?) || data["displayName"]?.try(&.as_s?),
+        utilization: data["utilization"]?.try { |v| v.as_f? || v.as_i64?.try(&.to_f64) },
+        resets_at: data["resets_at"]?.try(&.as_s?) || data["resetsAt"]?.try(&.as_s?),
+      )
+    end
+  end
+
   struct RateLimitInfo
     getter status : String
     getter resets_at : Int64?
@@ -817,6 +1134,17 @@ module ClaudeAgent
     getter overage_status : String?
     getter overage_resets_at : Int64?
     getter overage_disabled_reason : String?
+    # Credits-required rate-limit error code (e.g. "credits_required").
+    # Wire key is camelCase `errorCode`. Matches TS SDK 0.3.181+.
+    getter error_code : String?
+    # Whether the user can purchase credits to continue. Wire key
+    # `canUserPurchaseCredits`.
+    getter can_user_purchase_credits : Bool?
+    # Whether a chargeable saved payment method is on file. Wire key
+    # `hasChargeableSavedPaymentMethod`.
+    getter has_chargeable_saved_payment_method : Bool?
+    # Per-model weekly limit windows with utilization and reset times.
+    getter model_scoped : Array(ModelScopedRateLimit)?
     getter raw : MessageData
 
     def initialize(
@@ -827,6 +1155,10 @@ module ClaudeAgent
       @overage_status : String? = nil,
       @overage_resets_at : Int64? = nil,
       @overage_disabled_reason : String? = nil,
+      @error_code : String? = nil,
+      @can_user_purchase_credits : Bool? = nil,
+      @has_chargeable_saved_payment_method : Bool? = nil,
+      @model_scoped : Array(ModelScopedRateLimit)? = nil,
       @raw : MessageData = {} of String => JSON::Any,
     )
     end
@@ -834,6 +1166,19 @@ module ClaudeAgent
     def self.from_data(data : MessageData) : RateLimitInfo?
       status = data["status"]?.try(&.as_s?)
       return nil unless status
+
+      model_scoped = data["model_scoped"]?.try(&.as_a?).try do |arr|
+        arr.compact_map { |entry| ModelScopedRateLimit.from_any(entry) }
+      end
+      model_scoped ||= data["modelScoped"]?.try(&.as_a?).try do |arr|
+        arr.compact_map { |entry| ModelScopedRateLimit.from_any(entry) }
+      end
+
+      can_purchase = data["canUserPurchaseCredits"]?.try(&.as_bool?)
+      can_purchase = data["can_user_purchase_credits"]?.try(&.as_bool?) if can_purchase.nil?
+
+      has_payment = data["hasChargeableSavedPaymentMethod"]?.try(&.as_bool?)
+      has_payment = data["has_chargeable_saved_payment_method"]?.try(&.as_bool?) if has_payment.nil?
 
       new(
         status: status,
@@ -843,6 +1188,10 @@ module ClaudeAgent
         overage_status: data["overageStatus"]?.try(&.as_s?),
         overage_resets_at: data["overageResetsAt"]?.try(&.as_i64?),
         overage_disabled_reason: data["overageDisabledReason"]?.try(&.as_s?),
+        error_code: data["errorCode"]?.try(&.as_s?) || data["error_code"]?.try(&.as_s?),
+        can_user_purchase_credits: can_purchase,
+        has_chargeable_saved_payment_method: has_payment,
+        model_scoped: model_scoped,
         raw: data,
       )
     end
@@ -862,6 +1211,42 @@ module ClaudeAgent
     "seven_day_overage_included",
     "overage",
   }
+
+  # Rate-limit / usage-limit message prefix buckets for classifying free-text
+  # rate-limit notices without hand-mirrored lists. Alpha parity with the TS
+  # SDK's `@alpha` exports (0.3.211+). Match with `String#starts_with?`.
+  USAGE_LIMIT_ERROR_PREFIXES = [
+    "You've hit your",
+    "You've reached your",
+    "You're out of usage credits",
+    "Your org is out of usage · add funds to continue",
+    "Your org is out of usage · contact your admin",
+    "Your seat type doesn't include usage credits",
+    "Your seat type doesn't include usage",
+    "Your usage allocation has been disabled by your admin",
+    "Your group's usage limit is set to $0",
+    "Fable 5 requires usage credits",
+    "You're out of extra usage",
+    "Your seat type doesn't include extra usage",
+  ]
+
+  USAGE_WARNING_PREFIXES = [
+    "You've used",
+    "You're close to",
+  ]
+
+  USAGE_TRANSITION_PREFIXES = [
+    "You're now using usage credits",
+    "You're now using your usage allocation",
+    "Now using your usage allocation",
+    "Now using usage credits",
+    "You're now using extra usage",
+    "Now using extra usage",
+  ]
+
+  ORG_POLICY_LIMIT_PREFIXES = [
+    "This service is disabled for your org",
+  ]
 
   struct RateLimitEvent < Message
     getter type : String = "rate_limit_event"
@@ -1001,12 +1386,287 @@ module ClaudeAgent
     end
   end
 
+  # Recognized `command_lifecycle` states for a uuid-stamped message.
+  COMMAND_LIFECYCLE_STATES = Set{
+    "queued",
+    "started",
+    "completed",
+    "cancelled",
+    "discarded",
+  }
+
+  # Uuid-stamped command/message lifecycle frame. Reports terminal state
+  # transitions so hosts can track progress of individual commands in
+  # stream-json sessions. Matches TS SDK 0.3.206+.
+  struct CommandLifecycleMessage < SystemMessage
+    getter uuid : String
+    # Lifecycle state: queued / started / completed / cancelled / discarded.
+    getter state : String
+    # The uuid of the tracked command/message when distinct from `uuid`.
+    getter message_uuid : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @uuid : String,
+      @state : String,
+      @message_uuid : String? = nil,
+    )
+      super("command_lifecycle", session_id, data)
+    end
+
+    def terminal? : Bool
+      state == "completed" || state == "cancelled" || state == "discarded"
+    end
+  end
+
+  # One live background task as reported by `background_tasks_changed`.
+  struct BackgroundTaskEntry
+    getter task_id : String
+    getter task_type : String?
+    getter description : String?
+
+    def initialize(
+      @task_id : String,
+      @task_type : String? = nil,
+      @description : String? = nil,
+    )
+    end
+  end
+
+  # Full set of live background tasks after a membership change.
+  # REPLACE semantics: swap your active set for `tasks`. Matches the TS
+  # SDK's `SDKBackgroundTasksChangedMessage` (0.3.203+).
+  struct BackgroundTasksChangedMessage < SystemMessage
+    getter tasks : Array(BackgroundTaskEntry)
+    getter uuid : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @tasks : Array(BackgroundTaskEntry),
+      @uuid : String? = nil,
+    )
+      super("background_tasks_changed", session_id, data)
+    end
+  end
+
+  # Recognized `model_fallback` trigger values.
+  MODEL_FALLBACK_TRIGGERS = Set{
+    "model_not_found",
+    "permission_denied",
+    "overloaded",
+    "server_error",
+    "last_resort",
+  }
+
+  # Emitted when the CLI falls back to another model. Distinct from
+  # `model_refusal_fallback` (refusal category). Matches TS SDK 0.3.174+.
+  struct ModelFallbackMessage < SystemMessage
+    # Why fallback was triggered. See `MODEL_FALLBACK_TRIGGERS`.
+    getter trigger : String
+    getter original_model : String?
+    getter fallback_model : String?
+    getter uuid : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @trigger : String,
+      @original_model : String? = nil,
+      @fallback_model : String? = nil,
+      @uuid : String? = nil,
+    )
+      super("model_fallback", session_id, data)
+    end
+  end
+
+  # Remote Control worker graceful-exit notice so remote clients can
+  # show why the session ended. Matches TS SDK 0.3.178+.
+  struct WorkerShuttingDownMessage < SystemMessage
+    # Short snake_case reason from the host CLI (not user input), e.g.
+    # "host_exit", "remote_control_disabled".
+    getter reason : String
+    getter uuid : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @reason : String,
+      @uuid : String? = nil,
+    )
+      super("worker_shutting_down", session_id, data)
+    end
+  end
+
+  # Subagent rate-limit retry info nested on `tool_progress` messages.
+  struct SubagentRetryInfo
+    include JSON::Serializable
+
+    getter agent_id : String?
+    getter attempt : Int64?
+    getter max_retries : Int64?
+    getter retry_delay_ms : Int64?
+    getter error_status : Int64?
+    getter error_category : String?
+
+    def initialize(
+      @agent_id : String? = nil,
+      @attempt : Int64? = nil,
+      @max_retries : Int64? = nil,
+      @retry_delay_ms : Int64? = nil,
+      @error_status : Int64? = nil,
+      @error_category : String? = nil,
+    )
+    end
+  end
+
+  # Long-running tool progress (top-level `type: "tool_progress"`).
+  # Matches the TS SDK's `SDKToolProgressMessage` (with 0.3.214+ fields).
+  struct ToolProgressMessage < Message
+    include JSON::Serializable
+
+    getter type : String = "tool_progress"
+    getter uuid : String
+    getter session_id : String
+    getter tool_use_id : String
+    getter tool_name : String
+    getter parent_tool_use_id : String?
+    getter elapsed_time_seconds : Float64?
+    getter task_id : String?
+    getter heartbeat : Bool?
+    # Subagent type when progress is from a nested agent waiting out a
+    # rate-limit retry. Matches TS SDK 0.3.214+.
+    getter subagent_type : String?
+    getter subagent_retry : SubagentRetryInfo?
+    # When true, a workflow_agent progress step was blocked by the
+    # auto-mode safety classifier. Absent on non-workflow progress and
+    # older CLIs. Matches TS SDK 0.3.199+ (`workflow_agent` blocked).
+    getter blocked : Bool?
+  end
+
   struct DeferredToolUse
     include JSON::Serializable
     getter id : String
     getter name : String
     getter input : Hash(String, JSON::Any)
   end
+
+  # Per-model token usage and cost breakdown. Keys match the CLI's
+  # camelCase `modelUsage` payload (and the TS/Python SDKs' `ModelUsage`).
+  struct ModelUsage
+    include JSON::Serializable
+
+    @[JSON::Field(key: "inputTokens")]
+    getter input_tokens : Int64 = 0
+    @[JSON::Field(key: "outputTokens")]
+    getter output_tokens : Int64 = 0
+    @[JSON::Field(key: "cacheReadInputTokens")]
+    getter cache_read_input_tokens : Int64 = 0
+    @[JSON::Field(key: "cacheCreationInputTokens")]
+    getter cache_creation_input_tokens : Int64 = 0
+    @[JSON::Field(key: "webSearchRequests")]
+    getter web_search_requests : Int64 = 0
+    @[JSON::Field(key: "costUSD")]
+    getter cost_usd : Float64 = 0.0
+    @[JSON::Field(key: "contextWindow")]
+    getter context_window : Int64 = 0
+    @[JSON::Field(key: "maxOutputTokens")]
+    getter max_output_tokens : Int64 = 0
+    # Canonical model id used for the pricing lookup (e.g.
+    # "claude-opus-4-7"). May differ from the raw model string this entry
+    # is keyed by (provider-specific ids, aliases).
+    @[JSON::Field(key: "canonicalModel")]
+    getter canonical_model : String?
+    # API provider that served this model ("firstParty", "bedrock",
+    # "vertex", "foundry", "anthropicAws", "anthropicGoogleCloud",
+    # "mantle", "gateway").
+    getter provider : String?
+
+    def initialize(
+      @input_tokens : Int64 = 0,
+      @output_tokens : Int64 = 0,
+      @cache_read_input_tokens : Int64 = 0,
+      @cache_creation_input_tokens : Int64 = 0,
+      @web_search_requests : Int64 = 0,
+      @cost_usd : Float64 = 0.0,
+      @context_window : Int64 = 0,
+      @max_output_tokens : Int64 = 0,
+      @canonical_model : String? = nil,
+      @provider : String? = nil,
+    )
+    end
+  end
+
+  # Permission denial recorded on a result message. Matches the TS SDK's
+  # `SDKPermissionDenial` (tool_name / tool_use_id / tool_input).
+  struct PermissionDenial
+    include JSON::Serializable
+
+    getter tool_name : String
+    getter tool_use_id : String
+    getter tool_input : Hash(String, JSON::Any)?
+    # Optional reason when the CLI attaches one (open string).
+    getter reason : String?
+    # Discriminator from PermissionDecisionReason when present on the
+    # denial payload (e.g. "safetyCheck", "asyncAgent").
+    getter decision_reason_type : String?
+
+    def initialize(
+      @tool_name : String,
+      @tool_use_id : String,
+      @tool_input : Hash(String, JSON::Any)? = nil,
+      @reason : String? = nil,
+      @decision_reason_type : String? = nil,
+    )
+    end
+  end
+
+  # Known permission-decision reason types used by the CLI for
+  # permission-denied advisories and (when present) denial payloads.
+  # Open set — new values ship ahead of schema updates.
+  PERMISSION_DENIAL_REASONS = Set{
+    "safetyCheck",
+    "asyncAgent",
+    "classifier",
+    "mode",
+    "rule",
+    "hook",
+    "permissionPromptTool",
+    "sandboxOverride",
+    "workingDir",
+    "subcommandResults",
+    "other",
+  }
+
+  # Known values of `ResultMessage#terminal_reason`. Open set for
+  # forward compatibility; this documents the CLI vocabulary.
+  # Matches the TS SDK's `TerminalReason` (0.3.204+ expansions included).
+  TERMINAL_REASONS = Set{
+    "completed",
+    "max_turns",
+    "aborted_streaming",
+    "aborted_tools",
+    "tool_deferred",
+    "tool_deferred_unavailable",
+    "turn_setup_failed",
+    "api_error",
+    "malformed_tool_use_exhausted",
+    "budget_exhausted",
+    "structured_output_retry_exhausted",
+    "max_budget_usd",
+    "blocking_limit",
+    "rapid_refill_breaker",
+    "prompt_too_long",
+    "image_error",
+    "model_error",
+    "stop_hook_prevented",
+    "hook_stopped",
+    "background_requested",
+    "max_session_duration_ms",
+    "error",
+    "resume",
+  }
 
   # Final result message
   struct ResultMessage < Message
@@ -1030,9 +1690,18 @@ module ClaudeAgent
     getter is_error : Bool?
     getter num_turns : Int32?
     getter stop_reason : String?
-    # Reason the query loop terminated. Example values:
-    # "completed", "aborted_tools", "max_turns", "blocking_limit",
-    # "max_budget_usd", "max_session_duration_ms", "error", "resume".
+    # Reason the query loop terminated. Known values include (see also
+    # `TERMINAL_REASONS`):
+    # - "completed" — normal successful end
+    # - "max_turns" — hit max_turns limit
+    # - "aborted_streaming" / "aborted_tools" — cancelled via interrupt()
+    # - "tool_deferred" / "tool_deferred_unavailable" — deferred tool path
+    # - "turn_setup_failed" — turn-input builder threw before the turn
+    # - "api_error" — exhausted API retries
+    # - "malformed_tool_use_exhausted" — repeated bad tool_use payloads
+    # - "budget_exhausted" / "structured_output_retry_exhausted"
+    # - "max_budget_usd", "blocking_limit", "max_session_duration_ms"
+    # Open string for forward compatibility; nil on older CLIs.
     getter terminal_reason : String?
     # Non-fatal errors accumulated during the run (present on some result
     # subtypes, may be omitted entirely).
@@ -1043,14 +1712,24 @@ module ClaudeAgent
     # HTTP status of the final API error, if the run ended with a network
     # failure. Nil for successful runs.
     getter api_error_status : Int64?
-    # Per-model usage breakdown keyed by model ID
-    # (e.g., `{"claude-sonnet-4-6": {"input_tokens": ..., ...}}`).
+    # Per-model usage breakdown keyed by model ID. Wire key `modelUsage`
+    # (camelCase). Typed as `ModelUsage` (TS/Python parity).
     @[JSON::Field(key: "modelUsage")]
-    getter model_usage : Hash(String, JSON::Any)?
+    getter model_usage : Hash(String, ModelUsage)?
     # List of permission denials that occurred during the run.
-    getter permission_denials : Array(JSON::Any)?
+    getter permission_denials : Array(PermissionDenial)?
     # Fast-mode state at the time the run completed ("on", "off", ...).
     getter fast_mode_state : String?
+    # Why fast mode is off (e.g. "free", "preference", "network_error",
+    # "sdk_opt_in_required"). Absent when fast mode is on or CLI is older.
+    # Matches TS SDK 0.3.219+.
+    getter fast_mode_disabled_reason : String?
+    # UUID of the user message that started this turn, for cross-host
+    # request-latency correlation. Matches TS SDK 0.3.216+.
+    getter user_message_uuid : String?
+    # Wall-clock ms when the request was sent (host clock). Used with
+    # `user_message_uuid` for latency correlation. Matches TS 0.3.216+.
+    getter request_sent_wall_ms : Int64?
     @[JSON::Field(key: "deferred_tool_use")]
     getter deferred_tool_use : DeferredToolUse?
 

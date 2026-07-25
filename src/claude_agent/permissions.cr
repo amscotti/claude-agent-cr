@@ -163,6 +163,10 @@ module ClaudeAgent
     property display_name : String?
     # Human-readable subtitle for the permission UI
     property description : String?
+    # Control-protocol request id for this can_use_tool request. Use this to
+    # correlate out-of-band permission responses when suppressing the SDK's
+    # automatic control_response (TS 0.3.199).
+    property request_id : String?
 
     def initialize(
       @tool_name : String,
@@ -176,6 +180,7 @@ module ClaudeAgent
       @title : String? = nil,
       @display_name : String? = nil,
       @description : String? = nil,
+      @request_id : String? = nil,
     )
     end
   end
@@ -187,6 +192,11 @@ module ClaudeAgent
     property updated_input : Hash(String, JSON::Any)?
     property updated_permissions : Array(PermissionUpdate)?
     property? interrupt : Bool = false # Stop execution entirely
+    # When true, the SDK does not send a control_response for this
+    # can_use_tool request. The caller is expected to respond out-of-band
+    # (using `request_id` from PermissionContext). Matches returning `null`
+    # from canUseTool in the TypeScript SDK (0.3.199).
+    property? suppress_response : Bool = false
 
     def initialize(
       @allow : Bool,
@@ -194,6 +204,7 @@ module ClaudeAgent
       @updated_input : Hash(String, JSON::Any)? = nil,
       @updated_permissions : Array(PermissionUpdate)? = nil,
       @interrupt : Bool = false,
+      @suppress_response : Bool = false,
     )
     end
 
@@ -209,6 +220,14 @@ module ClaudeAgent
     # Create a deny result
     def self.deny(reason : String? = nil, interrupt : Bool = false) : PermissionResult
       new(allow: false, reason: reason, interrupt: interrupt)
+    end
+
+    # Suppress the automatic control_response so the caller can reply OOB
+    # via `AgentClient#respond_to_permission(request_id, result)`, using
+    # `PermissionContext#request_id` from the can_use_tool callback.
+    # Matches returning `null` from canUseTool in the TypeScript SDK (0.3.199).
+    def self.suppress : PermissionResult
+      new(allow: false, suppress_response: true)
     end
 
     # Allow and remember this decision for the session

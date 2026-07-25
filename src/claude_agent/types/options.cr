@@ -144,6 +144,10 @@ module ClaudeAgent
     property? allow_managed_domains_only : Bool?
     @[JSON::Field(key: "allowMachLookup")]
     property allow_mach_lookup : Array(String)?
+    # When true, sandboxed commands deterministically deny non-allowlisted
+    # hosts (TS SDK 0.3.219 / Claude Code v2.1.219).
+    @[JSON::Field(key: "strictAllowlist")]
+    property? strict_allowlist : Bool?
 
     def initialize(
       @allow_local_binding : Bool = false,
@@ -155,6 +159,7 @@ module ClaudeAgent
       @denied_domains : Array(String)? = nil,
       @allow_managed_domains_only : Bool? = nil,
       @allow_mach_lookup : Array(String)? = nil,
+      @strict_allowlist : Bool? = nil,
     )
     end
   end
@@ -504,6 +509,31 @@ module ClaudeAgent
     Max
   end
 
+  # Per-tool configuration for the built-in AskUserQuestion tool.
+  # Matches the TS SDK's `toolConfig.askUserQuestion` (0.2.69+ / 0.3.x).
+  struct AskUserQuestionConfig
+    include JSON::Serializable
+    # Content format for the `preview` field on question options.
+    # `"markdown"` (CLI default) or `"html"` (web SDK consumers).
+    @[JSON::Field(key: "previewFormat")]
+    property preview_format : String?
+
+    def initialize(@preview_format : String? = nil)
+    end
+  end
+
+  # Per-tool configuration for built-in tools. Allows SDK consumers to
+  # customize tool behavior that the CLI hardcodes.
+  # Matches the TS SDK's `toolConfig` (0.2.69+ / 0.3.x).
+  struct ToolConfig
+    include JSON::Serializable
+    @[JSON::Field(key: "askUserQuestion")]
+    property ask_user_question : AskUserQuestionConfig?
+
+    def initialize(@ask_user_question : AskUserQuestionConfig? = nil)
+    end
+  end
+
   struct AgentOptions
     include JSON::Serializable
 
@@ -521,6 +551,9 @@ module ClaudeAgent
     # Accepts Array(String) or ToolsPreset (e.g., ToolsPreset.claude_code)
     @[JSON::Field(ignore: true)]
     property tools : ToolsOption? # Specific tools list (different from allowed_tools)
+    # Per-tool config for built-in tools (e.g. AskUserQuestion preview format).
+    # Forwarded via `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` (matches TS SDK).
+    property tool_config : ToolConfig?
     property permission_mode : PermissionMode = PermissionMode::Default
     property? allow_dangerously_skip_permissions : Bool = false # Required for bypassPermissions
 
@@ -591,10 +624,22 @@ module ClaudeAgent
     # CLI configuration
     property cli_path : String?
     property env : Hash(String, String)?
+    # Enable verbose CLI debug logging (equivalent to `--debug`).
+    # Matches the TS SDK's `debug` option (0.2.30+).
+    property? debug : Bool = false
+    # Write debug logs to a specific file path (equivalent to `--debug-file`).
+    # Implicitly enables debug mode. Matches the TS SDK's `debugFile` (0.2.30+).
+    property debug_file : String?
 
     # Setting sources
     property setting_sources : Array(String)?
     property settings_path : String? # Path to settings file
+    # Advisory Dynamic workflow size guideline ("small" | "medium" | "large" |
+    # "unrestricted"). Emitted into the settings JSON passed via `--settings`
+    # as `workflowSizeGuideline` (TS SDK 0.3.219 / Claude Code v2.1.219).
+    # When set, the /config row for this preference is hidden in the CLI UI.
+    @[JSON::Field(key: "workflowSizeGuideline")]
+    property workflow_size_guideline : String?
     # Policy-tier settings passed to the CLI in-memory via the
     # `--managed-settings <json>` flag (a real flag hidden from
     # `claude --help`), honored *below* IT-controlled managed sources.
@@ -613,6 +658,17 @@ module ClaudeAgent
     property? fork_session : Bool = false
     property? no_session_persistence : Bool = false
     property title : String? # Optional session title; skips auto-generation
+
+    # Mirror transcripts to an external SessionStore adapter. When set,
+    # AgentClient enables CLI `--session-mirror`, peels `transcript_mirror`
+    # frames, and appends them via TranscriptMirrorBatcher. Resume/continue
+    # with a store materializes the session into a temp CLAUDE_CONFIG_DIR.
+    @[JSON::Field(ignore: true)]
+    property session_store : SessionStore?
+    # "batched" (default) or "eager" — when mirrored entries flush to the store.
+    property session_store_flush : String = "batched"
+    # Timeout for each session_store.load / list_subkeys during resume (ms).
+    property load_timeout_ms : Int32 = 60_000
 
     # When true (the default), the SDK probes the Claude Code CLI once on
     # first start (`claude --help`) to learn which option flags it supports,
@@ -654,6 +710,7 @@ module ClaudeAgent
       @allowed_tools : Array(String)? = nil,
       @disallowed_tools : Array(String)? = nil,
       @tools : ToolsOption? = nil,
+      @tool_config : ToolConfig? = nil,
       @permission_mode : PermissionMode = PermissionMode::Default,
       @allow_dangerously_skip_permissions : Bool = false,
       @max_budget_usd : Float64? = nil,
@@ -684,8 +741,11 @@ module ClaudeAgent
       @output_format : OutputFormat? = nil,
       @cli_path : String? = nil,
       @env : Hash(String, String)? = nil,
+      @debug : Bool = false,
+      @debug_file : String? = nil,
       @setting_sources : Array(String)? = nil,
       @settings_path : String? = nil,
+      @workflow_size_guideline : String? = nil,
       @managed_settings : Hash(String, JSON::Any)? = nil,
       @continue_conversation : Bool = false,
       @resume : String? = nil,
@@ -694,6 +754,9 @@ module ClaudeAgent
       @fork_session : Bool = false,
       @no_session_persistence : Bool = false,
       @title : String? = nil,
+      @session_store : SessionStore? = nil,
+      @session_store_flush : String = "batched",
+      @load_timeout_ms : Int32 = 60_000,
       @probe_cli_capabilities : Bool = true,
       @extra_args : Hash(String, String?)? = nil,
       @enable_file_checkpointing : Bool = false,
@@ -702,6 +765,72 @@ module ClaudeAgent
       @stderr : StderrCallback? = nil,
       @max_buffer_size : Int32? = nil,
     )
+    end
+
+    # Return a warning message when `can_use_tool` is set but will not be
+    # consulted for some (or all) tool calls because `permission_mode` is
+    # `bypassPermissions` or because `allowed_tools` contains whole-tool
+    # allow rules. Returns nil when no shadowing is detected or when
+    # `can_use_tool` is unset. Advisory only — shadowing can be intentional.
+    # Mirrors Python's `_get_can_use_tool_shadowed_warning` / TS
+    # `getCanUseToolShadowedWarning` (Py 0.2.111 / TS 0.3.198).
+    def can_use_tool_shadowed_warning : String?
+      return nil unless can_use_tool
+
+      if permission_mode == PermissionMode::BypassPermissions
+        return "can_use_tool will not be invoked: permission_mode " \
+               "'bypassPermissions' auto-approves every tool call (except " \
+               "explicit deny rules) before the callback is consulted. To gate " \
+               "every tool call, use a PreToolUse hook instead."
+      end
+
+      # skills="all" makes the transport inject a bare "Skill" allow rule,
+      # which shadows the callback just like a hand-written entry.
+      # skills=[names] injects Skill(name) specifiers, which do not.
+      allowed = allowed_tools.try(&.dup) || [] of String
+      if skills == "all" && !allowed.includes?("Skill")
+        allowed << "Skill"
+      end
+
+      # Dedup while preserving first-seen order (mirrors Python's dict.fromkeys).
+      shadowed = [] of String
+      seen = Set(String).new
+      allowed.each do |entry|
+        if tool = AgentOptions.whole_tool_allowed(entry)
+          unless seen.includes?(tool)
+            seen << tool
+            shadowed << tool
+          end
+        end
+      end
+
+      return nil if shadowed.empty?
+
+      "can_use_tool will not be invoked for: #{shadowed.join(", ")}. " \
+      "An allowed_tools entry that allows a whole tool auto-approves it " \
+      "before the callback is consulted. To gate every tool call, use a " \
+      "PreToolUse hook; or narrow the entry so calls fall through to " \
+      "can_use_tool. Allow rules from settings files can also shadow the " \
+      "callback but are not visible here."
+    end
+
+    # Return the tool an `allowed_tools` entry allows outright, else nil.
+    # Mirrors the CLI's rule parser: an entry allows a whole tool when it has
+    # no `(...)` specifier (`"Read"`), or when the specifier is empty or a lone
+    # wildcard (`"Read()"`, `"Read(*)"`). A real specifier (`"Bash(ls:*)"`)
+    # only allows matching invocations. Malformed entries fall back to the
+    # whole string as a tool name in the CLI, so they match nothing here.
+    def self.whole_tool_allowed(entry : String) : String?
+      return nil if entry.strip.empty?
+
+      open_index = entry.index('(')
+      return entry if open_index.nil?
+      return nil if open_index == 0 || !entry.ends_with?(')')
+
+      specifier = entry[(open_index + 1)...-1]
+      return entry[0...open_index] if specifier == "" || specifier == "*"
+
+      nil
     end
   end
 end

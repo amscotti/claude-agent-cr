@@ -1,6 +1,38 @@
 require "json"
 
 module ClaudeAgent
+  # Well-known model IDs accepted as free-form strings by `AgentOptions#model`
+  # and `AgentClient#set_model`. These are convenience constants only — the
+  # model field remains a plain `String`, so any CLI-supported ID works.
+  # Availability depends on the installed Claude Code CLI and account access.
+  #
+  # Intentionally omits `claude-mythos-preview` (preview-only; not tracked here).
+  module Models
+    # Claude 5 family
+    SONNET_5 = "claude-sonnet-5"
+    OPUS_5   = "claude-opus-5"
+    FABLE_5  = "claude-fable-5"
+    MYTHOS_5 = "claude-mythos-5"
+
+    # Short aliases accepted by some CLI builds (when supported).
+    FABLE  = "fable"
+    MYTHOS = "mythos"
+
+    # Claude 4.x family
+    OPUS_4_8   = "claude-opus-4-8"
+    OPUS_4_7   = "claude-opus-4-7"
+    OPUS_4_6   = "claude-opus-4-6"
+    OPUS_4_5   = "claude-opus-4-5"
+    SONNET_4_6 = "claude-sonnet-4-6"
+    SONNET_4_5 = "claude-sonnet-4-5"
+    HAIKU_4_5  = "claude-haiku-4-5"
+
+    # Snapshot / dated IDs commonly used in API clients
+    OPUS_4_5_20251101   = "claude-opus-4-5-20251101"
+    SONNET_4_5_20250929 = "claude-sonnet-4-5-20250929"
+    HAIKU_4_5_20251001  = "claude-haiku-4-5-20251001"
+  end
+
   struct ServerCommand
     getter name : String
     getter description : String?
@@ -90,6 +122,37 @@ module ClaudeAgent
     end
   end
 
+  # Plugin descriptor from system/init and reload_plugins (name + manifest version).
+  struct ServerPluginInfo
+    getter name : String
+    getter version : String?
+    getter path : String?
+    getter source : String?
+
+    def initialize(
+      @name : String,
+      @version : String? = nil,
+      @path : String? = nil,
+      @source : String? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : ServerPluginInfo?
+      data = value.as_h?
+      return nil unless data
+
+      name = data["name"]?.try(&.as_s?)
+      return nil unless name
+
+      new(
+        name,
+        data["version"]?.try(&.as_s?),
+        data["path"]?.try(&.as_s?),
+        data["source"]?.try(&.as_s?),
+      )
+    end
+  end
+
   struct ServerAccountInfo
     getter email : String?
     getter organization : String?
@@ -133,7 +196,9 @@ module ClaudeAgent
     # Summary of each configured MCP server (name + status + tools).
     # Raw JSON::Any entries so forward-compat fields are preserved.
     getter mcp_servers : Array(JSON::Any)
-    # Loaded plugin descriptors (name, path, source).
+    # Loaded plugin descriptors (name, path, source, version).
+    # Raw JSON::Any entries so forward-compat fields are preserved.
+    # Prefer `#plugin_infos` for typed access including manifest `version`.
     getter plugins : Array(JSON::Any)
     # Current working directory reported by the CLI.
     getter cwd : String?
@@ -145,6 +210,10 @@ module ClaudeAgent
     getter permission_mode : String?
     # Fast-mode runtime state ("on" / "off" / ...).
     getter fast_mode_state : String?
+    # Why fast mode is disabled when `fast_mode_state` is off/unavailable.
+    # Present on init (and result messages via the host) when the CLI explains
+    # the reason (account tier, model, org policy, etc.).
+    getter fast_mode_disabled_reason : String?
     # CLI build advertised by the subprocess.
     getter claude_code_version : String?
     # Full init payload, including any forward-compat fields this struct
@@ -167,6 +236,7 @@ module ClaudeAgent
       @model : String? = nil,
       @permission_mode : String? = nil,
       @fast_mode_state : String? = nil,
+      @fast_mode_disabled_reason : String? = nil,
       @claude_code_version : String? = nil,
       @raw_data : Hash(String, JSON::Any) = {} of String => JSON::Any,
     )
@@ -195,7 +265,9 @@ module ClaudeAgent
         cwd: data["cwd"]?.try(&.as_s?),
         model: data["model"]?.try(&.as_s?),
         permission_mode: data["permissionMode"]?.try(&.as_s?) || data["permission_mode"]?.try(&.as_s?),
-        fast_mode_state: data["fast_mode_state"]?.try(&.as_s?),
+        fast_mode_state: data["fast_mode_state"]?.try(&.as_s?) || data["fastModeState"]?.try(&.as_s?),
+        fast_mode_disabled_reason: data["fast_mode_disabled_reason"]?.try(&.as_s?) ||
+                                   data["fastModeDisabledReason"]?.try(&.as_s?),
         claude_code_version: data["claude_code_version"]?.try(&.as_s?),
         raw_data: data,
       )
@@ -223,6 +295,16 @@ module ClaudeAgent
 
     def model_named?(value : String) : ServerModelInfo?
       models.find { |model| model.value == value }
+    end
+
+    # Typed view of `#plugins`, including each plugin's manifest `version`
+    # (CLI ≥ system/init + reload_plugins parity with TS 0.3.214).
+    def plugin_infos : Array(ServerPluginInfo)
+      plugins.compact_map { |item| ServerPluginInfo.from_any(item) }
+    end
+
+    def plugin_named?(name : String) : ServerPluginInfo?
+      plugin_infos.find { |plugin| plugin.name == name }
     end
 
     private def self.string_array(value : JSON::Any?) : Array(String)
