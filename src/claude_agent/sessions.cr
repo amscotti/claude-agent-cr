@@ -785,7 +785,6 @@ module ClaudeAgent
       page.first(limit)
     end
 
-    # ameba:disable Metrics/CyclomaticComplexity
     private def build_session_info(
       session_id : String,
       file_path : String,
@@ -882,8 +881,9 @@ module ClaudeAgent
       if directory
         canonical_dir = canonicalize_path(directory)
         project_dir = find_project_dir(canonical_dir)
-        if project_dir && appendable_session_file?(path = File.join(project_dir, file_name))
-          return path
+        if project_dir
+          path = File.join(project_dir, file_name)
+          return path if appendable_session_file?(path)
         end
 
         worktree_paths(canonical_dir).each do |worktree_path|
@@ -1140,8 +1140,9 @@ module ClaudeAgent
       if directory
         canonical_dir = canonicalize_path(directory)
         project_dir = find_project_dir(canonical_dir)
-        if project_dir && appendable_session_file?(path = File.join(project_dir, file_name))
-          return {path, project_dir}
+        if project_dir
+          path = File.join(project_dir, file_name)
+          return {path, project_dir} if appendable_session_file?(path)
         end
 
         worktree_paths(canonical_dir).each do |worktree_path|

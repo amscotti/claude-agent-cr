@@ -156,7 +156,6 @@ describe ClaudeAgent::SDKMCPServer do
         input_schema: {} of String => JSON::Any,
         handler: ->(_args : Hash(String, JSON::Any)) {
           raise "Something went wrong!"
-          ClaudeAgent::ToolResult.text("never reached")
         }
       )
 

@@ -38,3 +38,28 @@ Excluded:
 #
 Metrics/LineLength:
   Max: 120
+
+# Protocol dispatch / parser tables are naturally branch-heavy.
+Metrics/CyclomaticComplexity:
+  Excluded:
+    - src/claude_agent/agent_client.cr
+    - src/claude_agent/sessions.cr
+    - src/claude_agent/types/messages.cr
+    - src/claude_agent/cli_client.cr
+
+# Ameba 1.7 style rules that are noisy against existing Crystal idioms in this
+# repo (JSON fixtures, explicit `return nil`, multi-type unions, example rescues).
+Style/RedundantNilInControlExpression:
+  Enabled: false
+Style/HeredocIndent:
+  Enabled: false
+Style/VerboseNilType:
+  Enabled: false
+Style/MultilineCurlyBlock:
+  Enabled: false
+Lint/SpecEqWithBoolOrNilLiteral:
+  Enabled: false
+Lint/UnusedRescueVariable:
+  Enabled: false
+Lint/ElseNil:
+  Enabled: false
