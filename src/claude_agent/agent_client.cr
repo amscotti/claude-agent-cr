@@ -1221,59 +1221,67 @@ module ClaudeAgent
       hooks = @options.try(&.hooks)
       return unless hooks
 
-      # Check for ToolResultBlock in content (indicates tool completed)
       message.content.each do |block|
         next unless block.is_a?(ToolResultBlock)
+        invoke_post_tool_use_hooks(hooks, message, block)
+      end
+    end
 
-        # Find the corresponding ToolUseBlock to get the tool name
-        tool_name = find_tool_name_for_result(message, block.tool_use_id)
-        next unless tool_name
+    private def invoke_post_tool_use_hooks(
+      hooks : HookConfig,
+      message : AssistantMessage,
+      block : ToolResultBlock,
+    )
+      tool_name = find_tool_name_for_result(message, block.tool_use_id)
+      return unless tool_name
 
-        # Determine if this was a failure
-        is_error = block.is_error == true
-        if is_error
-          next if control_hook_registered?("PostToolUseFailure")
-        else
-          next if control_hook_registered?("PostToolUse")
+      is_error = block.is_error == true
+      hook_event = is_error ? "PostToolUseFailure" : "PostToolUse"
+      return if control_hook_registered?(hook_event)
+
+      hook_matchers = is_error ? hooks.post_tool_use_failure : hooks.post_tool_use
+      return unless hook_matchers
+
+      input = build_post_tool_use_hook_input(message, block, tool_name, is_error, hook_event)
+      session_id = input.session_id || ""
+      ctx = HookContext.new(session_id: session_id)
+
+      hook_matchers.each do |hook_matcher|
+        next unless hook_matcher.matches?(tool_name)
+        hook_matcher.hooks.each do |callback|
+          safe_hook_call("PostToolUse") { callback.call(input, block.tool_use_id, ctx) }
         end
+      end
+    end
 
-        hook_matchers = is_error ? hooks.post_tool_use_failure : hooks.post_tool_use
-        next unless hook_matchers
+    private def build_post_tool_use_hook_input(
+      message : AssistantMessage,
+      block : ToolResultBlock,
+      tool_name : String,
+      is_error : Bool,
+      hook_event : String,
+    ) : HookInput
+      result_content = tool_result_content_string(block.content)
+      common = hook_common_fields(hook_event)
+      HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        tool_name: tool_name,
+        tool_input: find_tool_input_for_result(message, block.tool_use_id),
+        tool_use_id: block.tool_use_id,
+        tool_result: result_content,
+        tool_response: result_content,
+        error: is_error ? result_content : nil,
+      )
+    end
 
-        hook_matchers.each do |hook_matcher|
-          next unless hook_matcher.matches?(tool_name)
-
-          # Get result content as string
-          result_content = case content = block.content
-                           when String then content
-                           when Array  then content.to_json
-                           else             ""
-                           end
-
-          hook_event = is_error ? "PostToolUseFailure" : "PostToolUse"
-          common = hook_common_fields(hook_event)
-          # Find the original tool_input from the ToolUseBlock
-          original_tool_input = find_tool_input_for_result(message, block.tool_use_id)
-          input = HookInput.new(
-            session_id: common[:session_id],
-            cwd: common[:cwd],
-            permission_mode: common[:permission_mode],
-            hook_event_name: common[:hook_event_name],
-            tool_name: tool_name,
-            tool_input: original_tool_input,
-            tool_use_id: block.tool_use_id,
-            tool_result: result_content,
-            tool_response: result_content,
-            error: is_error ? result_content : nil,
-          )
-          ctx = HookContext.new(session_id: common[:session_id])
-
-          hook_matcher.hooks.each do |callback|
-            safe_hook_call("PostToolUse") do
-              callback.call(input, block.tool_use_id, ctx)
-            end
-          end
-        end
+    private def tool_result_content_string(content) : String
+      case content
+      when String then content
+      when Array  then content.to_json
+      else             ""
       end
     end
 

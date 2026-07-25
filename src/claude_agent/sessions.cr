@@ -1563,28 +1563,47 @@ module ClaudeAgent
       return [] of SessionMessage if agent_id.empty?
 
       project_key = project_key_for_directory(directory)
-      subpath = "subagents/agent-#{agent_id}"
+      subpath = resolve_store_subagent_subpath(store, project_key, session_id, agent_id)
+      return [] of SessionMessage unless subpath
 
-      if store.supports_list_subkeys?
-        target = "agent-#{agent_id}"
-        match = store.list_subkeys(SessionListSubkeysKey.new(project_key, session_id)).find do |subkey|
-          subkey.starts_with?("subagents/") && subkey.split('/').last == target
-        end
-        return [] of SessionMessage unless match
-        subpath = match
-      end
-
-      key = SessionKey.new(project_key, session_id, subpath)
-      entries = store.load(key)
+      entries = store.load(SessionKey.new(project_key, session_id, subpath))
       return [] of SessionMessage unless entries
 
+      messages = session_messages_from_store_entries(entries)
+      paginate_session_messages(messages, limit, offset)
+    end
+
+    private def resolve_store_subagent_subpath(
+      store : SessionStore,
+      project_key : String,
+      session_id : String,
+      agent_id : String,
+    ) : String?
+      default_path = "subagents/agent-#{agent_id}"
+      return default_path unless store.supports_list_subkeys?
+
+      target = "agent-#{agent_id}"
+      store.list_subkeys(SessionListSubkeysKey.new(project_key, session_id)).find do |subkey|
+        subkey.starts_with?("subagents/") && subkey.split('/').last == target
+      end
+    end
+
+    private def session_messages_from_store_entries(
+      entries : Array(SessionStoreEntry),
+    ) : Array(SessionMessage)
       transcript = entries.reject { |e| e.type == "agent_metadata" }.map(&.to_h)
       chain = build_subagent_chain(filter_transcript_hashes(transcript))
-      messages = chain.compact_map do |entry|
+      chain.compact_map do |entry|
         next unless {"user", "assistant"}.includes?(string_field(entry, "type"))
         to_session_message(entry)
       end
+    end
 
+    private def paginate_session_messages(
+      messages : Array(SessionMessage),
+      limit : Int32?,
+      offset : Int32,
+    ) : Array(SessionMessage)
       start = Math.max(offset, 0)
       return [] of SessionMessage if start >= messages.size
 
