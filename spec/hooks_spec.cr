@@ -79,6 +79,15 @@ describe ClaudeAgent::HookResult do
     output.try(&.hook_event_name).should eq("ElicitationResult")
     output.try(&.action).should eq("cancel")
   end
+
+  it "supports MessageDisplay display_content on HookSpecificOutput" do
+    output = ClaudeAgent::HookSpecificOutput.new(
+      hook_event_name: "MessageDisplay",
+      display_content: "scrubbed",
+    )
+    output.display_content.should eq("scrubbed")
+    JSON.parse(output.to_json)["displayContent"].as_s.should eq("scrubbed")
+  end
 end
 
 describe ClaudeAgent::HookConfig do
@@ -126,6 +135,38 @@ describe ClaudeAgent::HookConfig do
 
     config.elicitation.should_not be_nil
     config.elicitation_result.should_not be_nil
+  end
+
+  it "supports message_display hook" do
+    config = ClaudeAgent::HookConfig.new(
+      message_display: [->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+        ClaudeAgent::HookResult.new(
+          hook_specific_output: ClaudeAgent::HookSpecificOutput.new(
+            hook_event_name: "MessageDisplay",
+            display_content: "[redacted]",
+          )
+        )
+      }]
+    )
+    config.message_display.should_not be_nil
+    config.message_display.try(&.size).should eq(1)
+  end
+
+  it "supports directory_added hook" do
+    config = ClaudeAgent::HookConfig.new(
+      directory_added: [->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+        ClaudeAgent::HookResult.new
+      }]
+    )
+    config.directory_added.should_not be_nil
+    config.directory_added.try(&.size).should eq(1)
+  end
+end
+
+describe ClaudeAgent::HookEvent do
+  it "includes MessageDisplay and DirectoryAdded" do
+    ClaudeAgent::HookEvent::MessageDisplay.to_s.should eq("MessageDisplay")
+    ClaudeAgent::HookEvent::DirectoryAdded.to_s.should eq("DirectoryAdded")
   end
 end
 
@@ -240,7 +281,7 @@ describe ClaudeAgent::HookInput do
       is_interrupt: false,
     )
     input.error.should eq("command not found")
-    input.is_interrupt.should eq(false)
+    input.is_interrupt.should be_false
     input.tool_use_id.should eq("tu_789")
   end
 
@@ -249,7 +290,7 @@ describe ClaudeAgent::HookInput do
       hook_event_name: "Stop",
       stop_hook_active: true,
     )
-    input.stop_hook_active.should eq(true)
+    input.stop_hook_active.should be_true
   end
 
   it "supports SubagentStart fields" do
@@ -273,7 +314,7 @@ describe ClaudeAgent::HookInput do
     input.agent_id.should eq("agent-001")
     input.agent_type.should eq("code-reviewer")
     input.agent_transcript_path.should eq("/tmp/subagent.jsonl")
-    input.stop_hook_active.should eq(false)
+    input.stop_hook_active.should be_false
   end
 
   it "supports Notification fields with type" do
@@ -292,6 +333,38 @@ describe ClaudeAgent::HookInput do
       source: "startup",
     )
     input.source.should eq("startup")
+  end
+
+  it "supports SessionStart source fork" do
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "SessionStart",
+      source: "fork",
+    )
+    input.source.should eq("fork")
+  end
+
+  it "supports MessageDisplay fields" do
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "MessageDisplay",
+      message_content: "Hello, world",
+    )
+    input.hook_event_name.should eq("MessageDisplay")
+    input.message_content.should eq("Hello, world")
+  end
+
+  it "deserializes MessageDisplay message_content from JSON" do
+    json = %({"hook_event_name":"MessageDisplay","message_content":"secret token"})
+    input = ClaudeAgent::HookInput.from_json(json)
+    input.message_content.should eq("secret token")
+  end
+
+  it "supports DirectoryAdded fields" do
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "DirectoryAdded",
+      directory_path: "/tmp/workdir",
+    )
+    input.hook_event_name.should eq("DirectoryAdded")
+    input.directory_path.should eq("/tmp/workdir")
   end
 
   it "supports SessionEnd fields" do
@@ -349,7 +422,7 @@ describe ClaudeAgent::HookInput do
     input = ClaudeAgent::HookInput.from_json(json)
     input.hook_event_name.should eq("PostToolUseFailure")
     input.error.should eq("fail")
-    input.is_interrupt.should eq(true)
+    input.is_interrupt.should be_true
   end
 
   it "deserializes SubagentStop from JSON" do
@@ -358,6 +431,6 @@ describe ClaudeAgent::HookInput do
     input.agent_id.should eq("a1")
     input.agent_type.should eq("reviewer")
     input.agent_transcript_path.should eq("/tmp/a.jsonl")
-    input.stop_hook_active.should eq(true)
+    input.stop_hook_active.should be_true
   end
 end

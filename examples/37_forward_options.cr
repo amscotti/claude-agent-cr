@@ -104,7 +104,7 @@ begin
       puts "[live] result: #{message.subtype}"
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipped live call."
 rescue ex
   puts "Live call skipped: #{ex.message}"

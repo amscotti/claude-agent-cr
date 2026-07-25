@@ -41,6 +41,10 @@ module ClaudeAgent
     getter session_id : String
     getter message : Hash(String, JSON::Any)
     getter parent_tool_use_id : String?
+    # When set, this message belongs to a nested (depth-2+) subagent and
+    # identifies the parent agent in the tree. Present on disk-persisted
+    # subagent transcripts (TS SDK 0.3.202+). Nil for top-level sessions.
+    getter parent_agent_id : String?
 
     def initialize(
       @type : String,
@@ -48,6 +52,7 @@ module ClaudeAgent
       @session_id : String,
       @message : Hash(String, JSON::Any),
       @parent_tool_use_id : String? = nil,
+      @parent_agent_id : String? = nil,
     )
     end
   end
@@ -87,10 +92,10 @@ module ClaudeAgent
       session_id : String,
       directory : String? = nil,
     ) : SDKSessionInfo?
-      return nil unless valid_uuid?(session_id)
+      return unless valid_uuid?(session_id)
 
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       build_session_info(session_id, file_path, directory)
     end
@@ -123,8 +128,6 @@ module ClaudeAgent
                         value = sanitize_unicode(tag).strip
                         raise ArgumentError.new("tag must be non-empty (use nil to clear)") if value.empty?
                         value
-                      else
-                        nil
                       end
 
       append_to_session(
@@ -500,7 +503,7 @@ module ClaudeAgent
 
     private def read_session_file(session_id : String, directory : String?) : String?
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       File.read(file_path)
     rescue File::Error
@@ -597,8 +600,8 @@ module ClaudeAgent
 
       loop do
         uuid = string_field(current, "uuid")
-        return nil unless uuid
-        return nil if seen.includes?(uuid)
+        return unless uuid
+        return if seen.includes?(uuid)
         seen.add(uuid)
 
         case string_field(current, "type")
@@ -607,10 +610,10 @@ module ClaudeAgent
         end
 
         parent = string_field(current, "parentUuid")
-        return nil unless parent
+        return unless parent
 
         next_entry = by_uuid[parent]?
-        return nil unless next_entry
+        return unless next_entry
         current = next_entry
       end
     end
@@ -647,7 +650,7 @@ module ClaudeAgent
       leaves : Array(TranscriptEntry),
       entry_index : Hash(String, Int32),
     ) : TranscriptEntry?
-      return nil if leaves.empty?
+      return if leaves.empty?
 
       leaves.max_by do |entry|
         uuid = string_field(entry, "uuid")
@@ -673,7 +676,7 @@ module ClaudeAgent
       uuid = string_field(entry, "uuid")
       session_id = string_field(entry, "sessionId") || string_field(entry, "session_id")
       message = hash_field(entry, "message")
-      return nil unless type && uuid && session_id && message
+      return unless type && uuid && session_id && message
 
       SessionMessage.new(
         type: type,
@@ -681,6 +684,7 @@ module ClaudeAgent
         session_id: session_id,
         message: message,
         parent_tool_use_id: string_field(entry, "parentToolUseId") || string_field(entry, "parent_tool_use_id"),
+        parent_agent_id: string_field(entry, "parentAgentId") || string_field(entry, "parent_agent_id"),
       )
     end
 
@@ -779,25 +783,24 @@ module ClaudeAgent
       page.first(limit)
     end
 
-    # ameba:disable Metrics/CyclomaticComplexity
     private def build_session_info(
       session_id : String,
       file_path : String,
       project_path : String? = nil,
     ) : SDKSessionInfo?
       content = File.read(file_path)
-      return nil if content.empty?
+      return if content.empty?
 
       first_entry = first_json_entry(content)
-      return nil if first_entry && bool_field(first_entry, "isSidechain")
+      return if first_entry && bool_field(first_entry, "isSidechain")
 
       entries = parse_jsonl_entries(content)
-      return nil if entries.empty?
+      return if entries.empty?
 
       custom_title = last_string_field(entries, "customTitle")
       first_prompt = extract_first_prompt(entries)
       summary = custom_title || last_string_field(entries, "summary") || first_prompt
-      return nil unless summary
+      return unless summary
 
       info = File.info(file_path)
       git_branch = last_string_field(entries, "gitBranch") || first_string_field(entries, "gitBranch")
@@ -839,11 +842,11 @@ module ClaudeAgent
           return file_path if File.exists?(file_path)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         project_dir = File.join(projects_dir, entry)
@@ -876,8 +879,9 @@ module ClaudeAgent
       if directory
         canonical_dir = canonicalize_path(directory)
         project_dir = find_project_dir(canonical_dir)
-        if project_dir && appendable_session_file?(path = File.join(project_dir, file_name))
-          return path
+        if project_dir
+          path = File.join(project_dir, file_name)
+          return path if appendable_session_file?(path)
         end
 
         worktree_paths(canonical_dir).each do |worktree_path|
@@ -890,11 +894,11 @@ module ClaudeAgent
           return candidate if appendable_session_file?(candidate)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         candidate = File.join(projects_dir, entry, file_name)
@@ -946,7 +950,7 @@ module ClaudeAgent
           hash = data.as_h?
           return hash if hash
         rescue JSON::ParseException
-          return nil
+          return
         end
       end
 
@@ -973,7 +977,7 @@ module ClaudeAgent
 
     private def first_timestamp_ms(entries : Array(TranscriptEntry)) : Int64?
       timestamp = first_string_field(entries, "timestamp")
-      return nil unless timestamp
+      return unless timestamp
 
       Time::Format::ISO_8601_DATE_TIME.parse(timestamp, Time::Location::UTC).to_unix_ms
     rescue Time::Format::Error
@@ -1035,8 +1039,8 @@ module ClaudeAgent
       return exact if Dir.exists?(exact)
 
       sanitized = sanitize_path(project_path)
-      return nil if sanitized.size <= MAX_SANITIZED_LENGTH
-      return nil unless Dir.exists?(projects_dir_path)
+      return if sanitized.size <= MAX_SANITIZED_LENGTH
+      return unless Dir.exists?(projects_dir_path)
 
       prefix = sanitized[0, MAX_SANITIZED_LENGTH]
       Dir.children(projects_dir_path).each do |entry|
@@ -1051,7 +1055,7 @@ module ClaudeAgent
 
     private def resolve_subagents_dir(session_id : String, directory : String?) : String?
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       project_dir = Path[file_path].parent.to_s
       File.join(project_dir, session_id, "subagents")
@@ -1134,8 +1138,9 @@ module ClaudeAgent
       if directory
         canonical_dir = canonicalize_path(directory)
         project_dir = find_project_dir(canonical_dir)
-        if project_dir && appendable_session_file?(path = File.join(project_dir, file_name))
-          return {path, project_dir}
+        if project_dir
+          path = File.join(project_dir, file_name)
+          return {path, project_dir} if appendable_session_file?(path)
         end
 
         worktree_paths(canonical_dir).each do |worktree_path|
@@ -1146,11 +1151,11 @@ module ClaudeAgent
           return {candidate, worktree_dir} if appendable_session_file?(candidate)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         project_dir = File.join(projects_dir, entry)
@@ -1248,6 +1253,510 @@ module ClaudeAgent
 
       chars.reverse.join
     end
+
+    # ------------------------------------------------------------------
+    # SessionStore-backed helpers
+    # ------------------------------------------------------------------
+
+    DEFAULT_IMPORT_BATCH_SIZE = 500
+    MAX_IMPORT_BATCH_BYTES    = 1 << 20 # 1 MiB
+
+    def project_key_for_directory(directory : String? = nil) : String
+      abs_path = canonicalize_path(directory || ".")
+      sanitize_path(abs_path)
+    end
+
+    # Replay a local on-disk session transcript into a SessionStore.
+    def import_session_to_store(
+      session_id : String,
+      store : SessionStore,
+      directory : String? = nil,
+      include_subagents : Bool = true,
+      batch_size : Int32 = DEFAULT_IMPORT_BATCH_SIZE,
+    ) : Nil
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+
+      file_path = resolve_session_file_path(session_id, directory)
+      unless file_path
+        missing = directory ? File.join(directory, "#{session_id}.jsonl") : "#{session_id}.jsonl"
+        raise File::NotFoundError.new("Session #{session_id} not found", file: missing)
+      end
+
+      project_key = Path[file_path].parent.basename
+      effective_batch = batch_size > 0 ? batch_size : DEFAULT_IMPORT_BATCH_SIZE
+      main_key = SessionKey.new(project_key, session_id)
+      append_jsonl_file_in_batches(file_path, main_key, store, effective_batch)
+
+      return unless include_subagents
+
+      session_dir = file_path.rchop(".jsonl")
+      subagents_dir = File.join(session_dir, "subagents")
+      collect_jsonl_files(subagents_dir).each do |sub_path|
+        rel = Path[sub_path].relative_to(session_dir).to_s
+        subpath = rel.ends_with?(".jsonl") ? rel.rchop(".jsonl") : rel
+        sub_key = SessionKey.new(project_key, session_id, subpath)
+        append_jsonl_file_in_batches(sub_path, sub_key, store, effective_batch)
+
+        meta_path = sub_path.rchop(".jsonl") + ".meta.json"
+        next unless File.exists?(meta_path)
+
+        begin
+          meta = JSON.parse(File.read(meta_path)).as_h.dup
+          meta["type"] = JSON::Any.new("agent_metadata")
+          store.append(sub_key, [SessionStoreEntry.from_hash(meta)])
+        rescue JSON::ParseException
+        end
+      end
+    end
+
+    def list_sessions_from_store(
+      store : SessionStore,
+      directory : String? = nil,
+      limit : Int32? = nil,
+      offset : Int32 = 0,
+    ) : Array(SDKSessionInfo)
+      project_path = canonicalize_path(directory || ".")
+      project_key = sanitize_path(project_path)
+
+      unless store.supports_list_sessions? || store.supports_list_session_summaries?
+        raise ArgumentError.new(
+          "session_store implements neither list_session_summaries() nor " \
+          "list_sessions() -- cannot list sessions. Provide a store with at " \
+          "least one of those methods."
+        )
+      end
+
+      results = [] of SDKSessionInfo
+
+      if store.supports_list_session_summaries?
+        begin
+          store.list_session_summaries(project_key).each do |summary|
+            if info = summary_entry_to_sdk_info(summary, project_path)
+              results << info
+            end
+          end
+        rescue SessionStoreNotImplementedError
+        end
+      end
+
+      if results.empty? && store.supports_list_sessions?
+        store.list_sessions(project_key).each do |entry|
+          if info = get_session_info_from_store(store, entry.session_id, directory)
+            # Prefer store mtime when available.
+            results << SDKSessionInfo.new(
+              session_id: info.session_id,
+              summary: info.summary,
+              last_modified: entry.mtime,
+              file_size: info.file_size,
+              custom_title: info.custom_title,
+              first_prompt: info.first_prompt,
+              git_branch: info.git_branch,
+              cwd: info.cwd,
+              tag: info.tag,
+              created_at: info.created_at,
+            )
+          end
+        end
+      end
+
+      apply_sort_limit_and_offset(results, limit, offset)
+    end
+
+    def get_session_info_from_store(
+      store : SessionStore,
+      session_id : String,
+      directory : String? = nil,
+    ) : SDKSessionInfo?
+      return unless valid_uuid?(session_id)
+
+      project_key = project_key_for_directory(directory)
+      key = SessionKey.new(project_key, session_id)
+      entries = store.load(key)
+      return if entries.nil? || entries.empty?
+
+      build_session_info_from_store_entries(session_id, entries, directory)
+    end
+
+    def get_session_messages_from_store(
+      store : SessionStore,
+      session_id : String,
+      directory : String? = nil,
+      limit : Int32? = nil,
+      offset : Int32 = 0,
+      include_system_messages : Bool = false,
+    ) : Array(SessionMessage)
+      return [] of SessionMessage unless valid_uuid?(session_id)
+
+      project_key = project_key_for_directory(directory)
+      key = SessionKey.new(project_key, session_id)
+      entries = store.load(key)
+      return [] of SessionMessage if entries.nil? || entries.empty?
+
+      if first = entries.first?
+        return [] of SessionMessage if first.bool_field("isSidechain")
+      end
+
+      transcript = filter_transcript_entries(entries)
+      chain = build_conversation_chain(transcript)
+      messages = chain.compact_map do |entry|
+        next unless visible_message?(entry, include_system_messages)
+        to_session_message(entry)
+      end
+
+      start = Math.max(offset, 0)
+      return [] of SessionMessage if start >= messages.size
+
+      if limit && limit > 0
+        messages[start, limit]? || [] of SessionMessage
+      else
+        messages[start..] || [] of SessionMessage
+      end
+    end
+
+    def rename_session_via_store(
+      store : SessionStore,
+      session_id : String,
+      title : String,
+      directory : String? = nil,
+    ) : Nil
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+      stripped = title.strip
+      raise ArgumentError.new("title must be non-empty") if stripped.empty?
+
+      key = SessionKey.new(project_key_for_directory(directory), session_id)
+      entry = SessionStoreEntry.from_hash({
+        "type"        => JSON::Any.new("custom-title"),
+        "customTitle" => JSON::Any.new(stripped),
+        "sessionId"   => JSON::Any.new(session_id),
+        "uuid"        => JSON::Any.new(UUID.random.to_s),
+        "timestamp"   => JSON::Any.new(Time.utc.to_rfc3339),
+      })
+      store.append(key, [entry])
+    end
+
+    def tag_session_via_store(
+      store : SessionStore,
+      session_id : String,
+      tag : String?,
+      directory : String? = nil,
+    ) : Nil
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+
+      sanitized_tag = if tag
+                        value = sanitize_unicode(tag).strip
+                        raise ArgumentError.new("tag must be non-empty (use nil to clear)") if value.empty?
+                        value
+                      end
+
+      key = SessionKey.new(project_key_for_directory(directory), session_id)
+      entry = SessionStoreEntry.from_hash({
+        "type"      => JSON::Any.new("tag"),
+        "tag"       => JSON::Any.new(sanitized_tag || ""),
+        "sessionId" => JSON::Any.new(session_id),
+        "uuid"      => JSON::Any.new(UUID.random.to_s),
+        "timestamp" => JSON::Any.new(Time.utc.to_rfc3339),
+      })
+      store.append(key, [entry])
+    end
+
+    def delete_session_via_store(
+      store : SessionStore,
+      session_id : String,
+      directory : String? = nil,
+    ) : Nil
+      raise ArgumentError.new("Invalid session_id: #{session_id}") unless valid_uuid?(session_id)
+      return unless store.supports_delete?
+
+      key = SessionKey.new(project_key_for_directory(directory), session_id)
+      store.delete(key)
+    end
+
+    def fork_session_via_store(
+      store : SessionStore,
+      session_id : String,
+      directory : String? = nil,
+      up_to_message_id : String? = nil,
+      title : String? = nil,
+    ) : ForkSessionResult
+      validate_fork_inputs!(session_id, up_to_message_id)
+
+      project_key = project_key_for_directory(directory)
+      src_key = SessionKey.new(project_key, session_id)
+      loaded = store.load(src_key)
+      raise File::NotFoundError.new("Session #{session_id} not found", file: "#{session_id}.jsonl") unless loaded
+      raise ArgumentError.new("Session #{session_id} has no messages to fork") if loaded.empty?
+
+      content = loaded.map(&.to_h.to_json).join("\n") + "\n"
+      transcript, content_replacements = prepare_fork_transcript(content, session_id, up_to_message_id)
+      uuid_mapping = build_fork_uuid_mapping(transcript)
+      writable = transcript.reject { |entry| string_field(entry, "type") == "progress" }
+      raise ArgumentError.new("Session #{session_id} has no messages to fork") if writable.empty?
+
+      by_uuid = index_transcript(transcript)
+      forked_session_id = UUID.random.to_s
+
+      lines = build_fork_lines(
+        writable,
+        by_uuid,
+        uuid_mapping,
+        forked_session_id,
+        session_id,
+      )
+      append_fork_footer(lines, forked_session_id, content, content_replacements, title)
+
+      forked_entries = lines.compact_map do |line|
+        begin
+          SessionStoreEntry.from_hash(JSON.parse(line).as_h)
+        rescue
+          nil
+        end
+      end
+
+      dst_key = SessionKey.new(project_key, forked_session_id)
+      store.append(dst_key, forked_entries)
+      ForkSessionResult.new(forked_session_id)
+    end
+
+    def list_subagents_from_store(
+      store : SessionStore,
+      session_id : String,
+      directory : String? = nil,
+    ) : Array(String)
+      return [] of String unless valid_uuid?(session_id)
+      unless store.supports_list_subkeys?
+        raise ArgumentError.new(
+          "session_store does not implement list_subkeys() -- cannot list " \
+          "subagents. Provide a store with a list_subkeys() method."
+        )
+      end
+
+      project_key = project_key_for_directory(directory)
+      subkeys = store.list_subkeys(SessionListSubkeysKey.new(project_key, session_id))
+      seen = Set(String).new
+      ids = [] of String
+      subkeys.each do |subpath|
+        next unless subpath.starts_with?("subagents/")
+        last = subpath.split('/').last
+        next unless last.starts_with?("agent-")
+        agent_id = last.lchop("agent-")
+        unless seen.includes?(agent_id)
+          seen.add(agent_id)
+          ids << agent_id
+        end
+      end
+      ids
+    end
+
+    def get_subagent_messages_from_store(
+      store : SessionStore,
+      session_id : String,
+      agent_id : String,
+      directory : String? = nil,
+      limit : Int32? = nil,
+      offset : Int32 = 0,
+    ) : Array(SessionMessage)
+      return [] of SessionMessage unless valid_uuid?(session_id)
+      return [] of SessionMessage if agent_id.empty?
+
+      project_key = project_key_for_directory(directory)
+      subpath = resolve_store_subagent_subpath(store, project_key, session_id, agent_id)
+      return [] of SessionMessage unless subpath
+
+      entries = store.load(SessionKey.new(project_key, session_id, subpath))
+      return [] of SessionMessage unless entries
+
+      messages = session_messages_from_store_entries(entries)
+      paginate_session_messages(messages, limit, offset)
+    end
+
+    private def resolve_store_subagent_subpath(
+      store : SessionStore,
+      project_key : String,
+      session_id : String,
+      agent_id : String,
+    ) : String?
+      default_path = "subagents/agent-#{agent_id}"
+      return default_path unless store.supports_list_subkeys?
+
+      target = "agent-#{agent_id}"
+      store.list_subkeys(SessionListSubkeysKey.new(project_key, session_id)).find do |subkey|
+        subkey.starts_with?("subagents/") && subkey.split('/').last == target
+      end
+    end
+
+    private def session_messages_from_store_entries(
+      entries : Array(SessionStoreEntry),
+    ) : Array(SessionMessage)
+      transcript = entries.reject { |e| e.type == "agent_metadata" }.map(&.to_h)
+      chain = build_subagent_chain(filter_transcript_hashes(transcript))
+      chain.compact_map do |entry|
+        next unless {"user", "assistant"}.includes?(string_field(entry, "type"))
+        to_session_message(entry)
+      end
+    end
+
+    private def paginate_session_messages(
+      messages : Array(SessionMessage),
+      limit : Int32?,
+      offset : Int32,
+    ) : Array(SessionMessage)
+      start = Math.max(offset, 0)
+      return [] of SessionMessage if start >= messages.size
+
+      if limit && limit > 0
+        messages[start, limit]? || [] of SessionMessage
+      else
+        messages[start..] || [] of SessionMessage
+      end
+    end
+
+    # Convert a SessionSummaryEntry to SDKSessionInfo.
+    def summary_entry_to_sdk_info(
+      entry : SessionSummaryEntry,
+      project_path : String? = nil,
+    ) : SDKSessionInfo?
+      data = entry.data
+      return if data["is_sidechain"]?.try(&.as_bool?) == true
+
+      first_prompt = if data["first_prompt_locked"]?.try(&.as_bool?)
+                       data["first_prompt"]?.try(&.as_s?)
+                     else
+                       data["command_fallback"]?.try(&.as_s?)
+                     end
+
+      custom_title = data["custom_title"]?.try(&.as_s?) || data["ai_title"]?.try(&.as_s?)
+      summary = custom_title ||
+                data["last_prompt"]?.try(&.as_s?) ||
+                data["summary_hint"]?.try(&.as_s?) ||
+                first_prompt
+      return unless summary
+
+      SDKSessionInfo.new(
+        session_id: entry.session_id,
+        summary: summary,
+        last_modified: entry.mtime,
+        file_size: 0_i64,
+        custom_title: custom_title,
+        first_prompt: first_prompt,
+        git_branch: data["git_branch"]?.try(&.as_s?),
+        cwd: data["cwd"]?.try(&.as_s?) || project_path,
+        tag: data["tag"]?.try(&.as_s?),
+        created_at: data["created_at"]?.try(&.as_i64?),
+      )
+    end
+
+    private def build_session_info_from_store_entries(
+      session_id : String,
+      entries : Array(SessionStoreEntry),
+      directory : String?,
+    ) : SDKSessionInfo?
+      return if entries.first.bool_field("isSidechain")
+
+      hashes = entries.map(&.to_h)
+      custom_title = last_string_field(hashes, "customTitle")
+      first_prompt = extract_first_prompt(hashes)
+      summary = custom_title || last_string_field(hashes, "summary") || first_prompt
+      return unless summary
+
+      mtime = entries.reverse_each.compact_map do |entry|
+        iso_timestamp_ms(entry.timestamp)
+      end.first? || Time.utc.to_unix_ms
+
+      project_path = canonicalize_path(directory || ".")
+      tag = last_string_field(hashes, "tag")
+      tag = nil if tag && tag.empty?
+
+      SDKSessionInfo.new(
+        session_id: session_id,
+        summary: summary,
+        last_modified: mtime,
+        file_size: 0_i64,
+        custom_title: custom_title,
+        first_prompt: first_prompt,
+        git_branch: last_string_field(hashes, "gitBranch") || first_string_field(hashes, "gitBranch"),
+        cwd: first_string_field(hashes, "cwd") || project_path,
+        tag: tag,
+        created_at: first_timestamp_ms(hashes),
+      )
+    end
+
+    private def append_jsonl_file_in_batches(
+      file_path : String,
+      key : SessionKey,
+      store : SessionStore,
+      batch_size : Int32,
+    ) : Nil
+      batch = [] of SessionStoreEntry
+      nbytes = 0
+
+      File.each_line(file_path) do |line|
+        line = line.rstrip('\n').rstrip('\r')
+        next if line.empty?
+
+        begin
+          hash = JSON.parse(line).as_h
+          batch << SessionStoreEntry.from_hash(hash)
+          nbytes += line.bytesize
+          if batch.size >= batch_size || nbytes >= MAX_IMPORT_BATCH_BYTES
+            store.append(key, batch)
+            batch = [] of SessionStoreEntry
+            nbytes = 0
+          end
+        rescue JSON::ParseException
+        end
+      end
+
+      store.append(key, batch) unless batch.empty?
+    end
+
+    private def collect_jsonl_files(base_dir : String) : Array(String)
+      results = [] of String
+      return results unless Dir.exists?(base_dir)
+      walk_jsonl_files(base_dir, results)
+      results
+    end
+
+    private def walk_jsonl_files(current : String, results : Array(String)) : Nil
+      entries = begin
+        Dir.children(current).sort!
+      rescue File::Error
+        return
+      end
+
+      entries.each do |entry|
+        path = File.join(current, entry)
+        if File.file?(path) && entry.ends_with?(".jsonl")
+          results << path
+        elsif Dir.exists?(path)
+          walk_jsonl_files(path, results)
+        end
+      end
+    end
+
+    private def filter_transcript_entries(entries : Array(SessionStoreEntry)) : Array(TranscriptEntry)
+      types = {"user", "assistant", "progress", "system", "attachment"}
+      entries.compact_map do |entry|
+        next unless entry.uuid
+        next unless types.includes?(entry.type)
+        entry.to_h
+      end
+    end
+
+    private def filter_transcript_hashes(entries : Array(TranscriptEntry)) : Array(TranscriptEntry)
+      types = {"user", "assistant", "progress", "system", "attachment"}
+      entries.select do |entry|
+        type = string_field(entry, "type")
+        uuid = string_field(entry, "uuid")
+        uuid && type && types.includes?(type)
+      end
+    end
+
+    private def iso_timestamp_ms(ts : String?) : Int64?
+      return unless ts
+      Time::Format::ISO_8601_DATE_TIME.parse(ts, Time::Location::UTC).to_unix_ms
+    rescue Time::Format::Error
+      nil
+    end
   end
 
   def self.list_sessions(
@@ -1323,5 +1832,110 @@ module ClaudeAgent
     title : String? = nil,
   ) : ForkSessionResult
     SessionStorage.fork_session(session_id, directory, up_to_message_id, title)
+  end
+
+  def self.project_key_for_directory(directory : String? = nil) : String
+    SessionStorage.project_key_for_directory(directory)
+  end
+
+  def self.import_session_to_store(
+    session_id : String,
+    store : SessionStore,
+    directory : String? = nil,
+    include_subagents : Bool = true,
+    batch_size : Int32 = SessionStorage::DEFAULT_IMPORT_BATCH_SIZE,
+  ) : Nil
+    SessionStorage.import_session_to_store(
+      session_id, store, directory, include_subagents, batch_size
+    )
+  end
+
+  def self.list_sessions_from_store(
+    store : SessionStore,
+    directory : String? = nil,
+    limit : Int32? = nil,
+    offset : Int32 = 0,
+  ) : Array(SDKSessionInfo)
+    SessionStorage.list_sessions_from_store(store, directory, limit, offset)
+  end
+
+  def self.get_session_info_from_store(
+    store : SessionStore,
+    session_id : String,
+    directory : String? = nil,
+  ) : SDKSessionInfo?
+    SessionStorage.get_session_info_from_store(store, session_id, directory)
+  end
+
+  def self.get_session_messages_from_store(
+    store : SessionStore,
+    session_id : String,
+    directory : String? = nil,
+    limit : Int32? = nil,
+    offset : Int32 = 0,
+    include_system_messages : Bool = false,
+  ) : Array(SessionMessage)
+    SessionStorage.get_session_messages_from_store(
+      store, session_id, directory, limit, offset, include_system_messages
+    )
+  end
+
+  def self.rename_session_via_store(
+    store : SessionStore,
+    session_id : String,
+    title : String,
+    directory : String? = nil,
+  ) : Nil
+    SessionStorage.rename_session_via_store(store, session_id, title, directory)
+  end
+
+  def self.tag_session_via_store(
+    store : SessionStore,
+    session_id : String,
+    tag : String?,
+    directory : String? = nil,
+  ) : Nil
+    SessionStorage.tag_session_via_store(store, session_id, tag, directory)
+  end
+
+  def self.delete_session_via_store(
+    store : SessionStore,
+    session_id : String,
+    directory : String? = nil,
+  ) : Nil
+    SessionStorage.delete_session_via_store(store, session_id, directory)
+  end
+
+  def self.fork_session_via_store(
+    store : SessionStore,
+    session_id : String,
+    directory : String? = nil,
+    up_to_message_id : String? = nil,
+    title : String? = nil,
+  ) : ForkSessionResult
+    SessionStorage.fork_session_via_store(
+      store, session_id, directory, up_to_message_id, title
+    )
+  end
+
+  def self.list_subagents_from_store(
+    store : SessionStore,
+    session_id : String,
+    directory : String? = nil,
+  ) : Array(String)
+    SessionStorage.list_subagents_from_store(store, session_id, directory)
+  end
+
+  def self.get_subagent_messages_from_store(
+    store : SessionStore,
+    session_id : String,
+    agent_id : String,
+    directory : String? = nil,
+    limit : Int32? = nil,
+    offset : Int32 = 0,
+  ) : Array(SessionMessage)
+    SessionStorage.get_subagent_messages_from_store(
+      store, session_id, agent_id, directory, limit, offset
+    )
   end
 end

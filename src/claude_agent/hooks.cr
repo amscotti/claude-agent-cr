@@ -20,6 +20,13 @@ module ClaudeAgent
     TeammateIdle       # A background agent is idle and available
     TaskCompleted      # A background task finished
     ConfigChange       # Settings/permissions changed mid-session
+    # Transform or hide assistant message text as it is displayed
+    # (TS SDK 0.3.152 / Claude Code v2.1.152). Return displayContent via
+    # HookSpecificOutput to rewrite, or suppress_output / empty content to hide.
+    MessageDisplay
+    # Fired when a new working directory is registered mid-session
+    # (TS SDK 0.3.219 / control protocol DirectoryAdded lifecycle).
+    DirectoryAdded
   end
 
   # Forward declaration for types used in callback
@@ -73,6 +80,10 @@ module ClaudeAgent
     property teammate_idle : Array(HookCallback)?
     property task_completed : Array(HookCallback)?
     property config_change : Array(HookCallback)?
+    # MessageDisplay: transform/hide assistant text as it is displayed.
+    property message_display : Array(HookCallback)?
+    # DirectoryAdded: a new working directory was registered mid-session.
+    property directory_added : Array(HookCallback)?
 
     def initialize(
       @pre_tool_use : Array(HookMatcher)? = nil,
@@ -92,6 +103,8 @@ module ClaudeAgent
       @teammate_idle : Array(HookCallback)? = nil,
       @task_completed : Array(HookCallback)? = nil,
       @config_change : Array(HookCallback)? = nil,
+      @message_display : Array(HookCallback)? = nil,
+      @directory_added : Array(HookCallback)? = nil,
     )
     end
   end
@@ -131,7 +144,9 @@ module ClaudeAgent
     property trigger : String? # "manual" | "auto"
     property custom_instructions : String?
     # SessionStart fields
-    property source : String? # "startup" | "resume" | "clear" | "compact"
+    # "startup" | "resume" | "clear" | "compact" | "fork"
+    # (`"fork"` is reported when the session begins as a fork, Claude Code v2.1.214+)
+    property source : String?
     # SessionEnd fields
     property session_end_reason : String? # "clear" | "logout" | "prompt_input_exit" | etc.
     # PermissionRequest fields
@@ -152,6 +167,11 @@ module ClaudeAgent
     # ConfigChange hook fields
     property config_change_source : String? # e.g. "settings", "permissions"
     property config_change_diff : Hash(String, JSON::Any)?
+    # MessageDisplay fields — assistant text about to be shown to the user.
+    # Hooks can rewrite via HookSpecificOutput#display_content.
+    property message_content : String?
+    # DirectoryAdded: absolute path of the newly registered working directory.
+    property directory_path : String?
     # Stable identifier for the current prompt, emitted by the CLI so hooks
     # can correlate their events with OpenTelemetry prompt-level spans.
     # Matches the TS SDK's `prompt_id` (0.3.196). Absent on older CLIs.
@@ -196,6 +216,8 @@ module ClaudeAgent
       @task_summary : String? = nil,
       @config_change_source : String? = nil,
       @config_change_diff : Hash(String, JSON::Any)? = nil,
+      @message_content : String? = nil,
+      @directory_path : String? = nil,
       @prompt_id : String? = nil,
     )
     end
@@ -221,6 +243,10 @@ module ClaudeAgent
     property updated_mcp_tool_output : JSON::Any?
     property action : String?
     property content : Hash(String, JSON::Any)?
+    # MessageDisplay: rewritten assistant text shown to the user (wire key
+    # `displayContent`). Empty string hides the content.
+    @[JSON::Field(key: "displayContent")]
+    property display_content : String?
 
     def initialize(
       @hook_event_name : String,
@@ -233,6 +259,7 @@ module ClaudeAgent
       @updated_mcp_tool_output : JSON::Any? = nil,
       @action : String? = nil,
       @content : Hash(String, JSON::Any)? = nil,
+      @display_content : String? = nil,
     )
     end
   end

@@ -1,5 +1,5 @@
 name: claude-agent-cr
-version: 0.8.0
+version: 0.9.0
 description: |
   An unofficial Anthropic Agent SDK for Crystal. Provides a programmatic interface
   to the Claude Code CLI for building autonomous AI agents.
@@ -21,4 +21,4 @@ targets:
 development_dependencies:
   ameba:
     github: crystal-ameba/ameba
-    version: ~> 1.6
+    version: ~> 1.7.0-dev

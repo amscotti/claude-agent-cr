@@ -126,11 +126,82 @@ module ClaudeAgent
     getter description : String?
   end
 
-  # Interrupt request
+  # Interrupt request.
+  # Opt-in `cancel_queued` (capability `interrupt_cancel_queued_v1`) cancels
+  # queued and pending-dispatch messages alongside the abort (TS 0.3.205).
   struct ControlInterruptRequest
     include JSON::Serializable
 
     getter subtype : String = "interrupt"
+    # When true, also cancel queued/pending-dispatch messages.
+    @[JSON::Field(key: "cancel_queued")]
+    getter? cancel_queued : Bool?
+
+    def initialize(@cancel_queued : Bool? = nil)
+    end
+  end
+
+  # Receipt returned by an interrupt control response (capability
+  # `interrupt_receipt_v1`, TS 0.3.219). `still_queued` lists UUIDs of
+  # queued async messages that will still run after the interrupt.
+  # When the request set `cancel_queued: true` (capability
+  # `interrupt_cancel_queued_v1`), cancelled UUIDs are listed under
+  # `cancelled` and `still_queued` is empty.
+  struct InterruptReceipt
+    getter still_queued : Array(String)
+    # UUIDs cancelled by this interrupt when `cancel_queued: true`.
+    # Also accepts the wire alias `cancelled_uuids`.
+    getter cancelled : Array(String)
+
+    def initialize(
+      @still_queued : Array(String) = [] of String,
+      @cancelled : Array(String) = [] of String,
+    )
+    end
+
+    def self.from_response(response : Hash(String, JSON::Any)) : InterruptReceipt
+      still = parse_uuid_array(response, "still_queued", "stillQueued")
+      cancelled = parse_uuid_array(response, "cancelled", "cancelled_uuids", "cancelledUuids")
+      new(still, cancelled)
+    end
+
+    private def self.parse_uuid_array(
+      response : Hash(String, JSON::Any),
+      *keys : String,
+    ) : Array(String)
+      keys.each do |key|
+        if arr = response[key]?.try(&.as_a?)
+          return arr.compact_map(&.as_s?)
+        end
+      end
+      [] of String
+    end
+  end
+
+  # One path+mtime entry for seeding the CLI's readFileState cache so Edit
+  # validation succeeds after the originating Read left context.
+  struct ReadStateEntry
+    include JSON::Serializable
+
+    property path : String
+    # File mtime (typically milliseconds since epoch, matching Node mtimeMs).
+    property mtime : Int64
+
+    def initialize(@path : String, @mtime : Int64)
+    end
+  end
+
+  # Control request that seeds readFileState with a path+mtime entry
+  # (TS `seed_read_state`, CLI 2.1.83+).
+  struct ControlSeedReadStateRequest
+    include JSON::Serializable
+
+    getter subtype : String = "seed_read_state"
+    getter path : String
+    getter mtime : Int64
+
+    def initialize(@path : String, @mtime : Int64)
+    end
   end
 
   # Set permission mode request
@@ -365,6 +436,7 @@ module ClaudeAgent
                               ControlHookCallbackRequest |
                               ControlRewindFilesRequest |
                               ControlRewindConversationRequest |
+                              ControlSeedReadStateRequest |
                               ControlUnknownRequest
 
   # Converter for parsing control request inner based on subtype
@@ -396,6 +468,7 @@ module ClaudeAgent
       "hook_callback"           => ->(json : String) { ControlHookCallbackRequest.from_json(json).as(ControlRequestInner) },
       "rewind_files"            => ->(json : String) { ControlRewindFilesRequest.from_json(json).as(ControlRequestInner) },
       "rewind_conversation"     => ->(json : String) { ControlRewindConversationRequest.from_json(json).as(ControlRequestInner) },
+      "seed_read_state"         => ->(json : String) { ControlSeedReadStateRequest.from_json(json).as(ControlRequestInner) },
     }
 
     def self.from_json(pull : JSON::PullParser) : ControlRequestInner

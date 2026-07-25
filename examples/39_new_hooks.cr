@@ -58,7 +58,7 @@ begin
       end
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipping live run."
 rescue ex
   puts "Live run skipped: #{ex.message}"

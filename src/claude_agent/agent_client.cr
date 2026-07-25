@@ -1,4 +1,5 @@
 require "set"
+require "uuid"
 require "./cli_client"
 require "./hooks"
 require "./types/control_messages"
@@ -41,6 +42,21 @@ module ClaudeAgent
       "task_completed"        => "task_completed",
       "ConfigChange"          => "config_change",
       "config_change"         => "config_change",
+      "MessageDisplay"        => "message_display",
+      "message_display"       => "message_display",
+      "DirectoryAdded"        => "directory_added",
+      "directory_added"       => "directory_added",
+    }
+
+    # Task types whose completion can wake a follow-up turn. Matches the
+    # Python SDK's DEFERRING_TASK_TYPES.
+    private DEFERRING_TASK_TYPES = Set{"local_agent", "local_workflow"}
+
+    # Known permission mode wire values accepted by set_permission_mode.
+    # `"manual"` is an alias for `"default"` (TS 0.3.200 / 0.3.214).
+    private KNOWN_PERMISSION_MODE_STRINGS = Set{
+      "default", "manual", "acceptEdits", "plan",
+      "bypassPermissions", "auto", "dontAsk",
     }
 
     private struct HookCallbackRegistration
@@ -58,6 +74,10 @@ module ClaudeAgent
     @control_request_mutex : Mutex
     @registered_hook_callbacks : Hash(String, HookCallbackRegistration)
     @registered_control_hook_events : Set(String)
+    # Original tool inputs for suppress'ed can_use_tool requests, keyed by
+    # control request_id. Used by `respond_to_permission` when building the
+    # allow payload (updatedInput defaults to the original input).
+    @pending_permission_inputs : Hash(String, Hash(String, JSON::Any))
     @hook_callback_counter : Int64 = 0
     @request_counter : Int64 = 0
     @interrupted : Bool = false
@@ -65,6 +85,15 @@ module ClaudeAgent
     @started : Bool = false
     @server_info : ServerInfo? = nil
     @state_mutex : Mutex = Mutex.new
+    # Task IDs of started-but-not-finished delegated agent work. A result
+    # frame only ends one turn — background tasks keep running past it and
+    # may still emit messages / need control responses (Py 0.2.127 / #1088).
+    # Only `local_agent` / `local_workflow` types are tracked; background
+    # shells can run forever and would withhold end-of-turn forever.
+    @inflight_tasks : Set(String) = Set(String).new
+    # SessionStore live transcript mirror (nil when no session_store option).
+    @mirror_batcher : TranscriptMirrorBatcher? = nil
+    @materialized_resume : MaterializedResume? = nil
 
     def initialize(@options : AgentOptions? = nil, cli_client : CLIClient? = nil)
       @cli_client = cli_client || CLIClient.new(@options)
@@ -73,6 +102,7 @@ module ClaudeAgent
       @control_request_mutex = Mutex.new
       @registered_hook_callbacks = {} of String => HookCallbackRegistration
       @registered_control_hook_events = Set(String).new
+      @pending_permission_inputs = {} of String => Hash(String, JSON::Any)
     end
 
     # Get the current session ID
@@ -85,7 +115,9 @@ module ClaudeAgent
     end
 
     def start
+      prepare_session_store!
       @cli_client.start
+      setup_transcript_mirror
       @state_mutex.synchronize do
         @interrupted = false
         @started = true
@@ -95,6 +127,7 @@ module ClaudeAgent
         send_sdk_initialization
       rescue ex
         @state_mutex.synchronize { @started = false }
+        teardown_session_store
         @cli_client.stop
         @message_channel.close unless @message_channel.closed?
         raise ex
@@ -105,6 +138,41 @@ module ClaudeAgent
     # Send SDK MCP server initialization to CLI
     private def send_sdk_initialization
       return if @sdk_init_sent
+      # Register hooks under the same mutex as reinitialize / hook lookups
+      # so the response-reader fiber cannot race registry mutations.
+      request = @control_request_mutex.synchronize { build_initialize_request }
+      response = send_control_request(request, 90.seconds)
+      @server_info = response.empty? ? nil : ServerInfo.from_data(response)
+      @sdk_init_sent = true
+    end
+
+    # Re-send the initialize control request after a transport gap.
+    # Redelivers hooks/agents/skills payload and lets the CLI redeliver
+    # pending permission/dialog prompts (TS 0.3.195 `Query.reinitialize()`).
+    # Clears prior hook callback registrations so newly advertised callback
+    # IDs map cleanly onto this client's registry.
+    #
+    # Hook registry clear/rebuild is guarded by `@control_request_mutex` so
+    # concurrent `handle_hook_callback_request` lookups cannot race the
+    # rebuild. The mutex is released before waiting on the control response
+    # to avoid deadlock with the response-reader fiber.
+    def reinitialize : Hash(String, JSON::Any)
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      request = @control_request_mutex.synchronize do
+        @registered_hook_callbacks.clear
+        @registered_control_hook_events.clear
+        @hook_callback_counter = 0
+        build_initialize_request
+      end
+
+      response = send_control_request(request, 90.seconds)
+      @server_info = response.empty? ? nil : ServerInfo.from_data(response)
+      @sdk_init_sent = true
+      response
+    end
+
+    private def build_initialize_request : Hash(String, JSON::Any)
       request = {} of String => JSON::Any
       request["subtype"] = JSON::Any.new("initialize")
 
@@ -115,9 +183,7 @@ module ClaudeAgent
       populate_initialize_skills(request)
       populate_initialize_system_prompt(request)
 
-      response = send_control_request(request, 90.seconds)
-      @server_info = response.empty? ? nil : ServerInfo.from_data(response)
-      @sdk_init_sent = true
+      request
     end
 
     private def populate_initialize_mcp(request : Hash(String, JSON::Any))
@@ -194,6 +260,7 @@ module ClaudeAgent
       # takes over without leaving `each_response` blocked.
       @message_channel.close unless @message_channel.closed?
       @cli_client.stop
+      teardown_session_store
     end
 
     # Send a query and get responses
@@ -211,16 +278,36 @@ module ClaudeAgent
       response["cancelled"]?.try(&.as_bool?) == true
     end
 
-    # Interrupt a streaming query
-    def interrupt
-      @state_mutex.synchronize do
-        return if @interrupted
-        @interrupted = true
-      end
+    # Interrupt a streaming query via the control protocol.
+    #
+    # Pass `cancel_queued: true` (capability `interrupt_cancel_queued_v1`) to
+    # also cancel queued and pending-dispatch messages. The response may
+    # include `still_queued` — UUIDs of queued async messages that will still
+    # run (capability `interrupt_receipt_v1`, TS 0.3.205 / 0.3.219) — and
+    # when cancelling, `cancelled` — UUIDs removed by this interrupt.
+    def interrupt(*, cancel_queued : Bool = false) : InterruptReceipt
+      @state_mutex.synchronize { @interrupted = true }
 
-      @cli_client.send_message({
-        "type" => JSON::Any.new("interrupt"),
-      })
+      request = {
+        "subtype" => JSON::Any.new("interrupt"),
+      }
+      request["cancel_queued"] = JSON::Any.new(true) if cancel_queued
+
+      response = send_control_request(request)
+      InterruptReceipt.from_response(response)
+    end
+
+    # Seed the CLI's `readFileState` cache with path+mtime entries so `Edit`
+    # works after the originating `Read` was removed from context
+    # (TS `seed_read_state`, CLI 2.1.83+). Sends one control request per entry.
+    def seed_read_state(entries : Array(ReadStateEntry))
+      entries.each do |entry|
+        send_control_request({
+          "subtype" => JSON::Any.new("seed_read_state"),
+          "path"    => JSON::Any.new(entry.path),
+          "mtime"   => JSON::Any.new(entry.mtime),
+        })
+      end
     end
 
     # ameba:disable Naming/AccessorMethodName
@@ -230,9 +317,10 @@ module ClaudeAgent
 
     # ameba:disable Naming/AccessorMethodName
     def set_permission_mode(mode : String)
+      wire_mode = normalize_permission_mode_string(mode)
       send_control_request({
         "subtype" => JSON::Any.new("set_permission_mode"),
-        "mode"    => JSON::Any.new(mode),
+        "mode"    => JSON::Any.new(wire_mode),
       })
     end
 
@@ -285,12 +373,43 @@ module ClaudeAgent
 
     # Replace the active MCP server configuration at runtime.
     # Accepts a hash mirroring the `mcpServers` entries from options.
-    # ameba:disable Naming/AccessorMethodName
-    def set_mcp_servers(mcp_servers : Hash(String, JSON::Any))
+    #
+    # Optional `request_timeouts` merges a per-server `request_timeout_ms`
+    # into each named entry (TS 0.3.198). Servers may also carry the field
+    # directly in their config hash for full backward compatibility.
+    def set_mcp_servers(
+      mcp_servers : Hash(String, JSON::Any),
+      *,
+      request_timeouts : Hash(String, Int32)? = nil,
+    )
+      servers = merge_mcp_request_timeouts(mcp_servers, request_timeouts)
       send_control_request({
         "subtype"    => JSON::Any.new("mcp_set_servers"),
-        "mcpServers" => JSON::Any.new(mcp_servers),
+        "mcpServers" => JSON::Any.new(servers),
       })
+    end
+
+    private def merge_mcp_request_timeouts(
+      mcp_servers : Hash(String, JSON::Any),
+      request_timeouts : Hash(String, Int32)?,
+    ) : Hash(String, JSON::Any)
+      return mcp_servers unless request_timeouts
+
+      merged = {} of String => JSON::Any
+      mcp_servers.each do |name, config|
+        if timeout = request_timeouts[name]?
+          if entry = config.as_h?
+            entry = entry.dup
+            entry["request_timeout_ms"] = JSON::Any.new(timeout.to_i64)
+            merged[name] = JSON::Any.new(entry)
+          else
+            merged[name] = config
+          end
+        else
+          merged[name] = config
+        end
+      end
+      merged
     end
 
     # Activate the tools channel on an MCP server that advertises it
@@ -386,12 +505,21 @@ module ClaudeAgent
     # Rewind files to a checkpoint.
     # Requires enable_file_checkpointing: true and replay_user_messages: true.
     # Sends via the control protocol (matching the TypeScript SDK).
+    #
+    # Response may include `skippedLinks` (Int count of paths the rewind
+    # safety guards refused to restore or delete; TS 0.3.x). Use
+    # `rewind_files_skipped_links` to extract it.
     def rewind_files(user_message_id : String, *, dry_run : Bool = false) : Hash(String, JSON::Any)
       send_control_request({
         "subtype"         => JSON::Any.new("rewind_files"),
         "user_message_id" => JSON::Any.new(user_message_id),
         "dry_run"         => JSON::Any.new(dry_run),
       })
+    end
+
+    # Extract the optional `skippedLinks` count from a `rewind_files` response.
+    def self.rewind_files_skipped_links(response : Hash(String, JSON::Any)) : Int32?
+      response["skippedLinks"]?.try(&.as_i?)
     end
 
     # Rewind the conversation transcript to a previous user message and
@@ -407,23 +535,44 @@ module ClaudeAgent
       })
     end
 
-    # Iterate over incoming messages
+    # Iterate over incoming messages.
+    #
+    # A `ResultMessage` ends one turn, not necessarily the run: delegated
+    # background tasks (`local_agent` / `local_workflow`) can keep running
+    # past it and still emit messages or need control responses (Py 0.2.127 /
+    # #1088). This loop keeps reading while such tasks are in flight, and
+    # only stops once a result has been seen with an empty in-flight set.
+    # When `prompt_suggestions` is enabled, a short post-idle wait still
+    # collects a trailing `prompt_suggestion` message.
     def each_response(&block : Message ->)
       result_received = false
+      awaiting_prompt_suggestion = false
 
       loop do
-        message = receive_next_message(result_received)
+        message = if awaiting_prompt_suggestion
+                    receive_post_result_message
+                  else
+                    @message_channel.receive?
+                  end
         break unless message
         next if handle_internal_message(message)
 
+        track_task_lifecycle(message)
         run_message_hooks(message)
         block.call(message)
 
-        if result_received
-          break
-        elsif message.is_a?(ResultMessage)
+        if message.is_a?(ResultMessage)
           result_received = true
-          break unless @options.try(&.prompt_suggestions?)
+        end
+
+        # Stop only when a result has been seen and no tracked background
+        # tasks remain. Then optionally wait once for a prompt suggestion.
+        if result_received && !has_inflight_tasks?
+          if @options.try(&.prompt_suggestions?) && !awaiting_prompt_suggestion
+            awaiting_prompt_suggestion = true
+            next
+          end
+          break
         end
       end
     end
@@ -435,14 +584,35 @@ module ClaudeAgent
       @cli_client.send_user_message(content, uuid: uuid, should_query: should_query)
     end
 
-    # Send permission response
+    # Send permission response (legacy stream-message path).
     def grant_permission(tool_use_id : String, allow : Bool, reason : String? = nil)
-      message = Hash(String, String | Bool | Nil).new
+      message = Hash(String, String | Bool?).new
       message["type"] = "permission_response"
       message["tool_use_id"] = tool_use_id
       message["allow"] = allow
       message["reason"] = reason if reason
       @cli_client.send_json(message)
+    end
+
+    # Reply out-of-band to a `can_use_tool` control request whose callback
+    # returned `PermissionResult.suppress`. Pair with
+    # `PermissionContext#request_id` from the callback.
+    #
+    # Builds the allow/deny payload via the same path as the automatic
+    # control handler. When allowing, original tool input is taken from the
+    # pending map (stored at suppress time), else `result.updated_input`,
+    # else an empty hash.
+    def respond_to_permission(request_id : String, result : PermissionResult)
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      original_input = @control_request_mutex.synchronize do
+        @pending_permission_inputs.delete(request_id)
+      end
+      original_input ||= result.updated_input || {} of String => JSON::Any
+
+      response_data = permission_result_to_response(result, original_input)
+      response = ControlResponse.success(request_id, JSON::Any.new(response_data))
+      @cli_client.send_control_response(response)
     end
 
     # Answer a UserQuestion from the CLI.
@@ -479,6 +649,19 @@ module ClaudeAgent
               next
             end
 
+            # SessionStore path: peel transcript_mirror frames off the stream
+            # (do not yield to consumers). Matches Python Query._read_messages.
+            if message.is_a?(UnknownMessage) && message.type == "transcript_mirror"
+              handle_transcript_mirror(message)
+              next
+            end
+
+            # Flush pending mirror entries before consumers see the result so
+            # the store is up to date for this turn.
+            if message.is_a?(ResultMessage)
+              @mirror_batcher.try(&.flush)
+            end
+
             @message_channel.send(message)
           end
         rescue Channel::ClosedError
@@ -489,6 +672,109 @@ module ClaudeAgent
           fail_pending_control_requests(connection_closed_error)
           @message_channel.close unless @message_channel.closed?
         end
+      end
+    end
+
+    # Validate session_store options and materialize resume/continue from the
+    # store into a temp CLAUDE_CONFIG_DIR when needed. AgentOptions is a struct,
+    # so materialization returns a new options value that we push into both
+    # AgentClient and CLIClient before spawn.
+    private def prepare_session_store! : Nil
+      opts = @options
+      return unless opts
+
+      ClaudeAgent.validate_session_store_options!(opts)
+      return unless opts.session_store
+
+      if materialized = ClaudeAgent.materialize_resume_session(opts)
+        updated = ClaudeAgent.apply_materialized_options(opts, materialized)
+        @options = updated
+        @cli_client.replace_options(updated)
+        @materialized_resume = materialized
+      end
+    end
+
+    private def setup_transcript_mirror : Nil
+      opts = @options
+      store = opts.try(&.session_store)
+      return unless opts && store
+
+      projects_dir = ClaudeAgent.effective_projects_dir(opts.env)
+      @mirror_batcher = ClaudeAgent.build_mirror_batcher(
+        store,
+        projects_dir: projects_dir,
+        flush_mode: opts.session_store_flush,
+        on_error: ->(key : SessionKey?, error : String) {
+          report_mirror_error(key, error)
+        },
+      )
+    end
+
+    private def teardown_session_store : Nil
+      @mirror_batcher.try(&.close)
+      @mirror_batcher = nil
+      @materialized_resume.try(&.cleanup)
+      @materialized_resume = nil
+    end
+
+    private def handle_transcript_mirror(message : UnknownMessage) : Nil
+      batcher = @mirror_batcher
+      return unless batcher
+
+      data = message.data
+      file_path = data["filePath"]?.try(&.as_s?) || data["file_path"]?.try(&.as_s?)
+      return unless file_path
+
+      raw_entries = data["entries"]?.try(&.as_a?)
+      return unless raw_entries
+
+      entries = raw_entries.compact_map do |value|
+        hash = value.as_h?
+        next unless hash
+        begin
+          SessionStoreEntry.from_hash(hash)
+        rescue
+          nil
+        end
+      end
+      return if entries.empty?
+
+      batcher.enqueue(file_path, entries)
+    end
+
+    # Surface a SessionStore.append failure as a mirror_error message for
+    # consumers (at-most-once; the dropped batch is not retried further).
+    private def report_mirror_error(key : SessionKey?, error : String) : Nil
+      return if @message_channel.closed?
+
+      session_id = key.try(&.session_id) || ""
+      data = {
+        "type"       => JSON::Any.new("mirror_error"),
+        "subtype"    => JSON::Any.new("mirror_error"),
+        "error"      => JSON::Any.new(error),
+        "session_id" => JSON::Any.new(session_id),
+        "uuid"       => JSON::Any.new(UUID.random.to_s),
+      } of String => JSON::Any
+      if key
+        key_hash = {
+          "project_key" => JSON::Any.new(key.project_key),
+          "session_id"  => JSON::Any.new(key.session_id),
+        } of String => JSON::Any
+        if sub = key.subpath
+          key_hash["subpath"] = JSON::Any.new(sub)
+        end
+        data["key"] = JSON::Any.new(key_hash)
+      end
+
+      msg = MirrorErrorMessage.new(
+        data["uuid"].as_s?,
+        session_id,
+        error,
+        data,
+      )
+      begin
+        @message_channel.send(msg)
+      rescue Channel::ClosedError
       end
     end
 
@@ -508,6 +794,22 @@ module ClaudeAgent
       mode.to_cli_value
     end
 
+    # Normalize a permission-mode string for the control wire.
+    # Accepts `"manual"` as an alias for `"default"`; rejects unrecognized
+    # modes with a clear error instead of silently forwarding them
+    # (TS 0.3.200 / 0.3.214).
+    private def normalize_permission_mode_string(mode : String) : String
+      unless KNOWN_PERMISSION_MODE_STRINGS.includes?(mode)
+        raise Error.new(
+          "Unrecognized permission mode: #{mode.inspect}. " \
+          "Expected one of: default, manual, acceptEdits, plan, " \
+          "bypassPermissions, auto, dontAsk"
+        )
+      end
+
+      mode == "manual" ? "default" : mode
+    end
+
     private def receive_post_result_message : Message?
       select
       when message = @message_channel.receive?
@@ -517,11 +819,24 @@ module ClaudeAgent
       end
     end
 
-    private def receive_next_message(result_received : Bool) : Message?
-      if result_received && @options.try(&.prompt_suggestions?)
-        receive_post_result_message
-      else
-        @message_channel.receive?
+    private def has_inflight_tasks? : Bool
+      !@inflight_tasks.empty?
+    end
+
+    # Track delegated agent task lifecycle so `each_response` can tell
+    # "one turn ended" apart from "the run is idle". Only
+    # DEFERRING_TASK_TYPES are tracked — background shells may never
+    # reach a terminal status and would withhold end-of-turn forever.
+    private def track_task_lifecycle(message : Message)
+      case message
+      when TaskStartedMessage
+        if task_type = message.task_type
+          @inflight_tasks.add(message.task_id) if DEFERRING_TASK_TYPES.includes?(task_type)
+        end
+      when TaskNotificationMessage
+        @inflight_tasks.delete(message.task_id)
+      when TaskUpdatedMessage
+        @inflight_tasks.delete(message.task_id) if message.terminal?
       end
     end
 
@@ -652,7 +967,7 @@ module ClaudeAgent
 
     private def build_hook_initialize_payload : Hash(String, JSON::Any)?
       hooks = @options.try(&.hooks)
-      return nil unless hooks
+      return unless hooks
 
       payload = {} of String => JSON::Any
 
@@ -670,6 +985,8 @@ module ClaudeAgent
       add_simple_hook_payload(payload, "TeammateIdle", hooks.teammate_idle)
       add_simple_hook_payload(payload, "TaskCompleted", hooks.task_completed)
       add_simple_hook_payload(payload, "ConfigChange", hooks.config_change)
+      add_simple_hook_payload(payload, "MessageDisplay", hooks.message_display)
+      add_simple_hook_payload(payload, "DirectoryAdded", hooks.directory_added)
 
       payload.empty? ? nil : payload
     end
@@ -697,6 +1014,9 @@ module ClaudeAgent
       return if entries.empty?
 
       payload[hook_name] = JSON::Any.new(entries)
+      # Caller (build_initialize_request via reinitialize/start) owns locking
+      # for registry mutations; start path is also single-writer until the
+      # initialize response is processed.
       @registered_control_hook_events.add(hook_name)
     end
 
@@ -718,6 +1038,10 @@ module ClaudeAgent
       @registered_control_hook_events.add(hook_name)
     end
 
+    # Must be called while holding `@control_request_mutex` during reinitialize
+    # rebuild; safe on the single-threaded start init path before concurrent
+    # hook callbacks arrive (reader is spawned but hooks are registered before
+    # the CLI typically issues callbacks).
     private def register_hook_callbacks(
       hook_name : String,
       callbacks : Array(HookCallback),
@@ -731,12 +1055,14 @@ module ClaudeAgent
     end
 
     private def control_hook_registered?(hook_name : String) : Bool
-      @registered_control_hook_events.includes?(hook_name)
+      @control_request_mutex.synchronize do
+        @registered_control_hook_events.includes?(hook_name)
+      end
     end
 
     private def build_agents_initialize_payload : JSON::Any?
       agents = @options.try(&.agents)
-      return nil unless agents
+      return unless agents
 
       JSON.parse(agents.to_json)
     end
@@ -766,7 +1092,6 @@ module ClaudeAgent
                   when :session_start      then hooks.session_start
                   when :session_end        then hooks.session_end
                   when :user_prompt_submit then hooks.user_prompt_submit
-                  else                          nil
                   end
 
       return unless callbacks
@@ -817,6 +1142,12 @@ module ClaudeAgent
         )
 
         result = callback.call(context)
+        # Suppress is for the control-protocol can_use_tool path where a
+        # request_id exists for OOB reply. Legacy PermissionRequest messages
+        # have no request_id — treat suppress as a defer no-op (do not
+        # grant and do not deny) rather than auto-denying via allow=false.
+        return if result.suppress_response?
+
         grant_permission(request.tool_use_id, result.allow?, result.reason)
         return
       end
@@ -889,59 +1220,67 @@ module ClaudeAgent
       hooks = @options.try(&.hooks)
       return unless hooks
 
-      # Check for ToolResultBlock in content (indicates tool completed)
       message.content.each do |block|
         next unless block.is_a?(ToolResultBlock)
+        invoke_post_tool_use_hooks(hooks, message, block)
+      end
+    end
 
-        # Find the corresponding ToolUseBlock to get the tool name
-        tool_name = find_tool_name_for_result(message, block.tool_use_id)
-        next unless tool_name
+    private def invoke_post_tool_use_hooks(
+      hooks : HookConfig,
+      message : AssistantMessage,
+      block : ToolResultBlock,
+    )
+      tool_name = find_tool_name_for_result(message, block.tool_use_id)
+      return unless tool_name
 
-        # Determine if this was a failure
-        is_error = block.is_error == true
-        if is_error
-          next if control_hook_registered?("PostToolUseFailure")
-        else
-          next if control_hook_registered?("PostToolUse")
+      is_error = block.is_error == true
+      hook_event = is_error ? "PostToolUseFailure" : "PostToolUse"
+      return if control_hook_registered?(hook_event)
+
+      hook_matchers = is_error ? hooks.post_tool_use_failure : hooks.post_tool_use
+      return unless hook_matchers
+
+      input = build_post_tool_use_hook_input(message, block, tool_name, is_error, hook_event)
+      session_id = input.session_id || ""
+      ctx = HookContext.new(session_id: session_id)
+
+      hook_matchers.each do |hook_matcher|
+        next unless hook_matcher.matches?(tool_name)
+        hook_matcher.hooks.each do |callback|
+          safe_hook_call("PostToolUse") { callback.call(input, block.tool_use_id, ctx) }
         end
+      end
+    end
 
-        hook_matchers = is_error ? hooks.post_tool_use_failure : hooks.post_tool_use
-        next unless hook_matchers
+    private def build_post_tool_use_hook_input(
+      message : AssistantMessage,
+      block : ToolResultBlock,
+      tool_name : String,
+      is_error : Bool,
+      hook_event : String,
+    ) : HookInput
+      result_content = tool_result_content_string(block.content)
+      common = hook_common_fields(hook_event)
+      HookInput.new(
+        session_id: common[:session_id],
+        cwd: common[:cwd],
+        permission_mode: common[:permission_mode],
+        hook_event_name: common[:hook_event_name],
+        tool_name: tool_name,
+        tool_input: find_tool_input_for_result(message, block.tool_use_id),
+        tool_use_id: block.tool_use_id,
+        tool_result: result_content,
+        tool_response: result_content,
+        error: is_error ? result_content : nil,
+      )
+    end
 
-        hook_matchers.each do |hook_matcher|
-          next unless hook_matcher.matches?(tool_name)
-
-          # Get result content as string
-          result_content = case content = block.content
-                           when String then content
-                           when Array  then content.to_json
-                           else             ""
-                           end
-
-          hook_event = is_error ? "PostToolUseFailure" : "PostToolUse"
-          common = hook_common_fields(hook_event)
-          # Find the original tool_input from the ToolUseBlock
-          original_tool_input = find_tool_input_for_result(message, block.tool_use_id)
-          input = HookInput.new(
-            session_id: common[:session_id],
-            cwd: common[:cwd],
-            permission_mode: common[:permission_mode],
-            hook_event_name: common[:hook_event_name],
-            tool_name: tool_name,
-            tool_input: original_tool_input,
-            tool_use_id: block.tool_use_id,
-            tool_result: result_content,
-            tool_response: result_content,
-            error: is_error ? result_content : nil,
-          )
-          ctx = HookContext.new(session_id: common[:session_id])
-
-          hook_matcher.hooks.each do |callback|
-            safe_hook_call("PostToolUse") do
-              callback.call(input, block.tool_use_id, ctx)
-            end
-          end
-        end
+    private def tool_result_content_string(content) : String
+      case content
+      when String then content
+      when Array  then content.to_json
+      else             ""
       end
     end
 
@@ -1141,8 +1480,20 @@ module ClaudeAgent
                           title: req.title,
                           display_name: req.display_name,
                           description: req.description,
+                          request_id: request_id,
                         )
-                        permission_result_to_response(callback.call(context), req.input)
+                        result = callback.call(context)
+                        # Returning suppress (TS canUseTool → null) means the
+                        # caller will respond out-of-band using request_id via
+                        # `respond_to_permission`. Stash original input for
+                        # allow payloads that omit updated_input.
+                        if result.suppress_response?
+                          @control_request_mutex.synchronize do
+                            @pending_permission_inputs[request_id] = req.input
+                          end
+                          return
+                        end
+                        permission_result_to_response(result, req.input)
                       else
                         {
                           "behavior"     => JSON::Any.new("allow"),
@@ -1178,7 +1529,9 @@ module ClaudeAgent
 
     # Handle hook callback request from CLI (e.g. PreCompact)
     private def handle_hook_callback_request(request_id : String, req : ControlHookCallbackRequest)
-      registration = @registered_hook_callbacks[req.callback_id]?
+      registration = @control_request_mutex.synchronize do
+        @registered_hook_callbacks[req.callback_id]?
+      end
       raise Error.new("No hook callback found for ID: #{req.callback_id}") unless registration
 
       input = build_hook_input(req.input, registration.hook_name)
@@ -1196,7 +1549,7 @@ module ClaudeAgent
     end
 
     private def extract_any(input : Hash(String, JSON::Any)?, *keys : String) : JSON::Any?
-      return nil unless input
+      return unless input
 
       keys.each do |key|
         if value = input[key]?
@@ -1286,6 +1639,10 @@ module ClaudeAgent
       when "config_change"
         input.config_change_source = extract_string(input_data, "source", "changeSource")
         input.config_change_diff = extract_hash(input_data, "diff", "change")
+      when "message_display"
+        input.message_content = extract_string(input_data, "message_content", "messageContent", "content")
+      when "directory_added"
+        input.directory_path = extract_string(input_data, "path", "directory", "directory_path", "directoryPath")
       end
 
       input
@@ -1366,7 +1723,7 @@ module ClaudeAgent
     private def parse_permission_suggestions(
       suggestions : Array(JSON::Any)?,
     ) : Array(PermissionSuggestion)?
-      return nil unless suggestions
+      return unless suggestions
 
       parsed = suggestions.compact_map do |suggestion_any|
         suggestion = suggestion_any.as_h?
@@ -1408,7 +1765,7 @@ module ClaudeAgent
         )
       when "setMode"
         mode = parse_permission_mode(data["mode"]?.try(&.as_s?))
-        return nil unless mode
+        return unless mode
 
         SetModeUpdate.new(
           mode: mode,
@@ -1464,7 +1821,7 @@ module ClaudeAgent
 
     private def parse_permission_mode(value : String?) : PermissionMode?
       case value
-      when "default"           then PermissionMode::Default
+      when "default", "manual" then PermissionMode::Default
       when "acceptEdits"       then PermissionMode::AcceptEdits
       when "plan"              then PermissionMode::Plan
       when "bypassPermissions" then PermissionMode::BypassPermissions
@@ -1591,6 +1948,9 @@ module ClaudeAgent
       end
       output.action.try { |value| response["action"] = JSON::Any.new(value) }
       output.content.try { |value| response["content"] = JSON::Any.new(value) }
+      output.display_content.try do |value|
+        response["displayContent"] = JSON::Any.new(value)
+      end
 
       response
     end

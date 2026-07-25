@@ -14,6 +14,21 @@ describe ClaudeAgent::AgentOptions do
     options.effort.should be_nil
     options.prompt_suggestions?.should be_false
     options.agent_progress_summaries?.should be_false
+    options.session_store.should be_nil
+    options.session_store_flush.should eq("batched")
+    options.load_timeout_ms.should eq(60_000)
+  end
+
+  it "accepts session_store, session_store_flush, and load_timeout_ms" do
+    store = ClaudeAgent::InMemorySessionStore.new
+    options = ClaudeAgent::AgentOptions.new(
+      session_store: store,
+      session_store_flush: "eager",
+      load_timeout_ms: 5_000,
+    )
+    options.session_store.should be(store)
+    options.session_store_flush.should eq("eager")
+    options.load_timeout_ms.should eq(5_000)
   end
 
   it "accepts all configuration options" do
@@ -269,5 +284,242 @@ describe "new AgentOptions fields (managed_settings, forward_subagent_text, sand
 
   it "defaults forward_subagent_text to false" do
     ClaudeAgent::AgentOptions.new.forward_subagent_text?.should be_false
+  end
+end
+
+describe ClaudeAgent::SandboxNetworkSettings do
+  it "accepts strict_allowlist and serializes as strictAllowlist" do
+    net = ClaudeAgent::SandboxNetworkSettings.new(
+      allowed_domains: ["api.example.com"],
+      strict_allowlist: true,
+    )
+    net.strict_allowlist?.should be_true
+    net.allowed_domains.should eq(["api.example.com"])
+
+    parsed = JSON.parse(net.to_json)
+    parsed["strictAllowlist"].as_bool.should be_true
+    parsed["allowedDomains"].as_a.map(&.as_s).should eq(["api.example.com"])
+  end
+
+  it "round-trips strict_allowlist false through JSON" do
+    net = ClaudeAgent::SandboxNetworkSettings.new(strict_allowlist: false)
+    restored = ClaudeAgent::SandboxNetworkSettings.from_json(net.to_json)
+    restored.strict_allowlist?.should be_false
+  end
+
+  it "defaults strict_allowlist to nil" do
+    ClaudeAgent::SandboxNetworkSettings.new.strict_allowlist?.should be_nil
+  end
+end
+
+describe "AgentOptions#workflow_size_guideline" do
+  it "accepts advisory size values" do
+    options = ClaudeAgent::AgentOptions.new(workflow_size_guideline: "medium")
+    options.workflow_size_guideline.should eq("medium")
+  end
+
+  it "defaults to nil" do
+    ClaudeAgent::AgentOptions.new.workflow_size_guideline.should be_nil
+  end
+end
+
+describe "AgentOptions#debug and #debug_file" do
+  it "defaults debug to false and debug_file to nil" do
+    options = ClaudeAgent::AgentOptions.new
+    options.debug?.should be_false
+    options.debug_file.should be_nil
+  end
+
+  it "accepts debug and debug_file" do
+    options = ClaudeAgent::AgentOptions.new(
+      debug: true,
+      debug_file: "/tmp/claude-debug.log",
+    )
+    options.debug?.should be_true
+    options.debug_file.should eq("/tmp/claude-debug.log")
+  end
+end
+
+describe "AgentOptions#tool_config" do
+  it "defaults to nil" do
+    ClaudeAgent::AgentOptions.new.tool_config.should be_nil
+  end
+
+  it "accepts AskUserQuestion preview_format" do
+    tool_config = ClaudeAgent::ToolConfig.new(
+      ask_user_question: ClaudeAgent::AskUserQuestionConfig.new(preview_format: "html"),
+    )
+    options = ClaudeAgent::AgentOptions.new(tool_config: tool_config)
+    options.tool_config.try(&.ask_user_question).try(&.preview_format).should eq("html")
+  end
+
+  it "serializes toolConfig with camelCase keys" do
+    tool_config = ClaudeAgent::ToolConfig.new(
+      ask_user_question: ClaudeAgent::AskUserQuestionConfig.new(preview_format: "markdown"),
+    )
+    parsed = JSON.parse(tool_config.to_json)
+    parsed["askUserQuestion"]["previewFormat"].as_s.should eq("markdown")
+  end
+
+  it "round-trips through JSON" do
+    tool_config = ClaudeAgent::ToolConfig.new(
+      ask_user_question: ClaudeAgent::AskUserQuestionConfig.new(preview_format: "html"),
+    )
+    restored = ClaudeAgent::ToolConfig.from_json(tool_config.to_json)
+    restored.ask_user_question.try(&.preview_format).should eq("html")
+  end
+end
+
+describe "AgentOptions.whole_tool_allowed" do
+  it "treats bare tool names as whole-tool allows" do
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Read").should eq("Read")
+    ClaudeAgent::AgentOptions.whole_tool_allowed("mcp__server__tool").should eq("mcp__server__tool")
+  end
+
+  it "treats empty and wildcard specifiers as whole-tool allows" do
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Read(*)").should eq("Read")
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Read()").should eq("Read")
+    ClaudeAgent::AgentOptions.whole_tool_allowed("mcp__server__tool(*)").should eq("mcp__server__tool")
+  end
+
+  it "rejects real specifiers and malformed entries" do
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Bash(ls:*)").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Bash(git log:*)").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("   ").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Bash(ls:*").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Bash(ls)x").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("(foo)").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("(*)").should be_nil
+    ClaudeAgent::AgentOptions.whole_tool_allowed("Read(*x").should be_nil
+  end
+end
+
+describe "AgentOptions#can_use_tool_shadowed_warning" do
+  # Minimal can_use_tool callback so the warning path is active.
+  can_use = ->(_ctx : ClaudeAgent::PermissionContext) {
+    ClaudeAgent::PermissionResult.allow
+  }
+
+  it "returns nil when can_use_tool is unset" do
+    options = ClaudeAgent::AgentOptions.new(
+      permission_mode: ClaudeAgent::PermissionMode::BypassPermissions,
+      allowed_tools: ["Read"],
+    )
+    options.can_use_tool_shadowed_warning.should be_nil
+  end
+
+  it "warns on bypassPermissions" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      permission_mode: ClaudeAgent::PermissionMode::BypassPermissions,
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("bypassPermissions"))
+    message.try(&.should contain("PreToolUse"))
+  end
+
+  it "bypassPermissions takes precedence over bare allowed_tools entries" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      permission_mode: ClaudeAgent::PermissionMode::BypassPermissions,
+      allowed_tools: ["Read", "Write"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("bypassPermissions"))
+    message.try(&.should_not contain("Read"))
+  end
+
+  it "lists bare allowed_tools entries that shadow the callback" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      allowed_tools: ["Read", "mcp__server__tool", "Bash(ls:*)"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("Read, mcp__server__tool"))
+    message.try(&.should_not contain("Bash(ls:*)"))
+  end
+
+  it "treats Read(*) and Read() as whole-tool allows" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      allowed_tools: ["Read(*)", "Write()"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("invoked for: Read, Write."))
+  end
+
+  it "dedupes entries that resolve to the same tool" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      allowed_tools: ["Read", "Read()", "Read(*)"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("invoked for: Read."))
+  end
+
+  it "preserves first-seen order" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      allowed_tools: ["Write", "Read", "Write()"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("invoked for: Write, Read."))
+  end
+
+  it "returns nil for specifier-only allowed_tools" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      allowed_tools: ["Bash(ls:*)", "Bash(git log:*)"],
+    )
+    options.can_use_tool_shadowed_warning.should be_nil
+  end
+
+  it "skills=all injects Skill into the shadow list" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      skills: "all",
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("invoked for: Skill"))
+  end
+
+  it "skills=all does not duplicate an explicit Skill entry" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      skills: "all",
+      allowed_tools: ["Skill"],
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("invoked for: Skill."))
+  end
+
+  it "named skills do not shadow" do
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      skills: ["reviewer"],
+    )
+    options.can_use_tool_shadowed_warning.should be_nil
+  end
+
+  it "skills=all leaves caller allowed_tools untouched" do
+    allowed = ["Read"]
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: can_use,
+      skills: "all",
+      allowed_tools: allowed,
+    )
+    message = options.can_use_tool_shadowed_warning
+    message.should_not be_nil
+    message.try(&.should contain("Read, Skill"))
+    allowed.should eq(["Read"])
   end
 end

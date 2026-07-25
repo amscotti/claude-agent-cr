@@ -26,7 +26,7 @@ started_at = Time.instant
 
 client = begin
   ClaudeAgent.startup(options)
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; cannot demo startup / get_context_usage."
   exit 0
 end

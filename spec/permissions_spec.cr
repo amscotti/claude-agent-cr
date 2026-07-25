@@ -62,6 +62,14 @@ describe ClaudeAgent::PermissionResult do
       end
     end
   end
+
+  describe ".suppress" do
+    it "creates a suppress_response result" do
+      result = ClaudeAgent::PermissionResult.suppress
+      result.suppress_response?.should be_true
+      result.allow?.should be_false
+    end
+  end
 end
 
 describe ClaudeAgent::PermissionRuleValue do
@@ -138,5 +146,71 @@ describe ClaudeAgent::PermissionContext do
     context.tool_input["command"].as_s.should eq("ls -la")
     context.session_id.should eq("sess-123")
     context.suggestions.should be_nil
+    context.request_id.should be_nil
+  end
+
+  it "carries request_id for out-of-band permission correlation" do
+    context = ClaudeAgent::PermissionContext.new(
+      tool_name: "Bash",
+      tool_input: {"command" => JSON::Any.new("ls")},
+      session_id: "sess-123",
+      request_id: "req_perm_42",
+    )
+
+    context.request_id.should eq("req_perm_42")
+  end
+end
+
+describe ClaudeAgent::InterruptReceipt do
+  it "parses still_queued and cancelled from a control response" do
+    receipt = ClaudeAgent::InterruptReceipt.from_response({
+      "still_queued" => JSON::Any.new([JSON::Any.new("a"), JSON::Any.new("b")]),
+      "cancelled"    => JSON::Any.new([JSON::Any.new("c")]),
+    })
+
+    receipt.still_queued.should eq(["a", "b"])
+    receipt.cancelled.should eq(["c"])
+  end
+
+  it "parses cancelled_uuids alias and defaults missing arrays to empty" do
+    receipt = ClaudeAgent::InterruptReceipt.from_response({
+      "cancelled_uuids" => JSON::Any.new([JSON::Any.new("x")]),
+    })
+
+    receipt.still_queued.should eq([] of String)
+    receipt.cancelled.should eq(["x"])
+  end
+end
+
+describe ClaudeAgent::ReadStateEntry do
+  it "holds path and mtime for seed_read_state" do
+    entry = ClaudeAgent::ReadStateEntry.new("/tmp/file.cr", 123_i64)
+    entry.path.should eq("/tmp/file.cr")
+    entry.mtime.should eq(123_i64)
+  end
+end
+
+describe ClaudeAgent::ControlSeedReadStateRequest do
+  it "serializes the seed_read_state subtype" do
+    req = ClaudeAgent::ControlSeedReadStateRequest.new("/tmp/x", 99_i64)
+    json = JSON.parse(req.to_json).as_h
+    json["subtype"].as_s.should eq("seed_read_state")
+    json["path"].as_s.should eq("/tmp/x")
+    json["mtime"].as_i64.should eq(99_i64)
+  end
+
+  it "parses via ControlRequestInnerConverter" do
+    parsed = ClaudeAgent::ControlRequestInnerConverter.from_json(
+      JSON::PullParser.new({
+        "subtype" => "seed_read_state",
+        "path"    => "/a",
+        "mtime"   => 1,
+      }.to_json)
+    )
+    parsed.should be_a(ClaudeAgent::ControlSeedReadStateRequest)
+    if parsed.is_a?(ClaudeAgent::ControlSeedReadStateRequest)
+      parsed.path.should eq("/a")
+      parsed.mtime.should eq(1_i64)
+    end
   end
 end

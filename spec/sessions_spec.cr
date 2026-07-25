@@ -592,7 +592,7 @@ describe "ClaudeAgent session utilities" do
     end
   end
 
-  it "returns top-level session messages with nil parent tool use id" do
+  it "returns top-level session messages with nil parent tool use id and parent agent id" do
     message = ClaudeAgent::SessionMessage.new(
       type: "user",
       uuid: "abc",
@@ -601,6 +601,7 @@ describe "ClaudeAgent session utilities" do
     )
 
     message.parent_tool_use_id.should be_nil
+    message.parent_agent_id.should be_nil
   end
 
   it "parses parent_tool_use_id from transcript entries" do
@@ -619,6 +620,60 @@ describe "ClaudeAgent session utilities" do
 
       messages = ClaudeAgent.get_session_messages(session_id, directory: project_path)
       messages.last.parent_tool_use_id.should eq("tool-123")
+      messages.last.parent_agent_id.should be_nil
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "parses parent_agent_id from subagent transcript entries (camel and snake)" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      parent_agent = "top-level-agent"
+      nested_agent = "nested-worker"
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+
+      user_id = UUID.random.to_s
+      assistant_id = UUID.random.to_s
+      File.write(
+        File.join(subagent_dir, "agent-#{nested_agent}.jsonl"),
+        [
+          make_transcript_entry(
+            "user",
+            user_id,
+            nil,
+            session_id,
+            content: "nested task",
+            parentAgentId: parent_agent,
+          ),
+          make_transcript_entry(
+            "assistant",
+            assistant_id,
+            user_id,
+            session_id,
+            content: "done",
+            parent_agent_id: parent_agent,
+          ),
+        ].join('\n') + "\n"
+      )
+
+      messages = ClaudeAgent.get_subagent_messages(session_id, nested_agent, directory: project_path)
+      messages.size.should eq(2)
+      messages.first.parent_agent_id.should eq(parent_agent)
+      messages.last.parent_agent_id.should eq(parent_agent)
+
+      # Depth-2 tree reconstruction: nested agent → parent agent id.
+      tree = ClaudeAgent.list_subagents(session_id, directory: project_path).map do |agent_id|
+        msgs = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path)
+        {agent_id, msgs.first?.try(&.parent_agent_id)}
+      end
+      tree.should contain({nested_agent, parent_agent})
 
       FileUtils.rm_rf(project_path)
     end
@@ -973,6 +1028,73 @@ describe "ClaudeAgent session utilities" do
       info.try(&.custom_title).should eq("my fork title")
 
       FileUtils.rm_rf(project_path)
+    end
+  end
+
+  describe "via_store / import helpers" do
+    it "imports a disk session and reads messages from the store" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-import-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+        user_id = UUID.random.to_s
+        assistant_id = UUID.random.to_s
+
+        write_transcript(project_dir, session_id, [
+          make_transcript_entry("user", user_id, nil, session_id, content: "store import"),
+          make_transcript_entry("assistant", assistant_id, user_id, session_id, content: "ack"),
+        ])
+
+        store = ClaudeAgent::InMemorySessionStore.new
+        ClaudeAgent.import_session_to_store(session_id, store, directory: project_path)
+
+        messages = ClaudeAgent.get_session_messages_from_store(
+          store, session_id, directory: project_path
+        )
+        messages.size.should eq(2)
+        messages.first.message["content"]?.try(&.as_s?).should eq("store import")
+
+        ClaudeAgent.delete_session_via_store(store, session_id, directory: project_path)
+        project_key = ClaudeAgent.project_key_for_directory(project_path)
+        store.load(ClaudeAgent::SessionKey.new(project_key, session_id)).should be_nil
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+
+    it "rename/tag_session_via_store append metadata entries" do
+      store = ClaudeAgent::InMemorySessionStore.new
+      dir = "/tmp/via-store-meta"
+      project_key = ClaudeAgent.project_key_for_directory(dir)
+      session_id = UUID.random.to_s
+      key = ClaudeAgent::SessionKey.new(project_key, session_id)
+      user_id = UUID.random.to_s
+
+      store.append(key, [
+        ClaudeAgent::SessionStoreEntry.from_hash({
+          "type"      => JSON::Any.new("user"),
+          "uuid"      => JSON::Any.new(user_id),
+          "sessionId" => JSON::Any.new(session_id),
+          "timestamp" => JSON::Any.new("2024-01-01T00:00:00Z"),
+          "message"   => JSON::Any.new({
+            "role"    => JSON::Any.new("user"),
+            "content" => JSON::Any.new("hello"),
+          }),
+        }),
+      ])
+
+      ClaudeAgent.rename_session_via_store(store, session_id, "Via Store Title", directory: dir)
+      ClaudeAgent.tag_session_via_store(store, session_id, "via-tag", directory: dir)
+
+      types = store.get_entries(key).map(&.type)
+      types.should contain("custom-title")
+      types.should contain("tag")
+
+      info = ClaudeAgent.get_session_info_from_store(store, session_id, directory: dir)
+      info.should_not be_nil
+      info.try(&.custom_title).should eq("Via Store Title")
+      info.try(&.tag).should eq("via-tag")
     end
   end
 end
