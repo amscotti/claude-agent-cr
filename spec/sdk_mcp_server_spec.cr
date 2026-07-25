@@ -277,20 +277,20 @@ end
 describe "Control Message Parsing" do
   it "parses ControlRequest with mcp_message subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-123",
-      "request": {
-        "subtype": "mcp_message",
-        "server_name": "my-server",
-        "message": {
-          "jsonrpc": "2.0",
-          "id": 1,
-          "method": "tools/list"
+      {
+        "type": "control_request",
+        "request_id": "req-123",
+        "request": {
+          "subtype": "mcp_message",
+          "server_name": "my-server",
+          "message": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+          }
         }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -308,15 +308,15 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with initialize subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-456",
-      "request": {
-        "subtype": "initialize",
-        "sdkMcpServers": ["server1", "server2"]
+      {
+        "type": "control_request",
+        "request_id": "req-456",
+        "request": {
+          "subtype": "initialize",
+          "sdkMcpServers": ["server1", "server2"]
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -332,16 +332,16 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with can_use_tool subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-789",
-      "request": {
-        "subtype": "can_use_tool",
-        "tool_name": "Bash",
-        "input": {"command": "ls -la"}
+      {
+        "type": "control_request",
+        "request_id": "req-789",
+        "request": {
+          "subtype": "can_use_tool",
+          "tool_name": "Bash",
+          "input": {"command": "ls -la"}
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -358,14 +358,14 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with interrupt subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-int-001",
-      "request": {
-        "subtype": "interrupt"
+      {
+        "type": "control_request",
+        "request_id": "req-int-001",
+        "request": {
+          "subtype": "interrupt"
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -378,15 +378,15 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with set_permission_mode subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-perm-001",
-      "request": {
-        "subtype": "set_permission_mode",
-        "mode": "bypassPermissions"
+      {
+        "type": "control_request",
+        "request_id": "req-perm-001",
+        "request": {
+          "subtype": "set_permission_mode",
+          "mode": "bypassPermissions"
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -402,17 +402,17 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with hook_callback subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-hook-001",
-      "request": {
-        "subtype": "hook_callback",
-        "callback_id": "hook_123",
-        "tool_use_id": "tool_123",
-        "input": {"tool_name": "Bash", "command": "ls"}
+      {
+        "type": "control_request",
+        "request_id": "req-hook-001",
+        "request": {
+          "subtype": "hook_callback",
+          "callback_id": "hook_123",
+          "tool_use_id": "tool_123",
+          "input": {"tool_name": "Bash", "command": "ls"}
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -433,15 +433,15 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with rewind_files subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-rewind-001",
-      "request": {
-        "subtype": "rewind_files",
-        "user_message_uuid": "msg-uuid-12345"
+      {
+        "type": "control_request",
+        "request_id": "req-rewind-001",
+        "request": {
+          "subtype": "rewind_files",
+          "user_message_uuid": "msg-uuid-12345"
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -457,16 +457,16 @@ describe "Control Message Parsing" do
 
   it "parses ControlRequest with rewind_conversation subtype" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-rewind-conv-001",
-      "request": {
-        "subtype": "rewind_conversation",
-        "user_message_uuid": "msg-uuid-999",
-        "dry_run": true
+      {
+        "type": "control_request",
+        "request_id": "req-rewind-conv-001",
+        "request": {
+          "subtype": "rewind_conversation",
+          "user_message_uuid": "msg-uuid-999",
+          "dry_run": true
+        }
       }
-    }
-    JSON
+      JSON
 
     message = ClaudeAgent::Message.parse(json)
     message.should be_a(ClaudeAgent::ControlRequest)
@@ -483,15 +483,15 @@ describe "Control Message Parsing" do
 
   it "parses unknown control_request subtype as ControlUnknownRequest (never raises)" do
     json = <<-JSON
-    {
-      "type": "control_request",
-      "request_id": "req-unknown-1",
-      "request": {
-        "subtype": "brand_new_subtype_we_dont_know",
-        "some_field": 42
+      {
+        "type": "control_request",
+        "request_id": "req-unknown-1",
+        "request": {
+          "subtype": "brand_new_subtype_we_dont_know",
+          "some_field": 42
+        }
       }
-    }
-    JSON
+      JSON
 
     request = ClaudeAgent::ControlRequest.from_json(json)
     request.request.should be_a(ClaudeAgent::ControlUnknownRequest)

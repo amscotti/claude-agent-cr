@@ -586,7 +586,7 @@ module ClaudeAgent
 
     # Send permission response (legacy stream-message path).
     def grant_permission(tool_use_id : String, allow : Bool, reason : String? = nil)
-      message = Hash(String, String | Bool | Nil).new
+      message = Hash(String, String | Bool?).new
       message["type"] = "permission_response"
       message["tool_use_id"] = tool_use_id
       message["allow"] = allow
@@ -967,7 +967,7 @@ module ClaudeAgent
 
     private def build_hook_initialize_payload : Hash(String, JSON::Any)?
       hooks = @options.try(&.hooks)
-      return nil unless hooks
+      return unless hooks
 
       payload = {} of String => JSON::Any
 
@@ -1062,7 +1062,7 @@ module ClaudeAgent
 
     private def build_agents_initialize_payload : JSON::Any?
       agents = @options.try(&.agents)
-      return nil unless agents
+      return unless agents
 
       JSON.parse(agents.to_json)
     end
@@ -1092,7 +1092,6 @@ module ClaudeAgent
                   when :session_start      then hooks.session_start
                   when :session_end        then hooks.session_end
                   when :user_prompt_submit then hooks.user_prompt_submit
-                  else                          nil
                   end
 
       return unless callbacks
@@ -1550,7 +1549,7 @@ module ClaudeAgent
     end
 
     private def extract_any(input : Hash(String, JSON::Any)?, *keys : String) : JSON::Any?
-      return nil unless input
+      return unless input
 
       keys.each do |key|
         if value = input[key]?
@@ -1724,7 +1723,7 @@ module ClaudeAgent
     private def parse_permission_suggestions(
       suggestions : Array(JSON::Any)?,
     ) : Array(PermissionSuggestion)?
-      return nil unless suggestions
+      return unless suggestions
 
       parsed = suggestions.compact_map do |suggestion_any|
         suggestion = suggestion_any.as_h?
@@ -1766,7 +1765,7 @@ module ClaudeAgent
         )
       when "setMode"
         mode = parse_permission_mode(data["mode"]?.try(&.as_s?))
-        return nil unless mode
+        return unless mode
 
         SetModeUpdate.new(
           mode: mode,

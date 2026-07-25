@@ -99,7 +99,7 @@ begin
       end
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipped the live portion."
 rescue ex
   puts "Live portion skipped: #{ex.message}"

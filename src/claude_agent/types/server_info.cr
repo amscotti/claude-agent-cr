@@ -43,10 +43,10 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ServerCommand?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       name = data["name"]?.try(&.as_s?)
-      return nil unless name
+      return unless name
 
       new(
         name,
@@ -66,10 +66,10 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ServerAgentInfo?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       name = data["name"]?.try(&.as_s?)
-      return nil unless name
+      return unless name
 
       new(
         name,
@@ -101,10 +101,10 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ServerModelInfo?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       model_value = data["value"]?.try(&.as_s?)
-      return nil unless model_value
+      return unless model_value
 
       new(
         model_value,
@@ -139,10 +139,10 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ServerPluginInfo?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       name = data["name"]?.try(&.as_s?)
-      return nil unless name
+      return unless name
 
       new(
         name,
@@ -169,7 +169,7 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any?) : ServerAccountInfo?
       data = value.try(&.as_h?)
-      return nil unless data
+      return unless data
 
       new(
         data["email"]?.try(&.as_s?),

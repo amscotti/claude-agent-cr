@@ -281,7 +281,7 @@ describe ClaudeAgent::HookInput do
       is_interrupt: false,
     )
     input.error.should eq("command not found")
-    input.is_interrupt.should eq(false)
+    input.is_interrupt.should be_false
     input.tool_use_id.should eq("tu_789")
   end
 
@@ -290,7 +290,7 @@ describe ClaudeAgent::HookInput do
       hook_event_name: "Stop",
       stop_hook_active: true,
     )
-    input.stop_hook_active.should eq(true)
+    input.stop_hook_active.should be_true
   end
 
   it "supports SubagentStart fields" do
@@ -314,7 +314,7 @@ describe ClaudeAgent::HookInput do
     input.agent_id.should eq("agent-001")
     input.agent_type.should eq("code-reviewer")
     input.agent_transcript_path.should eq("/tmp/subagent.jsonl")
-    input.stop_hook_active.should eq(false)
+    input.stop_hook_active.should be_false
   end
 
   it "supports Notification fields with type" do
@@ -422,7 +422,7 @@ describe ClaudeAgent::HookInput do
     input = ClaudeAgent::HookInput.from_json(json)
     input.hook_event_name.should eq("PostToolUseFailure")
     input.error.should eq("fail")
-    input.is_interrupt.should eq(true)
+    input.is_interrupt.should be_true
   end
 
   it "deserializes SubagentStop from JSON" do
@@ -431,6 +431,6 @@ describe ClaudeAgent::HookInput do
     input.agent_id.should eq("a1")
     input.agent_type.should eq("reviewer")
     input.agent_transcript_path.should eq("/tmp/a.jsonl")
-    input.stop_hook_active.should eq(true)
+    input.stop_hook_active.should be_true
   end
 end

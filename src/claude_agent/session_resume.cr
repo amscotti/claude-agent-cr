@@ -82,19 +82,19 @@ module ClaudeAgent
   # needed (no store, no resume/continue, missing entries, or invalid id).
   def self.materialize_resume_session(options : AgentOptions) : MaterializedResume?
     store = options.session_store
-    return nil unless store
-    return nil if options.resume.nil? && !options.continue_conversation?
+    return unless store
+    return if options.resume.nil? && !options.continue_conversation?
 
     project_key = project_key_for_directory(options.cwd)
     timeout_ms = options.load_timeout_ms
 
     resolved = if resume_id = options.resume
-                 return nil unless resume_uuid?(resume_id)
+                 return unless resume_uuid?(resume_id)
                  load_candidate(store, project_key, resume_id, timeout_ms)
                else
                  resolve_continue_candidate(store, project_key, timeout_ms)
                end
-    return nil unless resolved
+    return unless resolved
 
     session_id, entries = resolved
     tmp_base = File.tempname("claude-resume-")
@@ -142,7 +142,7 @@ module ClaudeAgent
   ) : {String, Array(SessionStoreEntry)}?
     key = SessionKey.new(project_key, session_id)
     entries = store.load(key)
-    return nil if entries.nil? || entries.empty?
+    return if entries.nil? || entries.empty?
 
     {session_id, entries}
   end
@@ -152,7 +152,7 @@ module ClaudeAgent
     project_key : String,
     timeout_ms : Int32,
   ) : {String, Array(SessionStoreEntry)}?
-    return nil unless store.supports_list_sessions?
+    return unless store.supports_list_sessions?
 
     listed = store.list_sessions(project_key)
     # Prefer most recently modified session (highest mtime first).

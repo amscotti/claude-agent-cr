@@ -125,7 +125,7 @@ module ClaudeAgent
         @error = process.error
         @running = true
         start_stderr_drain
-      rescue ex : File::NotFoundError
+      rescue File::NotFoundError
         raise CLINotFoundError.new("Claude Code CLI not found at '#{cli_path}'", cli_path)
       end
     end
@@ -253,7 +253,7 @@ module ClaudeAgent
       uuid : String? = nil,
       should_query : Bool = true,
     )
-      message = Hash(String, String | Hash(String, String) | Bool | Nil).new
+      message = Hash(String, String | Hash(String, String) | Bool?).new
       message["type"] = "user"
       message["message"] = {"role" => "user", "content" => prompt}
       message["parent_tool_use_id"] = parent_tool_use_id if parent_tool_use_id
@@ -373,7 +373,7 @@ module ClaudeAgent
     # subprocess fail with an actionable `UnsupportedOptionError`.
     private def probe_cli_capabilities(cli_path : String) : Set(String)?
       opts = @options
-      return nil if opts && !opts.probe_cli_capabilities?
+      return if opts && !opts.probe_cli_capabilities?
 
       if cached = @@capability_mutex.synchronize { @@capability_cache[cli_path]? }
         return cached
@@ -870,8 +870,6 @@ module ClaudeAgent
         sdk_config["name"] = JSON::Any.new(config.name)
         sdk_config["version"] = JSON::Any.new(config.version)
         sdk_config
-      else
-        nil
       end
     end
 
@@ -989,7 +987,7 @@ module ClaudeAgent
         settings["workflowSizeGuideline"] = JSON::Any.new(guideline)
       end
 
-      return nil if settings.empty?
+      return if settings.empty?
       settings.to_json
     end
 

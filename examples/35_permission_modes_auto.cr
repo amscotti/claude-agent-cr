@@ -42,9 +42,9 @@ decisions = [] of String
 
 callback = ->(ctx : ClaudeAgent::PermissionContext) do
   decisions << <<-LINE
-  tool=#{ctx.tool_name} tool_use_id=#{ctx.tool_use_id || "-"} \
-  agent_id=#{ctx.agent_id || "(main)"} blocked_path=#{ctx.blocked_path || "-"}
-  LINE
+    tool=#{ctx.tool_name} tool_use_id=#{ctx.tool_use_id || "-"} \
+    agent_id=#{ctx.agent_id || "(main)"} blocked_path=#{ctx.blocked_path || "-"}
+    LINE
 
   if ctx.tool_name == "Bash" && ctx.agent_id.nil?
     # Deny bash from the main agent; allow everything else.
@@ -87,7 +87,7 @@ begin
       end
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipping live run."
 rescue ex
   puts "Live run skipped: #{ex.message}"

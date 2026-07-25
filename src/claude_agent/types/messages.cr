@@ -117,8 +117,6 @@ module ClaudeAgent
         parse_model_fallback(message, session_id)
       when "worker_shutting_down"
         parse_worker_shutting_down(message, session_id)
-      else
-        nil
       end
     end
 
@@ -680,7 +678,7 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ToolResultMeta?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       new(
         id: data["id"]?.try(&.as_s?),
@@ -692,7 +690,7 @@ module ClaudeAgent
     end
 
     def self.from_any_array(value : JSON::Any?) : Array(ToolResultMeta)?
-      return nil unless value
+      return unless value
 
       if arr = value.as_a?
         result = arr.compact_map { |entry| from_any(entry) }
@@ -731,7 +729,7 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : FileAttachment?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       new(
         path: data["path"]?.try(&.as_s?),
@@ -746,7 +744,7 @@ module ClaudeAgent
 
     def self.from_any_array(value : JSON::Any?) : Array(FileAttachment)?
       arr = value.try(&.as_a?)
-      return nil unless arr
+      return unless arr
 
       result = arr.compact_map { |entry| from_any(entry) }
       result.empty? ? nil : result
@@ -975,7 +973,7 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any?) : TaskUsage?
       data = value.try(&.as_h?)
-      return nil unless data
+      return unless data
 
       new(
         total_tokens: data["total_tokens"]?.try(&.as_i64?),
@@ -1116,7 +1114,7 @@ module ClaudeAgent
 
     def self.from_any(value : JSON::Any) : ModelScopedRateLimit?
       data = value.as_h?
-      return nil unless data
+      return unless data
 
       new(
         display_name: data["display_name"]?.try(&.as_s?) || data["displayName"]?.try(&.as_s?),
@@ -1165,7 +1163,7 @@ module ClaudeAgent
 
     def self.from_data(data : MessageData) : RateLimitInfo?
       status = data["status"]?.try(&.as_s?)
-      return nil unless status
+      return unless status
 
       model_scoped = data["model_scoped"]?.try(&.as_a?).try do |arr|
         arr.compact_map { |entry| ModelScopedRateLimit.from_any(entry) }

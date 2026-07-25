@@ -17,7 +17,7 @@ describe ClaudeAgent::BashToolOutput do
       out.timed_out_after_ms.should eq(120_000)
       out.timed_out?.should be_true
       out.background_task_id.should eq("bg-1")
-      out.backgrounded_by_user.should eq(false)
+      out.backgrounded_by_user.should be_false
     end
   end
 
@@ -75,7 +75,7 @@ describe ClaudeAgent::SkillToolOutput do
     out = ClaudeAgent::SkillToolOutput.parse(json)
     out.should_not be_nil
     if out
-      out.background.should eq(true)
+      out.background.should be_true
       out.background?.should be_true
       out.name.should eq("my-skill")
     end

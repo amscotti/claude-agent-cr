@@ -36,7 +36,7 @@ module ClaudeAgent
     def load(key : SessionKey) : Array(SessionStoreEntry)?
       @mutex.synchronize do
         path = entry_path(key)
-        return nil unless File.file?(path)
+        return unless File.file?(path)
 
         entries = [] of SessionStoreEntry
         File.each_line(path) do |line|

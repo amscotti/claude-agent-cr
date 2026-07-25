@@ -68,7 +68,7 @@ begin
   ensure
     client.stop
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipped the demo."
 rescue ex
   puts "Demo skipped: #{ex.message}"

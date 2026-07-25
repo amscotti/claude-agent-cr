@@ -275,9 +275,9 @@ describe ClaudeAgent::AgentClient do
         ClaudeAgent::ReadStateEntry.new("/tmp/b.txt", 1_700_000_000_100_i64),
       ])
 
-      seed_requests = fake_cli.sent_messages.select { |message|
+      seed_requests = fake_cli.sent_messages.select do |message|
         message["request"]?.try(&.as_h?).try(&.["subtype"]?.try(&.as_s?)) == "seed_read_state"
-      }
+      end
       seed_requests.size.should eq(2)
       first = seed_requests[0]["request"].as_h
       first["path"].as_s.should eq("/tmp/a.txt")
@@ -304,17 +304,17 @@ describe ClaudeAgent::AgentClient do
 
     begin
       client.start
-      initial_count = fake_cli.sent_messages.count { |message|
+      initial_count = fake_cli.sent_messages.count do |message|
         message["request"]?.try(&.as_h?).try(&.["subtype"]?.try(&.as_s?)) == "initialize"
-      }
+      end
       initial_count.should eq(1)
 
       response = client.reinitialize
       response["commands"].as_a.size.should eq(1)
 
-      init_count = fake_cli.sent_messages.count { |message|
+      init_count = fake_cli.sent_messages.count do |message|
         message["request"]?.try(&.as_h?).try(&.["subtype"]?.try(&.as_s?)) == "initialize"
-      }
+      end
       init_count.should eq(2)
       client.get_server_info.try(&.commands.first.name).should eq("review")
     ensure
@@ -1436,13 +1436,13 @@ describe ClaudeAgent::AgentClient do
       client.test_registered_hook_callback_count.should eq(1)
 
       # Hook callback after reinitialize still resolves via the rebuilt registry.
-      initialize_request = fake_cli.sent_messages.reverse.find { |message|
+      initialize_request = fake_cli.sent_messages.reverse.find do |message|
         message["request"]?.try(&.as_h?).try(&.["subtype"]?.try(&.as_s?)) == "initialize"
-      }
+      end
       initialize_request.should_not be_nil
-      callback_id = initialize_request.try { |msg|
+      callback_id = initialize_request.try do |msg|
         msg["request"].as_h["hooks"].as_h["PreToolUse"].as_a.first.as_h["hookCallbackIds"].as_a.first.as_s
-      }
+      end
       callback_id.should_not be_nil
       callback_id = callback_id.as(String)
 

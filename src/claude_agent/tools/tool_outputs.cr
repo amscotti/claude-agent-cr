@@ -40,7 +40,7 @@ module ClaudeAgent
     )
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : BashToolOutput?
+    def self.parse(value : JSON::Any | String?) : BashToolOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
 
@@ -92,7 +92,7 @@ module ClaudeAgent
       model || resolved_model
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : AgentToolCompletedOutput?
+    def self.parse(value : JSON::Any | String?) : AgentToolCompletedOutput?
       ToolOutputParser.parse(value) do |json|
         parsed = from_json(json)
         # Promote resolvedModel into model when model is absent.
@@ -135,7 +135,7 @@ module ClaudeAgent
       background == true
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : SkillToolOutput?
+    def self.parse(value : JSON::Any | String?) : SkillToolOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -162,7 +162,7 @@ module ClaudeAgent
     )
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : NotebookEditOutput?
+    def self.parse(value : JSON::Any | String?) : NotebookEditOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -188,7 +188,7 @@ module ClaudeAgent
       status == "queued_to_running"
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : AgentToolQueuedOutput?
+    def self.parse(value : JSON::Any | String?) : AgentToolQueuedOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -211,7 +211,7 @@ module ClaudeAgent
     )
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : ReadMcpResourceDirOutput?
+    def self.parse(value : JSON::Any | String?) : ReadMcpResourceDirOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -233,7 +233,7 @@ module ClaudeAgent
     )
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : ReadMcpResourceOutput?
+    def self.parse(value : JSON::Any | String?) : ReadMcpResourceOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -259,7 +259,7 @@ module ClaudeAgent
       results || search_results
     end
 
-    def self.parse(value : JSON::Any | String | Nil) : WebSearchToolOutput?
+    def self.parse(value : JSON::Any | String?) : WebSearchToolOutput?
       ToolOutputParser.parse(value) { |json| from_json(json) }
     end
   end
@@ -290,7 +290,7 @@ module ClaudeAgent
     end
 
     def self.parse(value : String, &)
-      return nil if value.blank?
+      return if value.blank?
       begin
         yield value
       rescue JSON::ParseException | JSON::SerializableError
@@ -306,8 +306,6 @@ module ClaudeAgent
       when String
         # tool_result content may be a JSON-encoded string.
         parse(raw) { |json| yield json }
-      else
-        nil
       end
     end
   end

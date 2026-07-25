@@ -483,10 +483,10 @@ module ClaudeAgent
   # Subagent: `<projects_dir>/<project_key>/<session_id>/subagents/.../agent-<id>.jsonl`
   def self.file_path_to_session_key(file_path : String, projects_dir : String) : SessionKey?
     rel = Path[file_path].relative_to(projects_dir).to_s
-    return nil if rel.starts_with?("..") || Path[rel].absolute?
+    return if rel.starts_with?("..") || Path[rel].absolute?
 
     parts = Path[rel].parts
-    return nil if parts.size < 2
+    return if parts.size < 2
 
     project_key = parts[0]
     second = parts[1]
@@ -508,7 +508,7 @@ module ClaudeAgent
   end
 
   private def self.iso_to_epoch_ms(ts : String?) : Int64?
-    return nil unless ts
+    return unless ts
 
     begin
       Time::Format::ISO_8601_DATE_TIME.parse(ts, Time::Location::UTC).to_unix_ms

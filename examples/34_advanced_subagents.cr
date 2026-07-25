@@ -95,7 +95,7 @@ begin
       end
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not installed; skipping live delegation."
 rescue ex
   puts "Live delegation skipped: #{ex.message}"

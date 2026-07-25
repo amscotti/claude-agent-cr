@@ -92,10 +92,10 @@ module ClaudeAgent
       session_id : String,
       directory : String? = nil,
     ) : SDKSessionInfo?
-      return nil unless valid_uuid?(session_id)
+      return unless valid_uuid?(session_id)
 
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       build_session_info(session_id, file_path, directory)
     end
@@ -128,8 +128,6 @@ module ClaudeAgent
                         value = sanitize_unicode(tag).strip
                         raise ArgumentError.new("tag must be non-empty (use nil to clear)") if value.empty?
                         value
-                      else
-                        nil
                       end
 
       append_to_session(
@@ -505,7 +503,7 @@ module ClaudeAgent
 
     private def read_session_file(session_id : String, directory : String?) : String?
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       File.read(file_path)
     rescue File::Error
@@ -602,8 +600,8 @@ module ClaudeAgent
 
       loop do
         uuid = string_field(current, "uuid")
-        return nil unless uuid
-        return nil if seen.includes?(uuid)
+        return unless uuid
+        return if seen.includes?(uuid)
         seen.add(uuid)
 
         case string_field(current, "type")
@@ -612,10 +610,10 @@ module ClaudeAgent
         end
 
         parent = string_field(current, "parentUuid")
-        return nil unless parent
+        return unless parent
 
         next_entry = by_uuid[parent]?
-        return nil unless next_entry
+        return unless next_entry
         current = next_entry
       end
     end
@@ -652,7 +650,7 @@ module ClaudeAgent
       leaves : Array(TranscriptEntry),
       entry_index : Hash(String, Int32),
     ) : TranscriptEntry?
-      return nil if leaves.empty?
+      return if leaves.empty?
 
       leaves.max_by do |entry|
         uuid = string_field(entry, "uuid")
@@ -678,7 +676,7 @@ module ClaudeAgent
       uuid = string_field(entry, "uuid")
       session_id = string_field(entry, "sessionId") || string_field(entry, "session_id")
       message = hash_field(entry, "message")
-      return nil unless type && uuid && session_id && message
+      return unless type && uuid && session_id && message
 
       SessionMessage.new(
         type: type,
@@ -791,18 +789,18 @@ module ClaudeAgent
       project_path : String? = nil,
     ) : SDKSessionInfo?
       content = File.read(file_path)
-      return nil if content.empty?
+      return if content.empty?
 
       first_entry = first_json_entry(content)
-      return nil if first_entry && bool_field(first_entry, "isSidechain")
+      return if first_entry && bool_field(first_entry, "isSidechain")
 
       entries = parse_jsonl_entries(content)
-      return nil if entries.empty?
+      return if entries.empty?
 
       custom_title = last_string_field(entries, "customTitle")
       first_prompt = extract_first_prompt(entries)
       summary = custom_title || last_string_field(entries, "summary") || first_prompt
-      return nil unless summary
+      return unless summary
 
       info = File.info(file_path)
       git_branch = last_string_field(entries, "gitBranch") || first_string_field(entries, "gitBranch")
@@ -844,11 +842,11 @@ module ClaudeAgent
           return file_path if File.exists?(file_path)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         project_dir = File.join(projects_dir, entry)
@@ -896,11 +894,11 @@ module ClaudeAgent
           return candidate if appendable_session_file?(candidate)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         candidate = File.join(projects_dir, entry, file_name)
@@ -952,7 +950,7 @@ module ClaudeAgent
           hash = data.as_h?
           return hash if hash
         rescue JSON::ParseException
-          return nil
+          return
         end
       end
 
@@ -979,7 +977,7 @@ module ClaudeAgent
 
     private def first_timestamp_ms(entries : Array(TranscriptEntry)) : Int64?
       timestamp = first_string_field(entries, "timestamp")
-      return nil unless timestamp
+      return unless timestamp
 
       Time::Format::ISO_8601_DATE_TIME.parse(timestamp, Time::Location::UTC).to_unix_ms
     rescue Time::Format::Error
@@ -1041,8 +1039,8 @@ module ClaudeAgent
       return exact if Dir.exists?(exact)
 
       sanitized = sanitize_path(project_path)
-      return nil if sanitized.size <= MAX_SANITIZED_LENGTH
-      return nil unless Dir.exists?(projects_dir_path)
+      return if sanitized.size <= MAX_SANITIZED_LENGTH
+      return unless Dir.exists?(projects_dir_path)
 
       prefix = sanitized[0, MAX_SANITIZED_LENGTH]
       Dir.children(projects_dir_path).each do |entry|
@@ -1057,7 +1055,7 @@ module ClaudeAgent
 
     private def resolve_subagents_dir(session_id : String, directory : String?) : String?
       file_path = resolve_session_file_path(session_id, directory)
-      return nil unless file_path
+      return unless file_path
 
       project_dir = Path[file_path].parent.to_s
       File.join(project_dir, session_id, "subagents")
@@ -1153,11 +1151,11 @@ module ClaudeAgent
           return {candidate, worktree_dir} if appendable_session_file?(candidate)
         end
 
-        return nil
+        return
       end
 
       projects_dir = projects_dir_path
-      return nil unless Dir.exists?(projects_dir)
+      return unless Dir.exists?(projects_dir)
 
       Dir.children(projects_dir).each do |entry|
         project_dir = File.join(projects_dir, entry)
@@ -1369,12 +1367,12 @@ module ClaudeAgent
       session_id : String,
       directory : String? = nil,
     ) : SDKSessionInfo?
-      return nil unless valid_uuid?(session_id)
+      return unless valid_uuid?(session_id)
 
       project_key = project_key_for_directory(directory)
       key = SessionKey.new(project_key, session_id)
       entries = store.load(key)
-      return nil if entries.nil? || entries.empty?
+      return if entries.nil? || entries.empty?
 
       build_session_info_from_store_entries(session_id, entries, directory)
     end
@@ -1448,8 +1446,6 @@ module ClaudeAgent
                         value = sanitize_unicode(tag).strip
                         raise ArgumentError.new("tag must be non-empty (use nil to clear)") if value.empty?
                         value
-                      else
-                        nil
                       end
 
       key = SessionKey.new(project_key_for_directory(directory), session_id)
@@ -1620,7 +1616,7 @@ module ClaudeAgent
       project_path : String? = nil,
     ) : SDKSessionInfo?
       data = entry.data
-      return nil if data["is_sidechain"]?.try(&.as_bool?) == true
+      return if data["is_sidechain"]?.try(&.as_bool?) == true
 
       first_prompt = if data["first_prompt_locked"]?.try(&.as_bool?)
                        data["first_prompt"]?.try(&.as_s?)
@@ -1633,7 +1629,7 @@ module ClaudeAgent
                 data["last_prompt"]?.try(&.as_s?) ||
                 data["summary_hint"]?.try(&.as_s?) ||
                 first_prompt
-      return nil unless summary
+      return unless summary
 
       SDKSessionInfo.new(
         session_id: entry.session_id,
@@ -1654,17 +1650,17 @@ module ClaudeAgent
       entries : Array(SessionStoreEntry),
       directory : String?,
     ) : SDKSessionInfo?
-      return nil if entries.first.bool_field("isSidechain")
+      return if entries.first.bool_field("isSidechain")
 
       hashes = entries.map(&.to_h)
       custom_title = last_string_field(hashes, "customTitle")
       first_prompt = extract_first_prompt(hashes)
       summary = custom_title || last_string_field(hashes, "summary") || first_prompt
-      return nil unless summary
+      return unless summary
 
-      mtime = entries.reverse_each.compact_map { |entry|
+      mtime = entries.reverse_each.compact_map do |entry|
         iso_timestamp_ms(entry.timestamp)
-      }.first? || Time.utc.to_unix_ms
+      end.first? || Time.utc.to_unix_ms
 
       project_path = canonicalize_path(directory || ".")
       tag = last_string_field(hashes, "tag")
@@ -1756,7 +1752,7 @@ module ClaudeAgent
     end
 
     private def iso_timestamp_ms(ts : String?) : Int64?
-      return nil unless ts
+      return unless ts
       Time::Format::ISO_8601_DATE_TIME.parse(ts, Time::Location::UTC).to_unix_ms
     rescue Time::Format::Error
       nil

@@ -13,7 +13,7 @@ begin
       puts "\nDone: #{message.subtype}"
     end
   end
-rescue ex : ClaudeAgent::CLINotFoundError
+rescue ClaudeAgent::CLINotFoundError
   puts "Claude CLI not found. Please install it to run this example."
 rescue ex
   puts "An error occurred: #{ex.message}"

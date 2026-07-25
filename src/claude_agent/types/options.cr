@@ -579,7 +579,7 @@ module ClaudeAgent
     property add_dirs : Array(String)?
 
     # Plugins
-    property plugins : Array(String) | Array(PluginConfig) | Nil
+    property plugins : (Array(String) | Array(PluginConfig))?
 
     # Session configuration
     property cwd : String?
@@ -722,7 +722,7 @@ module ClaudeAgent
       @betas : Array(String)? = nil,
       @skills : SkillsOption? = nil,
       @add_dirs : Array(String)? = nil,
-      @plugins : Array(String) | Array(PluginConfig) | Nil = nil,
+      @plugins : (Array(String) | Array(PluginConfig))? = nil,
       @cwd : String? = nil,
       @mcp_servers : Hash(String, MCPServerConfig)? = nil,
       @strict_mcp_config : Bool = false,
@@ -775,7 +775,7 @@ module ClaudeAgent
     # Mirrors Python's `_get_can_use_tool_shadowed_warning` / TS
     # `getCanUseToolShadowedWarning` (Py 0.2.111 / TS 0.3.198).
     def can_use_tool_shadowed_warning : String?
-      return nil unless can_use_tool
+      return unless can_use_tool
 
       if permission_mode == PermissionMode::BypassPermissions
         return "can_use_tool will not be invoked: permission_mode " \
@@ -804,7 +804,7 @@ module ClaudeAgent
         end
       end
 
-      return nil if shadowed.empty?
+      return if shadowed.empty?
 
       "can_use_tool will not be invoked for: #{shadowed.join(", ")}. " \
       "An allowed_tools entry that allows a whole tool auto-approves it " \
@@ -821,11 +821,11 @@ module ClaudeAgent
     # only allows matching invocations. Malformed entries fall back to the
     # whole string as a tool name in the CLI, so they match nothing here.
     def self.whole_tool_allowed(entry : String) : String?
-      return nil if entry.strip.empty?
+      return if entry.strip.empty?
 
       open_index = entry.index('(')
       return entry if open_index.nil?
-      return nil if open_index == 0 || !entry.ends_with?(')')
+      return if open_index == 0 || !entry.ends_with?(')')
 
       specifier = entry[(open_index + 1)...-1]
       return entry[0...open_index] if specifier == "" || specifier == "*"

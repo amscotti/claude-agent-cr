@@ -4,18 +4,18 @@ describe ClaudeAgent::Message do
   describe ".parse" do
     it "parses AssistantMessage" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "123",
-        "session_id": "sess-456",
-        "message": {
-          "content": [
-            {"type": "text", "text": "Hello, world!"}
-          ],
-          "model": "claude-sonnet-4-5-20250929"
+        {
+          "type": "assistant",
+          "uuid": "123",
+          "session_id": "sess-456",
+          "message": {
+            "content": [
+              {"type": "text", "text": "Hello, world!"}
+            ],
+            "model": "claude-sonnet-4-5-20250929"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -30,28 +30,28 @@ describe ClaudeAgent::Message do
 
     it "exposes id, usage, stop_reason, stop_sequence from the inner message" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "env-uuid",
-        "session_id": "sess-1",
-        "message": {
-          "id": "msg-001",
-          "model": "claude-sonnet-4-6",
-          "role": "assistant",
-          "stop_reason": "end_turn",
-          "stop_sequence": "</finish>",
-          "container": null,
-          "context_management": null,
-          "usage": {
-            "input_tokens": 42,
-            "output_tokens": 7,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
-          },
-          "content": [{"type": "text", "text": "ok"}]
+        {
+          "type": "assistant",
+          "uuid": "env-uuid",
+          "session_id": "sess-1",
+          "message": {
+            "id": "msg-001",
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "stop_sequence": "</finish>",
+            "container": null,
+            "context_management": null,
+            "usage": {
+              "input_tokens": 42,
+              "output_tokens": 7,
+              "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0
+            },
+            "content": [{"type": "text", "text": "ok"}]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -69,18 +69,18 @@ describe ClaudeAgent::Message do
 
     it "parses AssistantMessage with string error field" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "123",
-        "session_id": "sess-456",
-        "message": {
-          "content": [
-            {"type": "text", "text": "An error occurred"}
-          ]
-        },
-        "error": "unknown"
-      }
-      JSON
+        {
+          "type": "assistant",
+          "uuid": "123",
+          "session_id": "sess-456",
+          "message": {
+            "content": [
+              {"type": "text", "text": "An error occurred"}
+            ]
+          },
+          "error": "unknown"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -96,18 +96,18 @@ describe ClaudeAgent::Message do
 
     it "parses AssistantMessage with object error field" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "123",
-        "session_id": "sess-456",
-        "message": {
-          "content": [
-            {"type": "text", "text": "An error occurred"}
-          ]
-        },
-        "error": {"type": "api_error", "message": "Rate limit exceeded"}
-      }
-      JSON
+        {
+          "type": "assistant",
+          "uuid": "123",
+          "session_id": "sess-456",
+          "message": {
+            "content": [
+              {"type": "text", "text": "An error occurred"}
+            ]
+          },
+          "error": {"type": "api_error", "message": "Rate limit exceeded"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -123,18 +123,18 @@ describe ClaudeAgent::Message do
 
     it "parses AssistantMessage with tool use" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "123",
-        "session_id": "sess-456",
-        "message": {
-          "content": [
-            {"type": "text", "text": "Let me read that file."},
-            {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/tmp/test.txt"}}
-          ]
+        {
+          "type": "assistant",
+          "uuid": "123",
+          "session_id": "sess-456",
+          "message": {
+            "content": [
+              {"type": "text", "text": "Let me read that file."},
+              {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"file_path": "/tmp/test.txt"}}
+            ]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -152,33 +152,33 @@ describe ClaudeAgent::Message do
 
     it "exposes tool_use_meta sidecar, stop_details, and refusal? on AssistantMessage" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "env-uuid",
-        "session_id": "sess-1",
-        "message": {
-          "id": "msg-001",
-          "model": "claude-sonnet-4-6",
-          "stop_reason": "refusal",
-          "stop_details": {
-            "category": "cyber",
-            "explanation": "Refused: unsafe operation",
-            "fallback_credit_token": null
+        {
+          "type": "assistant",
+          "uuid": "env-uuid",
+          "session_id": "sess-1",
+          "message": {
+            "id": "msg-001",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "refusal",
+            "stop_details": {
+              "category": "cyber",
+              "explanation": "Refused: unsafe operation",
+              "fallback_credit_token": null
+            },
+            "content": [
+              {"type": "tool_use", "id": "tool-1", "name": "mcp__github__search", "input": {}}
+            ]
           },
-          "content": [
-            {"type": "tool_use", "id": "tool-1", "name": "mcp__github__search", "input": {}}
+          "tool_use_meta": [
+            {
+              "id": "tool-1",
+              "display_name": "Search GitHub",
+              "server_display_name": "GitHub",
+              "icon_url": "https://example.com/icon.png"
+            }
           ]
-        },
-        "tool_use_meta": [
-          {
-            "id": "tool-1",
-            "display_name": "Search GitHub",
-            "server_display_name": "GitHub",
-            "icon_url": "https://example.com/icon.png"
-          }
-        ]
-      }
-      JSON
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
@@ -209,13 +209,13 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-123",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "Hello"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-123",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "Hello"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
@@ -232,84 +232,84 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage isMeta as is_meta" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-meta-flag",
-        "session_id": "sess-456",
-        "isMeta": true,
-        "message": {"role": "user", "content": "system note"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-meta-flag",
+          "session_id": "sess-456",
+          "isMeta": true,
+          "message": {"role": "user", "content": "system note"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
 
       if message.is_a?(ClaudeAgent::UserMessage)
-        message.is_meta.should eq(true)
+        message.is_meta.should be_true
         message.meta?.should be_true
       end
     end
 
     it "maps isSynthetic to is_meta on UserMessage parse" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-synth",
-        "session_id": "sess-456",
-        "isSynthetic": true,
-        "message": {"role": "user", "content": "synthetic"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-synth",
+          "session_id": "sess-456",
+          "isSynthetic": true,
+          "message": {"role": "user", "content": "synthetic"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
 
       if message.is_a?(ClaudeAgent::UserMessage)
-        message.is_synthetic.should eq(true)
-        message.is_meta.should eq(true)
+        message.is_synthetic.should be_true
+        message.is_meta.should be_true
         message.meta?.should be_true
       end
     end
 
     it "parses UserMessage snake_case is_meta" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-snake-meta",
-        "session_id": "sess-456",
-        "is_meta": true,
-        "message": {"role": "user", "content": "meta"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-snake-meta",
+          "session_id": "sess-456",
+          "is_meta": true,
+          "message": {"role": "user", "content": "meta"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::UserMessage)
-        message.is_meta.should eq(true)
+        message.is_meta.should be_true
         message.meta?.should be_true
       end
     end
 
     it "parses UserMessage file_attachments" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-attach",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "see attached"},
-        "file_attachments": [
-          {
-            "path": "/tmp/photo.png",
-            "name": "photo.png",
-            "mediaType": "image/png"
-          },
-          {
-            "path": "/tmp/notes.txt",
-            "filename": "notes.txt",
-            "media_type": "text/plain"
-          }
-        ]
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-attach",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "see attached"},
+          "file_attachments": [
+            {
+              "path": "/tmp/photo.png",
+              "name": "photo.png",
+              "mediaType": "image/png"
+            },
+            {
+              "path": "/tmp/notes.txt",
+              "filename": "notes.txt",
+              "media_type": "text/plain"
+            }
+          ]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
@@ -333,20 +333,20 @@ describe ClaudeAgent::Message do
 
     it "parses InitMessage with server metadata" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "init",
-        "session_id": "sess-456",
-        "commands": [{"name": "commit", "description": "Create a commit", "argumentHint": "[message]"}],
-        "agents": [{"name": "reviewer", "description": "Reviews code", "model": "haiku"}],
-        "slash_commands": ["commit", "review"],
-        "output_style": "default",
-        "available_output_styles": ["default", "compact"],
-        "models": [{"value": "default", "displayName": "Default", "supportsEffort": true}],
-        "account": {"email": "user@example.com", "organization": "Example Org"},
-        "pid": 123
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "sess-456",
+          "commands": [{"name": "commit", "description": "Create a commit", "argumentHint": "[message]"}],
+          "agents": [{"name": "reviewer", "description": "Reviews code", "model": "haiku"}],
+          "slash_commands": ["commit", "review"],
+          "output_style": "default",
+          "available_output_styles": ["default", "compact"],
+          "models": [{"value": "default", "displayName": "Default", "supportsEffort": true}],
+          "account": {"email": "user@example.com", "organization": "Example Org"},
+          "pid": 123
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::InitMessage)
@@ -369,24 +369,24 @@ describe ClaudeAgent::Message do
 
     it "exposes init fields the CLI emits (tools, plugins, cwd, version, etc.)" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "init",
-        "session_id": "sess-1",
-        "cwd": "/tmp/project",
-        "tools": ["Bash", "Read", "Edit"],
-        "mcp_servers": [{"name": "ctx7", "status": "connected"}],
-        "model": "claude-opus-4-7",
-        "permissionMode": "default",
-        "apiKeySource": "none",
-        "claude_code_version": "2.1.114",
-        "skills": ["git", "playwright"],
-        "plugins": [{"name": "p1", "path": "/x", "source": "remote"}],
-        "memory_paths": {"auto": "/Users/a/.claude/memory/"},
-        "fast_mode_state": "off",
-        "slash_commands": ["init", "review"]
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "sess-1",
+          "cwd": "/tmp/project",
+          "tools": ["Bash", "Read", "Edit"],
+          "mcp_servers": [{"name": "ctx7", "status": "connected"}],
+          "model": "claude-opus-4-7",
+          "permissionMode": "default",
+          "apiKeySource": "none",
+          "claude_code_version": "2.1.114",
+          "skills": ["git", "playwright"],
+          "plugins": [{"name": "p1", "path": "/x", "source": "remote"}],
+          "memory_paths": {"auto": "/Users/a/.claude/memory/"},
+          "fast_mode_state": "off",
+          "slash_commands": ["init", "review"]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::InitMessage)
@@ -409,13 +409,13 @@ describe ClaudeAgent::Message do
 
     it "derives slash commands from command names when slash_commands is absent" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "init",
-        "session_id": "sess-456",
-        "commands": [{"name": "commit"}, {"name": "review"}]
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "init",
+          "session_id": "sess-456",
+          "commands": [{"name": "commit"}, {"name": "review"}]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::InitMessage)
@@ -427,13 +427,13 @@ describe ClaudeAgent::Message do
 
     it "parses generic system messages and retains raw data" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "custom_event",
-        "session_id": "sess-456",
-        "custom_field": "hello"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "custom_event",
+          "session_id": "sess-456",
+          "custom_field": "hello"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::GenericSystemMessage)
@@ -446,17 +446,17 @@ describe ClaudeAgent::Message do
 
     it "parses CompactBoundaryMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "compact_boundary",
-        "uuid": "compact-123",
-        "session_id": "sess-456",
-        "compact_metadata": {
-          "trigger": "auto",
-          "pre_tokens": 4096
+        {
+          "type": "system",
+          "subtype": "compact_boundary",
+          "uuid": "compact-123",
+          "session_id": "sess-456",
+          "compact_metadata": {
+            "trigger": "auto",
+            "pre_tokens": 4096
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::CompactBoundaryMessage)
@@ -470,17 +470,17 @@ describe ClaudeAgent::Message do
 
     it "parses TaskStartedMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "task_started",
-        "uuid": "task-start-123",
-        "session_id": "sess-456",
-        "task_id": "task-123",
-        "description": "Analyze the repository",
-        "tool_use_id": "tool-1",
-        "task_type": "explore"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "task_started",
+          "uuid": "task-start-123",
+          "session_id": "sess-456",
+          "task_id": "task-123",
+          "description": "Analyze the repository",
+          "tool_use_id": "tool-1",
+          "task_type": "explore"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::TaskStartedMessage)
@@ -496,22 +496,22 @@ describe ClaudeAgent::Message do
 
     it "parses TaskProgressMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "task_progress",
-        "uuid": "task-progress-123",
-        "session_id": "sess-456",
-        "task_id": "task-123",
-        "description": "Searching files",
-        "usage": {
-          "total_tokens": 120,
-          "tool_uses": 3,
-          "duration_ms": 450
-        },
-        "last_tool_name": "Grep",
-        "summary": "Scanning spec files"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "task_progress",
+          "uuid": "task-progress-123",
+          "session_id": "sess-456",
+          "task_id": "task-123",
+          "description": "Searching files",
+          "usage": {
+            "total_tokens": 120,
+            "tool_uses": 3,
+            "duration_ms": 450
+          },
+          "last_tool_name": "Grep",
+          "summary": "Scanning spec files"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::TaskProgressMessage)
@@ -529,13 +529,13 @@ describe ClaudeAgent::Message do
 
     it "parses PromptSuggestionMessage" do
       json = <<-JSON
-      {
-        "type": "prompt_suggestion",
-        "uuid": "suggest-123",
-        "session_id": "sess-456",
-        "suggestion": "Ask Claude to summarize the repository next"
-      }
-      JSON
+        {
+          "type": "prompt_suggestion",
+          "uuid": "suggest-123",
+          "session_id": "sess-456",
+          "suggestion": "Ask Claude to summarize the repository next"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::PromptSuggestionMessage)
@@ -549,15 +549,15 @@ describe ClaudeAgent::Message do
 
     it "parses ElicitationCompleteMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "elicitation_complete",
-        "uuid": "elicitation-123",
-        "session_id": "sess-456",
-        "mcp_server_name": "auth-server",
-        "elicitation_id": "oauth-1"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "elicitation_complete",
+          "uuid": "elicitation-123",
+          "session_id": "sess-456",
+          "mcp_server_name": "auth-server",
+          "elicitation_id": "oauth-1"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ElicitationCompleteMessage)
@@ -572,22 +572,22 @@ describe ClaudeAgent::Message do
 
     it "parses TaskNotificationMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "task_notification",
-        "uuid": "task-notify-123",
-        "session_id": "sess-456",
-        "task_id": "task-123",
-        "status": "completed",
-        "output_file": "/tmp/result.txt",
-        "summary": "Done",
-        "usage": {
-          "total_tokens": 240,
-          "tool_uses": 5,
-          "duration_ms": 900
+        {
+          "type": "system",
+          "subtype": "task_notification",
+          "uuid": "task-notify-123",
+          "session_id": "sess-456",
+          "task_id": "task-123",
+          "status": "completed",
+          "output_file": "/tmp/result.txt",
+          "summary": "Done",
+          "usage": {
+            "total_tokens": 240,
+            "tool_uses": 5,
+            "duration_ms": 900
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::TaskNotificationMessage)
@@ -603,15 +603,15 @@ describe ClaudeAgent::Message do
 
     it "parses TaskUpdatedMessage with terminal killed status" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "task_updated",
-        "uuid": "task-upd-123",
-        "session_id": "sess-456",
-        "task_id": "task-123",
-        "patch": {"status": "killed", "end_time": 1234}
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "task_updated",
+          "uuid": "task-upd-123",
+          "session_id": "sess-456",
+          "task_id": "task-123",
+          "patch": {"status": "killed", "end_time": 1234}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::TaskUpdatedMessage)
@@ -626,15 +626,15 @@ describe ClaudeAgent::Message do
 
     it "parses TaskUpdatedMessage with non-terminal running status" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "task_updated",
-        "uuid": "task-upd-456",
-        "session_id": "sess-456",
-        "task_id": "task-456",
-        "patch": {"status": "running"}
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "task_updated",
+          "uuid": "task-upd-456",
+          "session_id": "sess-456",
+          "task_id": "task-456",
+          "patch": {"status": "running"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::TaskUpdatedMessage)
@@ -654,23 +654,23 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-123",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "origin": {"kind": "human"},
-        "result": "Task completed",
-        "cost_usd": 0.001,
-        "duration_ms": 1500,
-        "duration_api_ms": 1200,
-        "is_error": false,
-        "num_turns": 3,
-        "stop_reason": "end_turn",
-        "total_cost_usd": 0.005,
-        "usage": {"input_tokens": 100, "output_tokens": 50}
-      }
-      JSON
+        {
+          "type": "result",
+          "uuid": "result-123",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "origin": {"kind": "human"},
+          "result": "Task completed",
+          "cost_usd": 0.001,
+          "duration_ms": 1500,
+          "duration_api_ms": 1200,
+          "is_error": false,
+          "num_turns": 3,
+          "stop_reason": "end_turn",
+          "total_cost_usd": 0.005,
+          "usage": {"input_tokens": 100, "output_tokens": 50}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ResultMessage)
@@ -684,7 +684,7 @@ describe ClaudeAgent::Message do
         message.result.should eq("Task completed")
         message.cost_usd.should eq(0.001)
         message.duration_ms.should eq(1500)
-        message.is_error.should eq(false)
+        message.is_error.should be_false
         message.num_turns.should eq(3)
         message.stop_reason.should eq("end_turn")
         message.usage.should_not be_nil
@@ -693,21 +693,21 @@ describe ClaudeAgent::Message do
 
     it "parses RateLimitEvent" do
       json = <<-JSON
-      {
-        "type": "rate_limit_event",
-        "uuid": "rate-123",
-        "session_id": "sess-456",
-        "rate_limit_info": {
-          "status": "allowed_warning",
-          "resetsAt": 1774000000,
-          "rateLimitType": "five_hour",
-          "utilization": 0.92,
-          "overageStatus": "allowed",
-          "overageResetsAt": 1774003600,
-          "overageDisabledReason": "none"
+        {
+          "type": "rate_limit_event",
+          "uuid": "rate-123",
+          "session_id": "sess-456",
+          "rate_limit_info": {
+            "status": "allowed_warning",
+            "resetsAt": 1774000000,
+            "rateLimitType": "five_hour",
+            "utilization": 0.92,
+            "overageStatus": "allowed",
+            "overageResetsAt": 1774003600,
+            "overageDisabledReason": "none"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::RateLimitEvent)
@@ -728,15 +728,15 @@ describe ClaudeAgent::Message do
 
     it "falls back to UnknownMessage for malformed rate_limit_event payloads" do
       json = <<-JSON
-      {
-        "type": "rate_limit_event",
-        "uuid": "rate-123",
-        "session_id": "sess-456",
-        "rate_limit_info": {
-          "resetsAt": 1774000000
+        {
+          "type": "rate_limit_event",
+          "uuid": "rate-123",
+          "session_id": "sess-456",
+          "rate_limit_info": {
+            "resetsAt": 1774000000
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UnknownMessage)
@@ -744,13 +744,13 @@ describe ClaudeAgent::Message do
 
     it "parses PermissionRequest" do
       json = <<-JSON
-      {
-        "type": "permission_request",
-        "tool_use_id": "tool-123",
-        "tool_name": "Bash",
-        "tool_input": {"command": "ls -la"}
-      }
-      JSON
+        {
+          "type": "permission_request",
+          "tool_use_id": "tool-123",
+          "tool_name": "Bash",
+          "tool_input": {"command": "ls -la"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::PermissionRequest)
@@ -764,12 +764,12 @@ describe ClaudeAgent::Message do
 
     it "parses UserQuestion" do
       json = <<-JSON
-      {
-        "type": "user_question",
-        "uuid": "q-123",
-        "message": "Which option would you prefer?"
-      }
-      JSON
+        {
+          "type": "user_question",
+          "uuid": "q-123",
+          "message": "Which option would you prefer?"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserQuestion)
@@ -782,12 +782,12 @@ describe ClaudeAgent::Message do
 
     it "parses UnknownMessage for unknown top-level message types" do
       json = <<-JSON
-      {
-        "type": "unknown_type",
-        "data": "test",
-        "session_id": "sess-456"
-      }
-      JSON
+        {
+          "type": "unknown_type",
+          "data": "test",
+          "session_id": "sess-456"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UnknownMessage)
@@ -800,10 +800,10 @@ describe ClaudeAgent::Message do
 
     it "raises error when message type is missing" do
       json = <<-JSON
-      {
-        "session_id": "sess-456"
-      }
-      JSON
+        {
+          "session_id": "sess-456"
+        }
+        JSON
 
       expect_raises(ClaudeAgent::Error, /Message missing 'type' field/) do
         ClaudeAgent::Message.parse(json)
@@ -812,21 +812,21 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage with structured output" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-123",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "result": "Extracted data",
-        "structured_output": {
-          "name": "John Doe",
-          "age": 30,
-          "email": "john@example.com",
-          "active": true,
-          "tags": ["admin", "user"]
+        {
+          "type": "result",
+          "uuid": "result-123",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "result": "Extracted data",
+          "structured_output": {
+            "name": "John Doe",
+            "age": 30,
+            "email": "john@example.com",
+            "active": true,
+            "tags": ["admin", "user"]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ResultMessage)
@@ -852,14 +852,14 @@ describe ClaudeAgent::Message do
 
     it "handles ResultMessage without structured output" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-123",
-        "session_id": "sess-456",
-        "subtype": "error_max_turns",
-        "result": "Max turns reached"
-      }
-      JSON
+        {
+          "type": "result",
+          "uuid": "result-123",
+          "session_id": "sess-456",
+          "subtype": "error_max_turns",
+          "result": "Max turns reached"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::ResultMessage)
@@ -872,14 +872,14 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage with tool_use_result" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-123",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "Done"},
-        "tool_use_result": {"tool_use_id": "tool-1", "status": "ok"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-123",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "Done"},
+          "tool_use_result": {"tool_use_id": "tool-1", "status": "ok"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
@@ -892,14 +892,14 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage with non-object tool_use_result" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-456",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "Done"},
-        "tool_use_result": "ok"
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-456",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "Done"},
+          "tool_use_result": "ok"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
@@ -911,18 +911,18 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage with deferred_tool_use" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "res-123",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "deferred_tool_use": {
-          "id": "tool-def",
-          "name": "Bash",
-          "input": {"command": "ls"}
+        {
+          "type": "result",
+          "uuid": "res-123",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "deferred_tool_use": {
+            "id": "tool-def",
+            "name": "Bash",
+            "input": {"command": "ls"}
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ResultMessage)
@@ -939,14 +939,14 @@ describe ClaudeAgent::Message do
 
     it "parses HookEventMessage system message" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "hook_started",
-        "session_id": "sess-456",
-        "hook_event": "PreToolUse",
-        "uuid": "hook-123"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "hook_started",
+          "session_id": "sess-456",
+          "hook_event": "PreToolUse",
+          "uuid": "hook-123"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::HookEventMessage)
@@ -960,33 +960,33 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage with typed ModelUsage including canonicalModel and provider" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-mu-1",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "result": "Hello",
-        "duration_ms": 3000,
-        "duration_api_ms": 2000,
-        "is_error": false,
-        "num_turns": 1,
-        "total_cost_usd": 0.0106,
-        "modelUsage": {
-          "claude-sonnet-4-5-20250929": {
-            "inputTokens": 3,
-            "outputTokens": 24,
-            "cacheReadInputTokens": 20012,
-            "cacheCreationInputTokens": 100,
-            "webSearchRequests": 1,
-            "costUSD": 0.0106,
-            "contextWindow": 200000,
-            "maxOutputTokens": 64000,
-            "canonicalModel": "claude-sonnet-4-5",
-            "provider": "firstParty"
+        {
+          "type": "result",
+          "uuid": "result-mu-1",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "result": "Hello",
+          "duration_ms": 3000,
+          "duration_api_ms": 2000,
+          "is_error": false,
+          "num_turns": 1,
+          "total_cost_usd": 0.0106,
+          "modelUsage": {
+            "claude-sonnet-4-5-20250929": {
+              "inputTokens": 3,
+              "outputTokens": 24,
+              "cacheReadInputTokens": 20012,
+              "cacheCreationInputTokens": 100,
+              "webSearchRequests": 1,
+              "costUSD": 0.0106,
+              "contextWindow": 200000,
+              "maxOutputTokens": 64000,
+              "canonicalModel": "claude-sonnet-4-5",
+              "provider": "firstParty"
+            }
           }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ResultMessage)
@@ -1014,22 +1014,22 @@ describe ClaudeAgent::Message do
 
     it "parses ModelUsage with missing optional fields defaulting safely" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-mu-2",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "modelUsage": {
-          "m1": {
-            "inputTokens": 10,
-            "outputTokens": 5,
-            "costUSD": 0.001,
-            "contextWindow": 200000,
-            "maxOutputTokens": 8192
+        {
+          "type": "result",
+          "uuid": "result-mu-2",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "modelUsage": {
+            "m1": {
+              "inputTokens": 10,
+              "outputTokens": 5,
+              "costUSD": 0.001,
+              "contextWindow": 200000,
+              "maxOutputTokens": 8192
+            }
           }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::ResultMessage)
@@ -1047,27 +1047,27 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage new metadata fields" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-meta-1",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "result": "ok",
-        "terminal_reason": "completed",
-        "fast_mode_state": "off",
-        "fast_mode_disabled_reason": "preference",
-        "user_message_uuid": "user-uuid-abc",
-        "request_sent_wall_ms": 1710000000123,
-        "permission_denials": [
-          {
-            "tool_name": "Bash",
-            "tool_use_id": "tool-1",
-            "tool_input": {"command": "rm -rf /"},
-            "decision_reason_type": "safetyCheck"
-          }
-        ]
-      }
-      JSON
+        {
+          "type": "result",
+          "uuid": "result-meta-1",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "result": "ok",
+          "terminal_reason": "completed",
+          "fast_mode_state": "off",
+          "fast_mode_disabled_reason": "preference",
+          "user_message_uuid": "user-uuid-abc",
+          "request_sent_wall_ms": 1710000000123,
+          "permission_denials": [
+            {
+              "tool_name": "Bash",
+              "tool_use_id": "tool-1",
+              "tool_input": {"command": "rm -rf /"},
+              "decision_reason_type": "safetyCheck"
+            }
+          ]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ResultMessage)
@@ -1109,21 +1109,21 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage with tool_result_meta array (CLI wire shape)" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-meta-1",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "tool result"},
-        "tool_use_result": "Permission denied",
-        "tool_result_meta": [
-          {
-            "id": "toolu_1",
-            "non_execution_kind": "denied",
-            "user_feedback": "User denied Bash"
-          }
-        ]
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-meta-1",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "tool result"},
+          "tool_use_result": "Permission denied",
+          "tool_result_meta": [
+            {
+              "id": "toolu_1",
+              "non_execution_kind": "denied",
+              "user_feedback": "User denied Bash"
+            }
+          ]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::UserMessage)
@@ -1141,17 +1141,17 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage with single-object tool_result_meta (compat)" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-meta-1b",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "tool result"},
-        "tool_result_meta": {
-          "non_execution_kind": "interrupted",
-          "user_feedback": "stopped"
+        {
+          "type": "user",
+          "uuid": "user-meta-1b",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "tool result"},
+          "tool_result_meta": {
+            "non_execution_kind": "interrupted",
+            "user_feedback": "stopped"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::UserMessage)
@@ -1162,13 +1162,13 @@ describe ClaudeAgent::Message do
 
     it "parses UserMessage without tool_result_meta (backward compat)" do
       json = <<-JSON
-      {
-        "type": "user",
-        "uuid": "user-meta-2",
-        "session_id": "sess-456",
-        "message": {"role": "user", "content": "Hello"}
-      }
-      JSON
+        {
+          "type": "user",
+          "uuid": "user-meta-2",
+          "session_id": "sess-456",
+          "message": {"role": "user", "content": "Hello"}
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::UserMessage)
@@ -1178,24 +1178,24 @@ describe ClaudeAgent::Message do
 
     it "parses AssistantMessage with timestamp and aborted" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "asst-abort-1",
-        "session_id": "sess-456",
-        "timestamp": "2026-07-24T12:00:00.000Z",
-        "aborted": true,
-        "message": {
-          "content": [{"type": "text", "text": "partial..."}]
+        {
+          "type": "assistant",
+          "uuid": "asst-abort-1",
+          "session_id": "sess-456",
+          "timestamp": "2026-07-24T12:00:00.000Z",
+          "aborted": true,
+          "message": {
+            "content": [{"type": "text", "text": "partial..."}]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::AssistantMessage)
 
       if message.is_a?(ClaudeAgent::AssistantMessage)
         message.timestamp.should eq("2026-07-24T12:00:00.000Z")
-        message.aborted.should eq(true)
+        message.aborted.should be_true
         message.aborted?.should be_true
         message.text.should eq("partial...")
       end
@@ -1203,15 +1203,15 @@ describe ClaudeAgent::Message do
 
     it "parses AssistantMessage without timestamp/aborted (backward compat)" do
       json = <<-JSON
-      {
-        "type": "assistant",
-        "uuid": "asst-old-1",
-        "session_id": "sess-456",
-        "message": {
-          "content": [{"type": "text", "text": "done"}]
+        {
+          "type": "assistant",
+          "uuid": "asst-old-1",
+          "session_id": "sess-456",
+          "message": {
+            "content": [{"type": "text", "text": "done"}]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::AssistantMessage)
@@ -1223,17 +1223,17 @@ describe ClaudeAgent::Message do
 
     it "parses MessageOrigin with subkind and body" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-origin-1",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "origin": {
-          "kind": "task-notification",
-          "subkind": "scheduled-trigger"
+        {
+          "type": "result",
+          "uuid": "result-origin-1",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "origin": {
+            "kind": "task-notification",
+            "subkind": "scheduled-trigger"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::ResultMessage)
@@ -1248,20 +1248,20 @@ describe ClaudeAgent::Message do
 
     it "parses MessageOrigin peer body" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-origin-2",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "origin": {
-          "kind": "peer",
-          "from": "agent-1",
-          "name": "Reviewer",
-          "body": "Please review the PR",
-          "senderTaskId": "task-99"
+        {
+          "type": "result",
+          "uuid": "result-origin-2",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "origin": {
+            "kind": "peer",
+            "from": "agent-1",
+            "name": "Reviewer",
+            "body": "Please review the PR",
+            "senderTaskId": "task-99"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::ResultMessage)
@@ -1276,15 +1276,15 @@ describe ClaudeAgent::Message do
 
     it "parses CommandLifecycleMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "command_lifecycle",
-        "session_id": "sess-456",
-        "uuid": "lifecycle-1",
-        "message_uuid": "cmd-uuid-1",
-        "state": "completed"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "command_lifecycle",
+          "session_id": "sess-456",
+          "uuid": "lifecycle-1",
+          "message_uuid": "cmd-uuid-1",
+          "state": "completed"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::CommandLifecycleMessage)
@@ -1299,14 +1299,14 @@ describe ClaudeAgent::Message do
 
     it "parses CommandLifecycleMessage cancelled state" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "command_lifecycle",
-        "session_id": "sess-456",
-        "uuid": "lifecycle-2",
-        "state": "cancelled"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "command_lifecycle",
+          "session_id": "sess-456",
+          "uuid": "lifecycle-2",
+          "state": "cancelled"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::CommandLifecycleMessage)
@@ -1319,25 +1319,25 @@ describe ClaudeAgent::Message do
 
     it "parses BackgroundTasksChangedMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "background_tasks_changed",
-        "session_id": "sess-456",
-        "uuid": "btc-1",
-        "tasks": [
-          {
-            "task_id": "task-1",
-            "task_type": "shell",
-            "description": "Running tests"
-          },
-          {
-            "task_id": "task-2",
-            "task_type": "subagent",
-            "description": "Explore codebase"
-          }
-        ]
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "background_tasks_changed",
+          "session_id": "sess-456",
+          "uuid": "btc-1",
+          "tasks": [
+            {
+              "task_id": "task-1",
+              "task_type": "shell",
+              "description": "Running tests"
+            },
+            {
+              "task_id": "task-2",
+              "task_type": "subagent",
+              "description": "Explore codebase"
+            }
+          ]
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::BackgroundTasksChangedMessage)
@@ -1355,13 +1355,13 @@ describe ClaudeAgent::Message do
 
     it "parses BackgroundTasksChangedMessage with empty tasks" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "background_tasks_changed",
-        "session_id": "sess-456",
-        "tasks": []
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "background_tasks_changed",
+          "session_id": "sess-456",
+          "tasks": []
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::BackgroundTasksChangedMessage)
@@ -1371,16 +1371,16 @@ describe ClaudeAgent::Message do
 
     it "parses ModelFallbackMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "model_fallback",
-        "session_id": "sess-456",
-        "uuid": "mf-1",
-        "trigger": "overloaded",
-        "original_model": "claude-opus-4-7",
-        "fallback_model": "claude-sonnet-4-6"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "model_fallback",
+          "session_id": "sess-456",
+          "uuid": "mf-1",
+          "trigger": "overloaded",
+          "original_model": "claude-opus-4-7",
+          "fallback_model": "claude-sonnet-4-6"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ModelFallbackMessage)
@@ -1398,14 +1398,14 @@ describe ClaudeAgent::Message do
 
     it "parses WorkerShuttingDownMessage" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "worker_shutting_down",
-        "session_id": "sess-456",
-        "uuid": "wsd-1",
-        "reason": "host_exit"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "worker_shutting_down",
+          "session_id": "sess-456",
+          "uuid": "wsd-1",
+          "reason": "host_exit"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::WorkerShuttingDownMessage)
@@ -1418,27 +1418,27 @@ describe ClaudeAgent::Message do
 
     it "parses ToolProgressMessage with subagent fields" do
       json = <<-JSON
-      {
-        "type": "tool_progress",
-        "uuid": "tp-1",
-        "session_id": "sess-456",
-        "tool_use_id": "tool-99",
-        "tool_name": "Agent",
-        "parent_tool_use_id": null,
-        "elapsed_time_seconds": 12.5,
-        "task_id": "task-sub-1",
-        "heartbeat": true,
-        "subagent_type": "Explore",
-        "subagent_retry": {
-          "agent_id": "agent-abc",
-          "attempt": 2,
-          "max_retries": 5,
-          "retry_delay_ms": 1500,
-          "error_status": 429,
-          "error_category": "rate_limit"
+        {
+          "type": "tool_progress",
+          "uuid": "tp-1",
+          "session_id": "sess-456",
+          "tool_use_id": "tool-99",
+          "tool_name": "Agent",
+          "parent_tool_use_id": null,
+          "elapsed_time_seconds": 12.5,
+          "task_id": "task-sub-1",
+          "heartbeat": true,
+          "subagent_type": "Explore",
+          "subagent_retry": {
+            "agent_id": "agent-abc",
+            "attempt": 2,
+            "max_retries": 5,
+            "retry_delay_ms": 1500,
+            "error_status": 429,
+            "error_category": "rate_limit"
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ToolProgressMessage)
@@ -1448,7 +1448,7 @@ describe ClaudeAgent::Message do
         message.tool_name.should eq("Agent")
         message.elapsed_time_seconds.should eq(12.5)
         message.task_id.should eq("task-sub-1")
-        message.heartbeat.should eq(true)
+        message.heartbeat.should be_true
         message.subagent_type.should eq("Explore")
         message.blocked.should be_nil
         retry_info = message.subagent_retry
@@ -1466,23 +1466,23 @@ describe ClaudeAgent::Message do
 
     it "parses ToolProgressMessage blocked for workflow_agent classifier" do
       json = <<-JSON
-      {
-        "type": "tool_progress",
-        "uuid": "tp-blocked",
-        "session_id": "sess-456",
-        "tool_use_id": "tool-wf-1",
-        "tool_name": "workflow_agent",
-        "elapsed_time_seconds": 1.0,
-        "blocked": true
-      }
-      JSON
+        {
+          "type": "tool_progress",
+          "uuid": "tp-blocked",
+          "session_id": "sess-456",
+          "tool_use_id": "tool-wf-1",
+          "tool_name": "workflow_agent",
+          "elapsed_time_seconds": 1.0,
+          "blocked": true
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::ToolProgressMessage)
 
       if message.is_a?(ClaudeAgent::ToolProgressMessage)
         message.tool_name.should eq("workflow_agent")
-        message.blocked.should eq(true)
+        message.blocked.should be_true
       end
     end
 
@@ -1501,28 +1501,28 @@ describe ClaudeAgent::Message do
 
     it "parses RateLimitInfo with credits and model_scoped extensions" do
       json = <<-JSON
-      {
-        "type": "rate_limit_event",
-        "uuid": "rate-ext-1",
-        "session_id": "sess-456",
-        "rate_limit_info": {
-          "status": "rejected",
-          "resetsAt": 1774000000,
-          "rateLimitType": "seven_day_overage_included",
-          "utilization": 1.0,
-          "errorCode": "credits_required",
-          "canUserPurchaseCredits": true,
-          "hasChargeableSavedPaymentMethod": false,
-          "model_scoped": [
-            {
-              "display_name": "Sonnet",
-              "utilization": 0.85,
-              "resets_at": "2026-07-31T00:00:00Z"
-            }
-          ]
+        {
+          "type": "rate_limit_event",
+          "uuid": "rate-ext-1",
+          "session_id": "sess-456",
+          "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": 1774000000,
+            "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0,
+            "errorCode": "credits_required",
+            "canUserPurchaseCredits": true,
+            "hasChargeableSavedPaymentMethod": false,
+            "model_scoped": [
+              {
+                "display_name": "Sonnet",
+                "utilization": 0.85,
+                "resets_at": "2026-07-31T00:00:00Z"
+              }
+            ]
+          }
         }
-      }
-      JSON
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::RateLimitEvent)
@@ -1531,8 +1531,8 @@ describe ClaudeAgent::Message do
         info = message.rate_limit_info
         info.status.should eq("rejected")
         info.error_code.should eq("credits_required")
-        info.can_user_purchase_credits.should eq(true)
-        info.has_chargeable_saved_payment_method.should eq(false)
+        info.can_user_purchase_credits.should be_true
+        info.has_chargeable_saved_payment_method.should be_false
         info.rate_limit_type.should eq("seven_day_overage_included")
 
         scoped = info.model_scoped
@@ -1548,14 +1548,14 @@ describe ClaudeAgent::Message do
 
     it "parses ResultMessage without new optional fields (backward compat)" do
       json = <<-JSON
-      {
-        "type": "result",
-        "uuid": "result-old",
-        "session_id": "sess-456",
-        "subtype": "success",
-        "result": "ok"
-      }
-      JSON
+        {
+          "type": "result",
+          "uuid": "result-old",
+          "session_id": "sess-456",
+          "subtype": "success",
+          "result": "ok"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       if message.is_a?(ClaudeAgent::ResultMessage)
@@ -1571,13 +1571,13 @@ describe ClaudeAgent::Message do
 
     it "falls back to GenericSystemMessage for incomplete command_lifecycle" do
       json = <<-JSON
-      {
-        "type": "system",
-        "subtype": "command_lifecycle",
-        "session_id": "sess-456",
-        "uuid": "lifecycle-incomplete"
-      }
-      JSON
+        {
+          "type": "system",
+          "subtype": "command_lifecycle",
+          "session_id": "sess-456",
+          "uuid": "lifecycle-incomplete"
+        }
+        JSON
 
       message = ClaudeAgent::Message.parse(json)
       message.should be_a(ClaudeAgent::GenericSystemMessage)
@@ -1610,7 +1610,7 @@ describe ClaudeAgent::ContentBlock do
 
     result = block.as(ClaudeAgent::ToolResultBlock)
     result.tool_use_id.should eq("t1")
-    result.is_error.should eq(false)
+    result.is_error.should be_false
   end
 
   it "parses ThinkingBlock" do
