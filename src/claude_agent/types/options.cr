@@ -654,6 +654,15 @@ module ClaudeAgent
     property? continue_conversation : Bool = false
     property resume : String?            # Session ID to resume
     property resume_session_at : String? # Message UUID to resume from
+    # With `resume_session_at`: UUID of the user prompt whose turn this
+    # truncating resume intends to discard. The CLI validates at load
+    # time that every transcript entry after the `resume_session_at`
+    # point is attributable to that turn and refuses the resume
+    # otherwise (surfaces as a `ResultError` whose message contains
+    # `Resume rejected by --resume-drops-turn:`). Leave unset to keep
+    # the unvalidated truncation behavior.
+    # Matches Python's `resume_drops_turn` (0.2.137).
+    property resume_drops_turn : String?
     property session_id : String?
     property? fork_session : Bool = false
     property? no_session_persistence : Bool = false
@@ -750,6 +759,7 @@ module ClaudeAgent
       @continue_conversation : Bool = false,
       @resume : String? = nil,
       @resume_session_at : String? = nil,
+      @resume_drops_turn : String? = nil,
       @session_id : String? = nil,
       @fork_session : Bool = false,
       @no_session_persistence : Bool = false,
@@ -812,6 +822,40 @@ module ClaudeAgent
       "PreToolUse hook; or narrow the entry so calls fall through to " \
       "can_use_tool. Allow rules from settings files can also shadow the " \
       "callback but are not visible here."
+    end
+
+    # Validate the `can_use_tool` configuration. Raises when `can_use_tool`
+    # is combined with `permission_prompt_tool_name` — the two are mutually
+    # exclusive permission channels. Called from both client `start` paths
+    # so one-shot queries and interactive clients enforce the same rule.
+    # Mirrors Python's `_configure_can_use_tool` validation (0.2.140).
+    # (Unlike Python there is nothing to rewrite: when `can_use_tool` is
+    # set this SDK already routes permission requests over the control
+    # protocol.)
+    def validate_can_use_tool! : Nil
+      return unless can_use_tool
+      return unless permission_prompt_tool_name
+
+      raise ConfigurationError.new(
+        "can_use_tool callback cannot be used with permission_prompt_tool_name. " \
+        "Please use one or the other.",
+      )
+    end
+
+    # True when a one-shot `ClaudeAgent.query` must run over `AgentClient`
+    # (bidirectional control protocol) instead of the lightweight
+    # one-shot `CLIClient` path: a `can_use_tool` callback, or
+    # in-process SDK MCP servers whose tool calls route back as
+    # `mcp_message` control requests — neither can be answered without
+    # the control protocol. Mirrors Python 0.2.140 (`can_use_tool`
+    # support for `query()` and string prompts).
+    def needs_control_protocol? : Bool
+      return true if can_use_tool
+
+      servers = mcp_servers
+      return false unless servers
+
+      servers.values.any?(SDKMCPServer)
     end
 
     # Return the tool an `allowed_tools` entry allows outright, else nil.

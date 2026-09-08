@@ -750,6 +750,164 @@ describe "ClaudeAgent session utilities" do
     end
   end
 
+  it "recovers parent ids from the .meta.json sidecar (Python 0.2.140 parity)" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      agent_id = "worker"
+      user_id = UUID.random.to_s
+      assistant_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+      File.write(
+        File.join(subagent_dir, "agent-#{agent_id}.jsonl"),
+        [
+          make_transcript_entry("user", user_id, nil, session_id, content: "plan"),
+          make_transcript_entry("assistant", assistant_id, user_id, session_id, content: "ack"),
+        ].join('\n') + "\n"
+      )
+      File.write(
+        File.join(subagent_dir, "agent-#{agent_id}.meta.json"),
+        {"toolUseId" => "tool-parent", "parentAgentId" => "agent-top"}.to_json
+      )
+
+      messages = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path)
+      messages.size.should eq(2)
+      messages.each do |message|
+        message.parent_tool_use_id.should eq("tool-parent")
+        message.parent_agent_id.should eq("agent-top")
+      end
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "leaves parent ids nil for missing or corrupt sidecars" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      user_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+
+      File.write(
+        File.join(subagent_dir, "agent-missing.jsonl"),
+        [make_transcript_entry("user", user_id, nil, session_id, content: "plan")].join('\n') + "\n"
+      )
+      messages = ClaudeAgent.get_subagent_messages(session_id, "missing", directory: project_path)
+      messages.size.should eq(1)
+      messages.first.parent_tool_use_id.should be_nil
+      messages.first.parent_agent_id.should be_nil
+
+      File.write(
+        File.join(subagent_dir, "agent-broken.jsonl"),
+        [make_transcript_entry("user", user_id, nil, session_id, content: "plan")].join('\n') + "\n"
+      )
+      File.write(File.join(subagent_dir, "agent-broken.meta.json"), "not json {{{")
+      broken = ClaudeAgent.get_subagent_messages(session_id, "broken", directory: project_path)
+      broken.size.should eq(1)
+      broken.first.parent_tool_use_id.should be_nil
+
+      File.write(
+        File.join(subagent_dir, "agent-array.jsonl"),
+        [make_transcript_entry("user", user_id, nil, session_id, content: "plan")].join('\n') + "\n"
+      )
+      File.write(File.join(subagent_dir, "agent-array.meta.json"), "[1, 2]")
+      arrayed = ClaudeAgent.get_subagent_messages(session_id, "array", directory: project_path)
+      arrayed.size.should eq(1)
+      arrayed.first.parent_tool_use_id.should be_nil
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "prefers transcript entry ids over the sidecar" do
+    with_temp_claude_config do |config_dir|
+      project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"
+      FileUtils.mkdir_p(project_path)
+      project_dir = make_project_dir(config_dir, project_path)
+      session_id = UUID.random.to_s
+      agent_id = "explicit"
+      user_id = UUID.random.to_s
+
+      make_session_file(project_dir, session_id: session_id)
+      subagent_dir = File.join(project_dir, session_id, "subagents")
+      FileUtils.mkdir_p(subagent_dir)
+      File.write(
+        File.join(subagent_dir, "agent-#{agent_id}.jsonl"),
+        [
+          make_transcript_entry(
+            "user", user_id, nil, session_id,
+            content: "plan", parentToolUseId: "tool-entry", parentAgentId: "agent-entry"
+          ),
+        ].join('\n') + "\n"
+      )
+      File.write(
+        File.join(subagent_dir, "agent-#{agent_id}.meta.json"),
+        {"toolUseId" => "tool-sidecar", "parentAgentId" => "agent-sidecar"}.to_json
+      )
+
+      messages = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path)
+      messages.size.should eq(1)
+      messages.first.parent_tool_use_id.should eq("tool-entry")
+      messages.first.parent_agent_id.should eq("agent-entry")
+
+      FileUtils.rm_rf(project_path)
+    end
+  end
+
+  it "recovers parent ids from store agent_metadata entries, last wins" do
+    store = ClaudeAgent::InMemorySessionStore.new
+    project_key = ClaudeAgent::SessionStorage.project_key_for_directory(nil)
+    session_id = UUID.random.to_s
+    user_id = UUID.random.to_s
+    assistant_id = UUID.random.to_s
+
+    entries = [
+      ClaudeAgent::SessionStoreEntry.from_hash({
+        "type"          => JSON::Any.new("agent_metadata"),
+        "toolUseId"     => JSON::Any.new("tool-old"),
+        "parentAgentId" => JSON::Any.new("agent-old"),
+      } of String => JSON::Any),
+      ClaudeAgent::SessionStoreEntry.from_hash({
+        "type"      => JSON::Any.new("user"),
+        "uuid"      => JSON::Any.new(user_id),
+        "sessionId" => JSON::Any.new(session_id),
+        "message"   => json_any({"role" => "user", "content" => "plan"}),
+      } of String => JSON::Any),
+      ClaudeAgent::SessionStoreEntry.from_hash({
+        "type"          => JSON::Any.new("agent_metadata"),
+        "toolUseId"     => JSON::Any.new("tool-new"),
+        "parentAgentId" => JSON::Any.new("agent-new"),
+      } of String => JSON::Any),
+      ClaudeAgent::SessionStoreEntry.from_hash({
+        "type"       => JSON::Any.new("assistant"),
+        "uuid"       => JSON::Any.new(assistant_id),
+        "parentUuid" => JSON::Any.new(user_id),
+        "sessionId"  => JSON::Any.new(session_id),
+        "message"    => json_any({"role" => "assistant", "content" => "ack"}),
+      } of String => JSON::Any),
+    ]
+    store.append(ClaudeAgent::SessionKey.new(project_key, session_id, "subagents/agent-w1"), entries)
+
+    messages = ClaudeAgent::SessionStorage.get_subagent_messages_from_store(
+      store, session_id, "w1", directory: nil
+    )
+    messages.should_not be_empty
+    messages.each do |message|
+      message.parent_tool_use_id.should eq("tool-new")
+      message.parent_agent_id.should eq("agent-new")
+    end
+  end
+
   it "forks a session into a new JSONL file with remapped UUIDs" do
     with_temp_claude_config do |config_dir|
       project_path = "/tmp/claude-agent-cr-project-#{Random.rand(1_000_000)}"

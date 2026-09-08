@@ -1435,3 +1435,86 @@ describe ClaudeAgent::UnsupportedOptionError do
     message.should contain("Upgrade the CLI")
   end
 end
+
+describe "skill name validation (Python 0.2.129 parity)" do
+  it "accepts plain and plugin-qualified names" do
+    ClaudeAgent::CLIClient.validate_skill_name("my-skill")
+    ClaudeAgent::CLIClient.validate_skill_name("plugin:my-skill")
+    ClaudeAgent::CLIClient.validate_skill_name("Skill Name 2.0")
+  end
+
+  it "rejects delimiter, wildcard, slash, and blank names" do
+    ["", "   ", "a,b", "a(b)", "a)b", "*", "plugin:*", "ns *", "/cmd", " lead", "trail "].each do |name|
+      expect_raises(ClaudeAgent::ConfigurationError) do
+        ClaudeAgent::CLIClient.validate_skill_name(name)
+      end
+    end
+  end
+
+  it "rejects control characters, BOM, and bad backslashes" do
+    ["a\tb", "a\nb", "a\u007Fb", "a\u0085b", "a\u{FEFF}b", "a\\\\b", "trail\\"].each do |name|
+      expect_raises(ClaudeAgent::ConfigurationError) do
+        ClaudeAgent::CLIClient.validate_skill_name(name)
+      end
+    end
+  end
+
+  it "rejects bad names when building argv" do
+    options = ClaudeAgent::AgentOptions.new(skills: ["ok-skill", "bad,skill"])
+    client = TestableCLIClient.new(options)
+    expect_raises(ClaudeAgent::ConfigurationError) do
+      client.test_build_cli_args
+    end
+  end
+
+  it "emits validated Skill(name) rules into --allowedTools" do
+    options = ClaudeAgent::AgentOptions.new(
+      skills: ["my-skill", "plugin:other"],
+      allowed_tools: ["Read"],
+    )
+    client = TestableCLIClient.new(options)
+    args = client.test_build_cli_args
+    idx = args.index("--allowedTools")
+    idx.should_not be_nil
+    if idx
+      value = args[idx + 1]
+      value.should contain("Skill(my-skill)")
+      value.should contain("Skill(plugin:other)")
+    end
+  end
+end
+
+describe "resume argv (Python 0.2.137 parity)" do
+  it "emits --resume-drops-turn in equals form" do
+    options = ClaudeAgent::AgentOptions.new(
+      resume: "sess-1",
+      resume_session_at: "msg-1",
+      resume_drops_turn: "prompt-9",
+    )
+    client = TestableCLIClient.new(options)
+    args = client.test_build_cli_args
+    args.should contain("--resume-drops-turn=prompt-9")
+    args.should contain("--resume-session-at=msg-1")
+  end
+
+  it "omits --resume-drops-turn when unset" do
+    options = ClaudeAgent::AgentOptions.new(resume: "sess-1")
+    client = TestableCLIClient.new(options)
+    args = client.test_build_cli_args
+    args.any?(&.starts_with?("--resume-drops-turn")).should be_false
+  end
+end
+
+describe "can_use_tool start validation (Python 0.2.140 parity)" do
+  it "raises on CLIClient#start when combined with permission_prompt_tool_name" do
+    callback = ClaudeAgent::PermissionCallback.new { |_ctx| ClaudeAgent::PermissionResult.allow }
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: callback,
+      permission_prompt_tool_name: "CustomPrompt",
+    )
+    client = ClaudeAgent::CLIClient.new(options)
+    expect_raises(ClaudeAgent::ConfigurationError, "cannot be used with permission_prompt_tool_name") do
+      client.start
+    end
+  end
+end

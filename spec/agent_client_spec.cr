@@ -131,6 +131,10 @@ class ClaudeAgent::AgentClient
   def test_registered_hook_callback_count : Int32
     @registered_hook_callbacks.size
   end
+
+  def test_connection_closed_error : ClaudeAgent::Error
+    connection_closed_error
+  end
 end
 
 describe ClaudeAgent::AgentClient do
@@ -1765,6 +1769,115 @@ describe "AgentClient session store mirroring" do
       saw_mirror_error.should be_true
     ensure
       client.stop
+    end
+  end
+
+  describe "start validation (Python 0.2.140 parity)" do
+    it "rejects can_use_tool combined with permission_prompt_tool_name" do
+      callback = ->(_context : ClaudeAgent::PermissionContext) {
+        ClaudeAgent::PermissionResult.allow
+      }
+      options = ClaudeAgent::AgentOptions.new(
+        can_use_tool: callback,
+        permission_prompt_tool_name: "CustomPrompt",
+      )
+      client = ClaudeAgent::AgentClient.new(options, FakeCLIClient.new)
+      expect_raises(ClaudeAgent::ConfigurationError, "cannot be used with permission_prompt_tool_name") do
+        client.start
+      end
+    end
+  end
+
+  describe "terminal error results (Python 0.2.140 parity)" do
+    it "yields the error result without raising on a multi-turn client" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json({
+          "type"       => JSON::Any.new("result"),
+          "uuid"       => JSON::Any.new("result-err"),
+          "session_id" => JSON::Any.new("sess-1"),
+          "subtype"    => JSON::Any.new("error_max_turns"),
+          "is_error"   => JSON::Any.new(true),
+          "errors"     => JSON::Any.new([JSON::Any.new("too many turns")]),
+        }.to_json))
+        fake_cli.close_messages
+
+        received = [] of ClaudeAgent::Message
+        client.each_response { |message| received << message }
+        received.size.should eq(1)
+        received.first.should be_a(ClaudeAgent::ResultMessage)
+      ensure
+        client.stop
+      end
+    end
+
+    it "prefers the terminal error result when the connection closes" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json({
+          "type"            => JSON::Any.new("result"),
+          "uuid"            => JSON::Any.new("result-err"),
+          "session_id"      => JSON::Any.new("sess-1"),
+          "subtype"         => JSON::Any.new("error_during_execution"),
+          "is_error"        => JSON::Any.new(true),
+          "errors"          => JSON::Any.new([JSON::Any.new("boom goes the turn")]),
+          "terminal_reason" => JSON::Any.new("api_error"),
+        }.to_json))
+
+        received = [] of ClaudeAgent::Message
+        client.each_response { |message| received << message }
+        received.size.should eq(1)
+
+        error = client.test_connection_closed_error
+        error.should be_a(ClaudeAgent::ResultError)
+        (error.message || "").should contain("boom goes the turn")
+        error.as(ClaudeAgent::ResultError).terminal_reason.should eq("api_error")
+      ensure
+        client.stop
+      end
+    end
+
+    it "clears the tracked error once the conversation moves on" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json({
+          "type"       => JSON::Any.new("result"),
+          "uuid"       => JSON::Any.new("result-err"),
+          "session_id" => JSON::Any.new("sess-1"),
+          "subtype"    => JSON::Any.new("error_max_turns"),
+          "is_error"   => JSON::Any.new(true),
+          "errors"     => JSON::Any.new([JSON::Any.new("stale failure")]),
+        }.to_json))
+        fake_cli.push_message(ClaudeAgent::GenericSystemMessage.new(
+          "custom", "sess-1", {} of String => JSON::Any
+        ))
+        fake_cli.close_messages
+
+        # The first turn ends at the error result; a second pass picks up
+        # the follow-up message the reader forwarded afterwards.
+        received = [] of ClaudeAgent::Message
+        client.each_response { |message| received << message }
+        received.size.should eq(1)
+
+        followups = [] of ClaudeAgent::Message
+        client.each_response { |message| followups << message }
+        followups.size.should eq(1)
+
+        error = client.test_connection_closed_error
+        error.should be_a(ClaudeAgent::ConnectionError)
+        (error.message || "").should_not contain("stale failure")
+      ensure
+        client.stop
+      end
     end
   end
 end

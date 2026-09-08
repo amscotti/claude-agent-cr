@@ -59,7 +59,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.9.0
+        version: ~> 0.10.0
     ```
 
 2.  Run `shards install`
@@ -1397,7 +1397,8 @@ end
 
 ## Status
 
-> Developed against Claude Code CLI **v2.1.220**. The SDK is forward-compatible:
+> Developed against Claude Code CLI **v2.1.220**, with SDK-surface parity through
+> Python `0.2.152` / TypeScript `0.3.263`. The SDK is forward-compatible:
 > features that require newer CLI versions are gracefully no-op or surface a
 > clear error on older CLIs.
 
@@ -1500,6 +1501,26 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.10.0
+
+Parity release covering the official Python SDK (`0.2.129`–`0.2.152`) and TypeScript SDK (`0.3.221`–`0.3.263`) changes since 0.9.0. Developed/tested against Claude Code CLI **v2.1.220**; newer wire shapes are forward-compatible parses covered by canned-payload specs.
+
+**Behavior changes** (read before upgrading):
+- **Error results now raise**: `ClaudeAgent.query` (block and iterator forms) yields the error `ResultMessage` first, then raises the new `ResultError` (a `ProcessError` subclass, so existing `rescue ProcessError` handlers keep working). Previously the error result was returned silently. `AgentClient#each_response` still yields without raising (multi-turn sessions stay alive).
+- **`query()` honors `can_use_tool` and SDK MCP servers**: one-shot queries with these options now run over `AgentClient` (control protocol) instead of silently dropping permission callbacks and in-process tool calls. `can_use_tool` combined with `permission_prompt_tool_name` raises `ConfigurationError` on every `start` path.
+- **Skill names are validated**: `skills: [...]` entries carrying delimiters, wildcards, or surrounding whitespace raise `ConfigurationError` at `start` instead of building dead `--allowedTools` rules (Python `0.2.129` security parity).
+- **Resume materialization partitions sidecars**: `agent_metadata` entries are written to `.meta.json` (last wins) instead of into the subagent `.jsonl`, so resumed subagents keep their agent type/worktree; resume also seeds `settings.json` / `cowork_settings.json` (plugin declarations stripped), fixing `apiKeyHelper`-only auth on resume.
+
+**New features**:
+- **`ResultError`**: structured failure (`subtype`, `errors`, `result`, `api_error_status`, `terminal_reason`, `session_id`, raw `data`) with Python-matching error-text selection; pending control requests (e.g. `initialize` during a refused resume) now fail with the CLI's actual error text.
+- **`ConversationResetMessage`**: surfaces the CLI's `conversation_reset` frame (`new_conversation_id`, `uuid`, `session_id`) so long-lived sessions can snapshot running totals.
+- **`UserMessage#origin`** plus `MessageOrigin#from_session` / `#verified_peer_pid`; malformed `origin` payloads degrade to `nil` instead of failing the envelope (Python `0.2.137`).
+- **Truncating resume**: `AgentOptions#resume_drops_turn` (`--resume-drops-turn=`); refusals surface as `ResultError` containing `Resume rejected by --resume-drops-turn:`.
+- **Subagent linkage**: `get_subagent_messages` (disk and store) recovers `parent_tool_use_id` / `parent_agent_id` from the `.meta.json` sidecar; `import_session_to_store` tolerates corrupt/non-object sidecars.
+- **Result/usage/task fields** (TS `0.3.243`–`0.3.260`): `user_message_uuids`, `queued_turn_count`, `first_content_frame_ms` / `first_stream_post_ms` / `first_stream_post_ack_ms` / `first_stream_post_wall_ms`, `ModelUsage#thinking_tokens` / `#cost_basis`, `task_started` `is_backgrounded` / `spawn_depth` / `ambient`, `task_notification` `resource_links` / `ambient`, `background_tasks_changed` entry `ambient`, `user_message_uuid` on `StreamEvent` / `AssistantMessage`.
+- **Hooks**: `HookSpecificOutput#classifier_context` (PostToolUse, TS `0.3.236`) and `#suppress_original_prompt` (UserPromptSubmit/Expansion, TS `0.3.238`).
+- **Server info**: `effort` and `terminal_slash_commands` on init (TS `0.3.229`/`0.3.234`).
 
 ### 0.9.0
 

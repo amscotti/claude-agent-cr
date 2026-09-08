@@ -214,6 +214,12 @@ module ClaudeAgent
     # Present on init (and result messages via the host) when the CLI explains
     # the reason (account tier, model, org policy, etc.).
     getter fast_mode_disabled_reason : String?
+    # Session's applied effort level, or null when none is sent. Set on
+    # Remote Control bridge init frames. Matches TS SDK 0.3.234+.
+    getter effort : JSON::Any?
+    # Terminal-oriented slash commands, so Remote Control clients can
+    # hide them. Matches TS SDK 0.3.229+.
+    getter terminal_slash_commands : Array(String)?
     # CLI build advertised by the subprocess.
     getter claude_code_version : String?
     # Full init payload, including any forward-compat fields this struct
@@ -237,6 +243,8 @@ module ClaudeAgent
       @permission_mode : String? = nil,
       @fast_mode_state : String? = nil,
       @fast_mode_disabled_reason : String? = nil,
+      @effort : JSON::Any? = nil,
+      @terminal_slash_commands : Array(String)? = nil,
       @claude_code_version : String? = nil,
       @raw_data : Hash(String, JSON::Any) = {} of String => JSON::Any,
     )
@@ -268,6 +276,9 @@ module ClaudeAgent
         fast_mode_state: data["fast_mode_state"]?.try(&.as_s?) || data["fastModeState"]?.try(&.as_s?),
         fast_mode_disabled_reason: data["fast_mode_disabled_reason"]?.try(&.as_s?) ||
                                    data["fastModeDisabledReason"]?.try(&.as_s?),
+        effort: data["effort"]?,
+        terminal_slash_commands: data["terminal_slash_commands"]?.try(&.as_a?).try(&.compact_map(&.as_s?)) ||
+                                 data["terminalSlashCommands"]?.try(&.as_a?).try(&.compact_map(&.as_s?)),
         claude_code_version: data["claude_code_version"]?.try(&.as_s?),
         raw_data: data,
       )

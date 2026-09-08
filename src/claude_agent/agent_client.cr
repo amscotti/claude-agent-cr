@@ -94,6 +94,14 @@ module ClaudeAgent
     # SessionStore live transcript mirror (nil when no session_store option).
     @mirror_batcher : TranscriptMirrorBatcher? = nil
     @materialized_resume : MaterializedResume? = nil
+    # Most recent terminal error result (`is_error: true`), if the latest
+    # turn marker is one. Read by `connection_closed_error` so pending
+    # control requests (e.g. `initialize` during a refused resume) fail
+    # with the CLI's actual error text. Cleared by any later message —
+    # a new turn marker means the conversation moved on. Written and
+    # read only on the response-reader fiber. Mirrors Python's
+    # `Query._last_error_result` (0.2.140).
+    @last_error_result : ResultMessage? = nil
 
     def initialize(@options : AgentOptions? = nil, cli_client : CLIClient? = nil)
       @cli_client = cli_client || CLIClient.new(@options)
@@ -116,6 +124,9 @@ module ClaudeAgent
 
     def start
       prepare_session_store!
+      # Same mutual-exclusion rule as the one-shot path (mirrors Python
+      # `_configure_can_use_tool`, which both entry points share).
+      @options.try(&.validate_can_use_tool!)
       @cli_client.start
       setup_transcript_mirror
       @state_mutex.synchronize do
@@ -640,38 +651,39 @@ module ClaudeAgent
 
     private def start_response_reader
       @response_fiber = spawn do
-        begin
-          @cli_client.each_message do |message|
-            next if @message_channel.closed?
+        @cli_client.each_message do |message|
+          next if @message_channel.closed?
 
-            if message.is_a?(ControlResponseMessage)
-              handle_control_response(message)
-              next
-            end
-
-            # SessionStore path: peel transcript_mirror frames off the stream
-            # (do not yield to consumers). Matches Python Query._read_messages.
-            if message.is_a?(UnknownMessage) && message.type == "transcript_mirror"
-              handle_transcript_mirror(message)
-              next
-            end
-
-            # Flush pending mirror entries before consumers see the result so
-            # the store is up to date for this turn.
-            if message.is_a?(ResultMessage)
-              @mirror_batcher.try(&.flush)
-            end
-
-            @message_channel.send(message)
+          if message.is_a?(ControlResponseMessage)
+            handle_control_response(message)
+            next
           end
-        rescue Channel::ClosedError
-          # Expected during shutdown
-        rescue ex
-          STDERR.puts "claude-agent-cr: response reader error: #{ex.message}"
-        ensure
-          fail_pending_control_requests(connection_closed_error)
-          @message_channel.close unless @message_channel.closed?
+
+          # SessionStore path: peel transcript_mirror frames off the stream
+          # (do not yield to consumers). Matches Python Query._read_messages.
+          if message.is_a?(UnknownMessage) && message.type == "transcript_mirror"
+            handle_transcript_mirror(message)
+            next
+          end
+
+          # Flush pending mirror entries before consumers see the result so
+          # the store is up to date for this turn.
+          if message.is_a?(ResultMessage)
+            @mirror_batcher.try(&.flush)
+            @last_error_result = message.is_error == true ? message : nil
+          else
+            @last_error_result = nil
+          end
+
+          @message_channel.send(message)
         end
+      rescue Channel::ClosedError
+        # Expected during shutdown
+      rescue ex
+        STDERR.puts "claude-agent-cr: response reader error: #{ex.message}"
+      ensure
+        fail_pending_control_requests(connection_closed_error)
+        @message_channel.close unless @message_channel.closed?
       end
     end
 
@@ -778,11 +790,18 @@ module ClaudeAgent
       end
     end
 
-    # Translate an abrupt subprocess exit into a more actionable error when
-    # the CLI's stderr contains an "unknown option '--xxx'" message (a
-    # signature of forwarding a v0.5+ SDK-only flag to an older CLI).
-    # Falls back to a generic ConnectionError otherwise.
+    # Translate an abrupt subprocess exit into a more actionable error.
+    # Prefers the structured `ResultError` when the CLI emitted a terminal
+    # error result first (e.g. a refused resume — so a pending
+    # `initialize` sees the actual error text instead of a generic
+    # "exit code 1"), then the unknown-option diagnostic (a signature of
+    # forwarding an SDK-only flag to an older CLI), then a generic
+    # ConnectionError. Mirrors Python's `Query._read_messages` error
+    # replacement (0.2.140).
     private def connection_closed_error : ClaudeAgent::Error
+      if failed = @last_error_result
+        return ResultError.from_result(failed)
+      end
       if flag = @cli_client.detect_unknown_option_error
         UnsupportedOptionError.new(flag, cli_path: @options.try(&.cli_path))
       else
@@ -958,11 +977,19 @@ module ClaudeAgent
       end
 
       channels.each do |channel|
-        begin
-          channel.send(error)
-        rescue Channel::ClosedError
-        end
+        deliver_control_failure(channel, error)
       end
+    end
+
+    # Deliver one pending-control failure, ignoring receivers that
+    # already went away. A closed channel must not abort delivery to
+    # the remaining waiters.
+    private def deliver_control_failure(
+      channel : Channel(ControlRequestResult),
+      error : Exception,
+    ) : Nil
+      channel.send(error)
+    rescue Channel::ClosedError
     end
 
     private def build_hook_initialize_payload : Hash(String, JSON::Any)?

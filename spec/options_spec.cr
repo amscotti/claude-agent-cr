@@ -522,4 +522,47 @@ describe "AgentOptions#can_use_tool_shadowed_warning" do
     message.try(&.should contain("Read, Skill"))
     allowed.should eq(["Read"])
   end
+
+  it "defaults resume_drops_turn to nil and accepts a value" do
+    ClaudeAgent::AgentOptions.new.resume_drops_turn.should be_nil
+    options = ClaudeAgent::AgentOptions.new(
+      resume: "sess-1",
+      resume_session_at: "msg-1",
+      resume_drops_turn: "prompt-9",
+    )
+    options.resume_drops_turn.should eq("prompt-9")
+  end
+
+  it "rejects can_use_tool combined with permission_prompt_tool_name" do
+    callback = ClaudeAgent::PermissionCallback.new { |_ctx| ClaudeAgent::PermissionResult.allow }
+    options = ClaudeAgent::AgentOptions.new(
+      can_use_tool: callback,
+      permission_prompt_tool_name: "CustomPrompt",
+    )
+    expect_raises(ClaudeAgent::ConfigurationError, "cannot be used with permission_prompt_tool_name") do
+      options.validate_can_use_tool!
+    end
+  end
+
+  it "accepts can_use_tool and permission_prompt_tool_name independently" do
+    callback = ClaudeAgent::PermissionCallback.new { |_ctx| ClaudeAgent::PermissionResult.allow }
+    ClaudeAgent::AgentOptions.new(can_use_tool: callback).validate_can_use_tool!
+    ClaudeAgent::AgentOptions.new(permission_prompt_tool_name: "CustomPrompt").validate_can_use_tool!
+    ClaudeAgent::AgentOptions.new.validate_can_use_tool!
+  end
+
+  it "detects when a query needs the control protocol" do
+    ClaudeAgent::AgentOptions.new.needs_control_protocol?.should be_false
+
+    callback = ClaudeAgent::PermissionCallback.new { |_ctx| ClaudeAgent::PermissionResult.allow }
+    ClaudeAgent::AgentOptions.new(can_use_tool: callback).needs_control_protocol?.should be_true
+
+    servers = {} of String => ClaudeAgent::MCPServerConfig
+    servers["tools"] = ClaudeAgent::SDKMCPServer.new("tools")
+    ClaudeAgent::AgentOptions.new(mcp_servers: servers).needs_control_protocol?.should be_true
+
+    external = {} of String => ClaudeAgent::MCPServerConfig
+    external["ext"] = ClaudeAgent::ExternalMCPServerConfig.stdio("python", ["server.py"])
+    ClaudeAgent::AgentOptions.new(mcp_servers: external).needs_control_protocol?.should be_false
+  end
 end

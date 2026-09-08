@@ -167,6 +167,25 @@ describe ClaudeAgent::ServerInfo do
     absent.fast_mode_disabled_reason.should be_nil
   end
 
+  it "parses effort and terminal_slash_commands (TS 0.3.229/0.3.234 parity)" do
+    info = ClaudeAgent::ServerInfo.from_data({
+      "effort"                => JSON::Any.new("high"),
+      "terminalSlashCommands" => JSON::Any.new([JSON::Any.new("/ide"), JSON::Any.new("/terminal")]),
+    })
+    info.effort.try(&.as_s?).should eq("high")
+    info.terminal_slash_commands.should eq(["/ide", "/terminal"])
+
+    snake = ClaudeAgent::ServerInfo.from_data({
+      "terminal_slash_commands" => JSON::Any.new([JSON::Any.new("/vim")]),
+    })
+    snake.terminal_slash_commands.should eq(["/vim"])
+    snake.effort.should be_nil
+
+    absent = ClaudeAgent::ServerInfo.from_data({} of String => JSON::Any)
+    absent.effort.should be_nil
+    absent.terminal_slash_commands.should be_nil
+  end
+
   it "preserves model capability flags including supports_fast_mode" do
     data = {
       "models" => JSON::Any.new([

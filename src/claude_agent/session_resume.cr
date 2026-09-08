@@ -193,17 +193,44 @@ module ClaudeAgent
       entries = store.load(SessionKey.new(project_key, session_id, subpath))
       next if entries.nil? || entries.empty?
 
+      # Partition: agent_metadata entries describe the .meta.json sidecar
+      # (last one wins — it is rewritten on resume); everything else is
+      # a transcript line. Mirrors Python's `_materialize_subkeys`
+      # (0.2.140): resumed subagents keep their agentType/worktreePath.
+      metadata = nil.as(SessionStoreEntry?)
+      transcript = [] of SessionStoreEntry
+      entries.each do |entry|
+        if entry.type == "agent_metadata"
+          metadata = entry
+        else
+          transcript << entry
+        end
+      end
+
       # subpath like "subagents/agent-xyz" → session_dir/subagents/agent-xyz.jsonl
       target = File.join(project_dir, session_id, "#{subpath}.jsonl")
       Dir.mkdir_p(File.dirname(target))
-      write_jsonl(target, entries)
+      write_jsonl(target, transcript) unless transcript.empty?
+
+      if meta = metadata
+        # Strip the synthetic `type` discriminator before persisting.
+        meta_content = meta.to_h.reject { |key, _| key == "type" }
+        meta_file = agent_metadata_sidecar_path(target)
+        File.write(meta_file, meta_content.to_json)
+        begin
+          File.chmod(meta_file, 0o600)
+        rescue
+        end
+      end
     end
   rescue SessionStoreNotImplementedError
     # optional API
   end
 
-  # Copy `.credentials.json` (refreshToken redacted) and `.claude.json` into
-  # the temp config dir so a resumed CLI can authenticate.
+  # Seed `tmp_base` with the caller's auth and user config:
+  # `.credentials.json` (refreshToken redacted), `.claude.json`, and user
+  # `settings.json` / `cowork_settings.json` (plugin declarations
+  # stripped). Mirrors Python's `_copy_auth_files` (0.2.137).
   private def self.copy_auth_files(tmp_base : String, opt_env : Hash(String, String)?) : Nil
     caller_config = opt_env.try(&.["CLAUDE_CONFIG_DIR"]?) || ENV["CLAUDE_CONFIG_DIR"]?
     source_config = if caller_config
@@ -223,6 +250,65 @@ module ClaudeAgent
                         File.join(ENV["HOME"]? || ".", ".claude.json")
                       end
     copy_if_present(claude_json_src, File.join(tmp_base, ".claude.json"))
+
+    # User settings carry `apiKeyHelper` (a fourth auth mechanism
+    # alongside .credentials.json / Keychain / env) plus env/hooks/
+    # permissions. Without them the resumed subprocess sees no user
+    # settings at all, and an apiKeyHelper-only host fails with
+    # "Not logged in". `cowork_settings.json` is the alternate filename
+    # the CLI reads in cowork-plugins mode. Both pass through
+    # `strip_settings_for_resume` so plugin declarations don't reconcile
+    # against the empty tmp plugin cache.
+    ["settings.json", "cowork_settings.json"].each do |name|
+      copy_if_present(
+        File.join(source_config, name),
+        File.join(tmp_base, name),
+        ->strip_settings_for_resume(String),
+      )
+    end
+  end
+
+  # User-settings keys that only misbehave under the redirected
+  # CLAUDE_CONFIG_DIR: plugin declarations reconcile against the
+  # always-empty tmp plugins cache and would network-install each
+  # declared marketplace on every resume.
+  RESUME_SETTINGS_STRIPPED_KEYS = {"enabledPlugins", "extraKnownMarketplaces"}
+
+  # Drop settings keys that misbehave under a redirected config dir:
+  # `RESUME_SETTINGS_STRIPPED_KEYS` and `env.CLAUDE_CONFIG_DIR` (which
+  # would point the subprocess's config reads away from `tmp_base`).
+  # Content that doesn't parse as a JSON object is returned untouched so
+  # the subprocess sees exactly what the CLI would have read.
+  # Mirrors Python's `_strip_settings_for_resume` (0.2.137).
+  def self.strip_settings_for_resume(content : String) : String
+    parsed = begin
+      # lchop mirrors the CLI's BOM-tolerant settings reader:
+      # PowerShell writes settings.json with a UTF-8 BOM, which a plain
+      # parse rejects.
+      JSON.parse(content.lchop('\uFEFF')).as_h?
+    rescue JSON::ParseException
+      return content
+    end
+    return content unless parsed
+
+    stripped = false
+    RESUME_SETTINGS_STRIPPED_KEYS.each do |key|
+      if parsed.has_key?(key)
+        parsed.delete(key)
+        stripped = true
+      end
+    end
+    if env_block = parsed["env"]?.try(&.as_h?)
+      if env_block.has_key?("CLAUDE_CONFIG_DIR")
+        env_block.delete("CLAUDE_CONFIG_DIR")
+        stripped = true
+      end
+    end
+    return content unless stripped
+
+    parsed.to_json
+  rescue
+    content
   end
 
   private def self.write_redacted_credentials(creds_json : String, dst : String) : Nil
@@ -250,11 +336,43 @@ module ClaudeAgent
     end
   end
 
-  private def self.copy_if_present(src : String, dst : String) : Nil
-    return unless File.file?(src)
+  # Copy `src` to `dst` (mode 0o600) when it exists, through an
+  # optional `transform`. Best-effort enrichment of the temp config dir:
+  # a missing source is skipped silently; anything else unreadable (a
+  # directory or FIFO where a file was expected, permissions, ...) is
+  # skipped rather than aborting — or, for a FIFO, hanging — the resume.
+  # A failed write never leaves a truncated `dst` behind for the
+  # subprocess to misparse. Mirrors Python's `_read_if_present` /
+  # `_copy_if_present` (0.2.137).
+  private def self.copy_if_present(
+    src : String,
+    dst : String,
+    transform : (String -> String)? = nil,
+  ) : Nil
+    content = read_if_present(src)
+    return unless content
 
-    File.copy(src, dst)
+    begin
+      File.write(dst, transform ? transform.call(content) : content)
+      begin
+        File.chmod(dst, 0o600)
+      rescue
+      end
+    rescue
+      begin
+        File.delete(dst)
+      rescue
+      end
+    end
+  end
+
+  private def self.read_if_present(src : String) : String?
+    info = File.info?(src)
+    return unless info && info.file?
+
+    File.read(src)
   rescue
+    nil
   end
 
   # Best-effort rmtree with short retries for transient locks (AV/indexer).
@@ -262,16 +380,18 @@ module ClaudeAgent
     return unless Dir.exists?(path) || File.exists?(path)
 
     retries.times do |i|
-      begin
-        FileUtils.rm_rf(path)
-        return
-      rescue
-        sleep(0.1.seconds) if i + 1 < retries
-      end
+      return if try_rmtree(path)
+      sleep(0.1.seconds) if i + 1 < retries
     end
-    begin
-      FileUtils.rm_rf(path)
-    rescue
-    end
+    try_rmtree(path)
+  end
+
+  # Single rmtree attempt. A failed attempt must not abort the retry
+  # loop (or the final best-effort sweep).
+  private def self.try_rmtree(path : String) : Bool
+    FileUtils.rm_rf(path)
+    true
+  rescue
+    false
   end
 end

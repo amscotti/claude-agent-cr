@@ -13,7 +13,8 @@ module ClaudeAgent
       # mirror_error intentionally handled in parse_special_message so we can
       # derive defaults when fields are missing.
       "user"               => ->(json : String, data : MessageData) { UserMessage.parse_envelope(json, data).as(Message) },
-      "result"             => ->(json : String, _data : MessageData) { ResultMessage.from_json(json).as(Message) },
+      "result"             => ->(json : String, data : MessageData) { ResultMessage.parse_result(json, data).as(Message) },
+      "conversation_reset" => ->(json : String, _data : MessageData) { ConversationResetMessage.from_json(json).as(Message) },
       "permission_request" => ->(json : String, _data : MessageData) { PermissionRequest.from_json(json).as(Message) },
       "prompt_suggestion"  => ->(json : String, _data : MessageData) { PromptSuggestionMessage.from_json(json).as(Message) },
       "user_question"      => ->(json : String, _data : MessageData) { UserQuestion.from_json(json).as(Message) },
@@ -168,6 +169,7 @@ module ClaudeAgent
       description = data["description"]?.try(&.as_s)
       return GenericSystemMessage.new("task_started", session_id, data) unless uuid && task_id && description
 
+      spawn_depth = data["spawn_depth"]?.try(&.as_i64?).try(&.to_i32)
       TaskStartedMessage.new(
         session_id,
         data,
@@ -176,6 +178,9 @@ module ClaudeAgent
         description,
         data["tool_use_id"]?.try(&.as_s?),
         data["task_type"]?.try(&.as_s?),
+        data["is_backgrounded"]?.try(&.as_bool?),
+        spawn_depth,
+        data["ambient"]?.try(&.as_bool?),
       )
     end
 
@@ -215,6 +220,8 @@ module ClaudeAgent
         data["summary"]?.try(&.as_s?),
         TaskUsage.from_any(data["usage"]?),
         data["tool_use_id"]?.try(&.as_s?),
+        data["resource_links"]?.try(&.as_a?),
+        data["ambient"]?.try(&.as_bool?),
       )
     end
 
@@ -277,8 +284,10 @@ module ClaudeAgent
     end
 
     # Reports a uuid-stamped command/message's lifecycle state
-    # (queued/started/completed/cancelled/discarded). Matches the TS SDK's
-    # command_lifecycle frames (0.3.206+).
+    # (queued/started/completed/cancelled/discarded, plus `refused` for a
+    # cross-session peer message the session's receive-side policy
+    # declines — TS 0.3.238+). Matches the TS SDK's command_lifecycle
+    # frames (0.3.206+).
     private def self.parse_command_lifecycle(data : MessageData, session_id : String) : Message
       uuid = data["uuid"]?.try(&.as_s)
       state = data["state"]?.try(&.as_s)
@@ -308,6 +317,7 @@ module ClaudeAgent
           task_id: task_id,
           task_type: hash["task_type"]?.try(&.as_s?) || hash["taskType"]?.try(&.as_s?),
           description: hash["description"]?.try(&.as_s?),
+          ambient: hash["ambient"]?.try(&.as_bool?),
         )
       end
 
@@ -428,6 +438,15 @@ module ClaudeAgent
     # Present only when the turn is a harness-formed envelope; render
     # this instead of re-parsing the message text. Matches TS 0.3.205+.
     getter body : String?
+    # For "peer": the sender's host-openable session id, when its host
+    # provided one. A navigation target only, never proof of identity.
+    @[JSON::Field(key: "fromSession")]
+    getter from_session : String?
+    # For "peer": kernel-verified pid of the process that connected to
+    # this session's local messaging socket (the *connecting* process —
+    # for relayed traffic that is the relay). Absent when unverifiable.
+    @[JSON::Field(key: "verifiedPeerPid")]
+    getter verified_peer_pid : Int64?
 
     def initialize(
       @kind : String,
@@ -437,7 +456,36 @@ module ClaudeAgent
       @sender_task_id : String? = nil,
       @subkind : String? = nil,
       @body : String? = nil,
+      @from_session : String? = nil,
+      @verified_peer_pid : Int64? = nil,
     )
+    end
+
+    # Tolerant origin parse: return `data["origin"]` when it is a
+    # well-formed origin object (a hash with a string `kind`), else nil.
+    # Well-formed origins pass through as-is; anything else is treated
+    # as absent instead of raising. Mirrors Python's `_parse_origin`
+    # (0.2.137): newer CLI origin kinds/fields stay visible, malformed
+    # payloads degrade to nil.
+    def self.from_data?(data : MessageData) : MessageOrigin?
+      raw = data["origin"]?
+      hash = raw.try(&.as_h?)
+      return unless hash && hash["kind"]?.try(&.as_s?)
+      from_json(raw.to_json)
+    rescue
+      nil
+    end
+
+    # Return *json* with a malformed `origin` member removed so strict
+    # `JSON::Serializable` parsing cannot choke on it. Well-formed
+    # origins are left untouched. Pair with `.from_data?`, which reads
+    # the value tolerantly.
+    def self.scrub_json(json : String, data : MessageData) : String
+      return json unless data["origin"]?
+      return json if from_data?(data)
+      stripped = data.dup
+      stripped.delete("origin")
+      stripped.to_json
     end
 
     # True when this result was triggered by a human-authored prompt.
@@ -559,6 +607,10 @@ module ClaudeAgent
     # content may end mid-word). Absent on normally completed messages.
     # Matches the TS SDK's `aborted` (0.3.214+).
     getter aborted : Bool?
+
+    # UUID of the user message that triggered this turn, linking a reply
+    # to the message it answers. Matches TS SDK 0.3.246+.
+    getter user_message_uuid : String?
 
     def content
       message.content
@@ -761,6 +813,12 @@ module ClaudeAgent
     getter message : Hash(String, JSON::Any)
     getter parent_tool_use_id : String?
     getter tool_use_result : JSON::Any?
+    # Provenance of this message (why the turn was initiated). Populated
+    # on injected turns (task notifications, channel/peer messages, ...)
+    # and on user messages the CLI replays; tool-result messages never
+    # carry it. Nil when the CLI did not attribute the message.
+    # Matches Python's `UserMessage.origin` (0.2.137).
+    getter origin : MessageOrigin?
     # Sidecar array for non-executed tool calls (one entry per tool_use id).
     # Absent when tools ran normally or on older CLIs. CLI v2.1.220 emits an
     # array (same pattern as `tool_use_meta`). Matches TS SDK 0.3.216+.
@@ -783,6 +841,7 @@ module ClaudeAgent
       @message : Hash(String, JSON::Any) = {} of String => JSON::Any,
       @parent_tool_use_id : String? = nil,
       @tool_use_result : JSON::Any? = nil,
+      @origin : MessageOrigin? = nil,
       @tool_result_meta : Array(ToolResultMeta)? = nil,
       @is_meta : Bool? = nil,
       @is_synthetic : Bool? = nil,
@@ -803,8 +862,11 @@ module ClaudeAgent
 
     # Parse a user envelope, normalizing dual wire keys and mapping
     # `isSynthetic` → `is_meta` when `isMeta`/`is_meta` are absent.
+    # A malformed `origin` member is dropped (treated as absent) instead
+    # of failing the whole envelope. Mirrors Python's `_parse_origin`
+    # (0.2.137).
     def self.parse_envelope(json : String, data : MessageData) : UserMessage
-      base = from_json(json)
+      base = from_json(MessageOrigin.scrub_json(json, data))
 
       is_synthetic = data["isSynthetic"]?.try(&.as_bool?)
       is_synthetic = data["is_synthetic"]?.try(&.as_bool?) if is_synthetic.nil?
@@ -831,6 +893,7 @@ module ClaudeAgent
         message: base.message,
         parent_tool_use_id: base.parent_tool_use_id,
         tool_use_result: base.tool_use_result,
+        origin: base.origin,
         tool_result_meta: meta,
         is_meta: is_meta,
         is_synthetic: is_synthetic,
@@ -989,6 +1052,14 @@ module ClaudeAgent
     getter description : String
     getter tool_use_id : String?
     getter task_type : String?
+    # True for subagent tasks (also on background Bash tasks) launched
+    # detached. Matches TS SDK 0.3.238+.
+    getter is_backgrounded : Bool?
+    # Subagent spawn depth for nested-agent tasks. Matches TS 0.3.238+.
+    getter spawn_depth : Int32?
+    # True for housekeeping tasks; exclude from activity indicators.
+    # Matches TS SDK 0.3.247+.
+    getter ambient : Bool?
 
     def initialize(
       session_id : String,
@@ -998,6 +1069,9 @@ module ClaudeAgent
       @description : String,
       @tool_use_id : String? = nil,
       @task_type : String? = nil,
+      @is_backgrounded : Bool? = nil,
+      @spawn_depth : Int32? = nil,
+      @ambient : Bool? = nil,
     )
       super("task_started", session_id, data)
     end
@@ -1035,6 +1109,13 @@ module ClaudeAgent
     getter summary : String?
     getter usage : TaskUsage?
     getter tool_use_id : String?
+    # Files returned by reference for an auto-backgrounded MCP tool call
+    # that completed. Join to the call via `tool_use_id`. Raw entries so
+    # newer CLI shapes stay visible. Matches TS SDK 0.3.257+.
+    getter resource_links : Array(JSON::Any)?
+    # True for housekeeping tasks; exclude from activity indicators.
+    # Matches TS SDK 0.3.247+.
+    getter ambient : Bool?
 
     def initialize(
       session_id : String,
@@ -1046,6 +1127,8 @@ module ClaudeAgent
       @summary : String? = nil,
       @usage : TaskUsage? = nil,
       @tool_use_id : String? = nil,
+      @resource_links : Array(JSON::Any)? = nil,
+      @ambient : Bool? = nil,
     )
       super("task_notification", session_id, data)
     end
@@ -1312,6 +1395,35 @@ module ClaudeAgent
     end
   end
 
+  # Emitted when the session's conversation is replaced without ending
+  # the connection — e.g. after `/clear` or any other flow that discards
+  # the transcript mid-session.
+  #
+  # In streaming-input mode one connection can carry many turns, and a
+  # reset clears the history *and* zeroes the running totals reported on
+  # subsequent `ResultMessage`s (e.g. `total_cost_usd`). Snapshot any
+  # accumulated totals when this message arrives.
+  #
+  # `new_conversation_id` identifies the fresh conversation (key an empty
+  # transcript on it); it is *not* the `session_id` of later messages.
+  # Matches Python's `ConversationResetMessage` (0.2.137).
+  struct ConversationResetMessage < Message
+    include JSON::Serializable
+
+    getter type : String = "conversation_reset"
+    getter new_conversation_id : String
+    getter uuid : String
+    getter session_id : String
+
+    def initialize(
+      @new_conversation_id : String,
+      @uuid : String,
+      @session_id : String,
+    )
+      @type = "conversation_reset"
+    end
+  end
+
   # Emitted when an external session-store adapter fails to mirror an append.
   struct MirrorErrorMessage < Message
     getter type : String = "mirror_error"
@@ -1423,11 +1535,15 @@ module ClaudeAgent
     getter task_id : String
     getter task_type : String?
     getter description : String?
+    # True for housekeeping tasks; exclude from activity indicators.
+    # Matches TS SDK 0.3.247+.
+    getter ambient : Bool?
 
     def initialize(
       @task_id : String,
       @task_type : String? = nil,
       @description : String? = nil,
+      @ambient : Bool? = nil,
     )
     end
   end
@@ -1580,6 +1696,13 @@ module ClaudeAgent
     # "vertex", "foundry", "anthropicAws", "anthropicGoogleCloud",
     # "mantle", "gateway").
     getter provider : String?
+    # Thinking tokens, a subset of `output_tokens`. Matches TS 0.3.257+.
+    @[JSON::Field(key: "thinkingTokens")]
+    getter thinking_tokens : Int64 = 0
+    # Which price table `cost_usd` was computed from ("list" | "managed"
+    # | "unknown"). Matches TS SDK 0.3.246+.
+    @[JSON::Field(key: "costBasis")]
+    getter cost_basis : String?
 
     def initialize(
       @input_tokens : Int64 = 0,
@@ -1592,6 +1715,8 @@ module ClaudeAgent
       @max_output_tokens : Int64 = 0,
       @canonical_model : String? = nil,
       @provider : String? = nil,
+      @thinking_tokens : Int64 = 0,
+      @cost_basis : String? = nil,
     )
     end
   end
@@ -1725,11 +1850,34 @@ module ClaudeAgent
     # UUID of the user message that started this turn, for cross-host
     # request-latency correlation. Matches TS SDK 0.3.216+.
     getter user_message_uuid : String?
+    # Every user message the turn answered (beside `user_message_uuid`),
+    # so a reply to several merged messages can be matched to each.
+    # Matches TS SDK 0.3.259+.
+    getter user_message_uuids : Array(String)?
+    # Queued user sends still pending when this result was produced; a
+    # nonzero value means another turn and result will follow.
+    # Matches TS SDK 0.3.243+.
+    getter queued_turn_count : Int32?
+    # Remote-session latency breakdown (ms). `first_content_frame_ms`
+    # marks the turn's first reply frame; the `first_stream_post_*`
+    # trio marks the first stream post, its ack, and its wall-clock
+    # arrival. Matches TS SDK 0.3.260+.
+    getter first_content_frame_ms : Int64?
+    getter first_stream_post_ms : Int64?
+    getter first_stream_post_ack_ms : Int64?
+    getter first_stream_post_wall_ms : Int64?
     # Wall-clock ms when the request was sent (host clock). Used with
     # `user_message_uuid` for latency correlation. Matches TS 0.3.216+.
     getter request_sent_wall_ms : Int64?
     @[JSON::Field(key: "deferred_tool_use")]
     getter deferred_tool_use : DeferredToolUse?
+
+    # Parse a result envelope, dropping a malformed `origin` member
+    # (treated as absent) instead of failing the whole message.
+    # Mirrors Python's `_parse_origin` (0.2.137).
+    def self.parse_result(json : String, data : MessageData) : ResultMessage
+      from_json(MessageOrigin.scrub_json(json, data))
+    end
 
     # --- Structured Output Helpers ---
 
@@ -1805,6 +1953,9 @@ module ClaudeAgent
     getter session_id : String
     getter event : Hash(String, JSON::Any)
     getter parent_tool_use_id : String?
+    # UUID of the user message that triggered this turn, linking a reply
+    # to the message it answers. Matches TS SDK 0.3.246+.
+    getter user_message_uuid : String?
   end
 
   # Control request from CLI to SDK (for SDK MCP server integration)

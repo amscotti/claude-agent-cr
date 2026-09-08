@@ -77,12 +77,15 @@ module ClaudeAgent
       end
 
       errors.each do |key, message|
-        begin
-          @on_error.call(key, message)
-        rescue
-          # Defensive: never let on_error crash the reader fiber.
-        end
+        report_error(key, message)
       end
+    end
+
+    # Report one mirror failure. A raising handler must not abort
+    # reporting to the remaining callbacks — or crash the reader fiber.
+    private def report_error(key : SessionKey?, message : String) : Nil
+      @on_error.call(key, message)
+    rescue
     end
 
     # Final flush before teardown. Never raises.
