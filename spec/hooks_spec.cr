@@ -88,6 +88,30 @@ describe ClaudeAgent::HookResult do
     output.display_content.should eq("scrubbed")
     JSON.parse(output.to_json)["displayContent"].as_s.should eq("scrubbed")
   end
+
+  it "supports classifierContext on HookSpecificOutput (TS 0.3.236 parity)" do
+    output = ClaudeAgent::HookSpecificOutput.new(
+      hook_event_name: "PostToolUse",
+      classifier_context: "result verified against staging",
+    )
+    output.classifier_context.should eq("result verified against staging")
+    parsed = JSON.parse(output.to_json)
+    parsed["classifierContext"].as_s.should eq("result verified against staging")
+    round_tripped = ClaudeAgent::HookSpecificOutput.from_json(output.to_json)
+    round_tripped.classifier_context.should eq("result verified against staging")
+  end
+
+  it "supports suppressOriginalPrompt on HookSpecificOutput (TS 0.3.238 parity)" do
+    output = ClaudeAgent::HookSpecificOutput.new(
+      hook_event_name: "UserPromptSubmit",
+      suppress_original_prompt: true,
+    )
+    output.suppress_original_prompt.should be_true
+    parsed = JSON.parse(output.to_json)
+    parsed["suppressOriginalPrompt"].as_bool.should be_true
+    round_tripped = ClaudeAgent::HookSpecificOutput.from_json(output.to_json)
+    round_tripped.suppress_original_prompt.should be_true
+  end
 end
 
 describe ClaudeAgent::HookConfig do

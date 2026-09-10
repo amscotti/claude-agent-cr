@@ -37,4 +37,41 @@ describe "ClaudeAgent.query" do
       result.should be_a(ClaudeAgent::QueryIterator)
     end
   end
+
+  describe ".finish_query (Python 0.2.140 ResultError parity)" do
+    it "returns a successful result unchanged" do
+      message = ClaudeAgent::Message.parse(
+        %({"type": "result", "uuid": "u-1", "session_id": "s-1", "subtype": "success"})
+      ).as(ClaudeAgent::ResultMessage)
+
+      ClaudeAgent.finish_query(message).uuid.should eq("u-1")
+    end
+
+    it "raises ResultError for an error result" do
+      message = ClaudeAgent::Message.parse(
+        %({"type": "result", "uuid": "u-1", "session_id": "s-1", ) +
+        %("subtype": "error_max_turns", "is_error": true, "errors": ["too many turns"]})
+      ).as(ClaudeAgent::ResultMessage)
+
+      expect_raises(ClaudeAgent::ResultError, "too many turns") do
+        ClaudeAgent.finish_query(message)
+      end
+    end
+
+    it "raises ResultError as a ProcessError for rescue compatibility" do
+      message = ClaudeAgent::Message.parse(
+        %({"type": "result", "uuid": "u-1", "session_id": "s-1", "subtype": "success", "is_error": true})
+      ).as(ClaudeAgent::ResultMessage)
+
+      expect_raises(ClaudeAgent::ProcessError, "unknown error") do
+        ClaudeAgent.finish_query(message)
+      end
+    end
+
+    it "raises Error when no result was received" do
+      expect_raises(ClaudeAgent::Error, "No result message received") do
+        ClaudeAgent.finish_query(nil)
+      end
+    end
+  end
 end

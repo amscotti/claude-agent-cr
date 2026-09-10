@@ -247,6 +247,16 @@ module ClaudeAgent
     # `displayContent`). Empty string hides the content.
     @[JSON::Field(key: "displayContent")]
     property display_content : String?
+    # PostToolUse only: short host-asserted note about a tool call's
+    # result that the auto-mode permission classifier reads alongside
+    # that result (wire key `classifierContext`). Matches TS 0.3.236+.
+    @[JSON::Field(key: "classifierContext")]
+    property classifier_context : String?
+    # UserPromptSubmit/UserPromptExpansion only: hide the original prompt
+    # from the transcript (wire key `suppressOriginalPrompt`).
+    # Matches TS SDK 0.3.238+.
+    @[JSON::Field(key: "suppressOriginalPrompt")]
+    property suppress_original_prompt : Bool?
 
     def initialize(
       @hook_event_name : String,
@@ -260,6 +270,8 @@ module ClaudeAgent
       @action : String? = nil,
       @content : Hash(String, JSON::Any)? = nil,
       @display_content : String? = nil,
+      @classifier_context : String? = nil,
+      @suppress_original_prompt : Bool? = nil,
     )
     end
   end

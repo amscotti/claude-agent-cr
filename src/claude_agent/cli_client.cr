@@ -94,6 +94,10 @@ module ClaudeAgent
     def start
       return if @running
 
+      # Hard validation first: can_use_tool and permission_prompt_tool_name
+      # are mutually exclusive (mirrors Python `_configure_can_use_tool`).
+      @options.try(&.validate_can_use_tool!)
+
       # Advisory only: emit once per connect when can_use_tool is shadowed
       # by whole-tool allowed_tools entries or bypassPermissions.
       emit_can_use_tool_shadowed_warning
@@ -340,23 +344,21 @@ module ClaudeAgent
       stderr_callback = @options.try(&.stderr)
 
       spawn do
-        begin
-          stderr.each_line do |line|
-            @stderr_mutex.synchronize do
-              @stderr_tail << line
-              # Keep a bounded tail (~512 lines) so we can surface
-              # "unknown option" errors in `stop` without holding onto
-              # arbitrarily large output.
-              while @stderr_tail.size > 512
-                @stderr_tail.shift
-              end
-            end
-            if cb = stderr_callback
-              cb.call(line)
+        stderr.each_line do |line|
+          @stderr_mutex.synchronize do
+            @stderr_tail << line
+            # Keep a bounded tail (~512 lines) so we can surface
+            # "unknown option" errors in `stop` without holding onto
+            # arbitrarily large output.
+            while @stderr_tail.size > 512
+              @stderr_tail.shift
             end
           end
-        rescue IO::Error
+          if cb = stderr_callback
+            cb.call(line)
+          end
         end
+      rescue IO::Error
       end
     end
 
@@ -763,6 +765,7 @@ module ClaudeAgent
         # `setting_sources` as a side effect.
         unless skills.empty?
           skills.each do |name|
+            CLIClient.validate_skill_name(name)
             pattern = "Skill(#{name})"
             allowed << pattern unless allowed.includes?(pattern)
           end
@@ -771,6 +774,85 @@ module ClaudeAgent
       end
 
       {allowed, sources}
+    end
+
+    # Reject skill names that cannot ride safely in a `Skill(name)` rule.
+    # Names from `AgentOptions#skills` are formatted into the
+    # `--allowedTools` value, which the CLI splits into rules on commas
+    # and spaces outside parentheses (no escape sequences at split
+    # time), so a name carrying a delimiter cannot be passed through
+    # reliably. Names that tokenize cleanly but can never match the
+    # listed skill are rejected too, so a dead rule fails loudly here
+    # instead of silently granting nothing.
+    # Mirrors Python's `_validate_skill_name` (0.2.129). Raises
+    # `ConfigurationError` (this SDK's analogue of Python's ValueError
+    # at connect time); called from `apply_skills_defaults`, which runs
+    # during argv construction on every `start` — before the subprocess
+    # spawns and before any `initialize` control request is sent.
+    def self.validate_skill_name(name : String) : Nil
+      unless name.valid_encoding?
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: not valid UTF-8, which can " \
+          "never match a skill the CLI discovered.",
+        )
+      end
+      if name.strip.empty?
+        raise ConfigurationError.new("Skill names must be non-empty strings")
+      end
+      if name != name.strip
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: leading or trailing " \
+          "whitespace can never match — the Skill tool trims the invoked name.",
+        )
+      end
+      if name.each_char.any? { |char| skill_name_invalid_char?(char) }
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: parentheses, commas, control " \
+          "characters, and byte-order marks are not allowed. Names match " \
+          "the skill's directory name, or 'plugin:skill' for plugin-qualified skills.",
+        )
+      end
+      if name == "*"
+        raise ConfigurationError.new(
+          "Invalid skill name '*': use skills=\"all\" to enable every skill.",
+        )
+      end
+      if name.ends_with?(":*") || name.ends_with?(" *")
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: wildcard-suffix names are not " \
+          "allowed; list each skill by its exact name.",
+        )
+      end
+      if name.starts_with?("/")
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: skill names may not start " \
+          "with '/'. The skills option takes the canonical name, not the " \
+          "slash-command form.",
+        )
+      end
+      if name.includes?("\\\\")
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: consecutive backslashes are " \
+          "not allowed — the per-rule parser collapses them, so the rule " \
+          "would name a different skill.",
+        )
+      end
+      if name.ends_with?("\\")
+        raise ConfigurationError.new(
+          "Invalid skill name #{name.inspect}: names may not end with an " \
+          "unpaired backslash.",
+        )
+      end
+    end
+
+    # Parentheses and commas are delimiters to the --allowedTools
+    # tokenizer; control characters (C0, DEL, C1) never appear in a skill
+    # directory name. U+FEFF is included because the CLI trims it as
+    # whitespace while Crystal's `strip` does not.
+    private def self.skill_name_invalid_char?(char : Char) : Bool
+      ord = char.ord
+      char.in?('(', ')', ',') ||
+        ord < 0x20 || (0x7F..0x9F).includes?(ord) || ord == 0xFEFF
     end
 
     private def add_tools_option_args(args : Array(String), opts : AgentOptions)
@@ -902,6 +984,15 @@ module ClaudeAgent
           )
         end
         args << "--resume-session-at=#{uuid}"
+      end
+
+      # Equals form so the value can never be parsed as a separate flag.
+      # Note: only nil skips (empty string is truthy in Crystal and is
+      # forwarded, so the CLI rejects it as a malformed declaration
+      # instead of the SDK silently disarming the guard the caller
+      # believes is armed). Matches Python 0.2.137+.
+      if drops = opts.resume_drops_turn
+        args << "--resume-drops-turn=#{drops}"
       end
 
       args << "--fork-session" if opts.fork_session?

@@ -65,6 +65,16 @@ module ClaudeAgent
     end
   end
 
+  # `agent-<id>.jsonl` -> `agent-<id>.meta.json` (same directory).
+  # Single definition of the subagent metadata sidecar naming
+  # convention, shared by the disk read path (`SessionStorage`) and
+  # resume materialization (`materialize_resume_session`). Mirrors
+  # Python's `_agent_metadata_sidecar_path` (0.2.140).
+  def self.agent_metadata_sidecar_path(transcript_path : String) : String
+    base = transcript_path.ends_with?(".jsonl") ? transcript_path[0...-".jsonl".size] : transcript_path
+    "#{base}.meta.json"
+  end
+
   module SessionStorage
     extend self
 
@@ -193,10 +203,11 @@ module ClaudeAgent
       content = File.read(match[1])
       entries = parse_transcript_entries(content)
       chain = build_subagent_chain(entries)
+      parent_tool_use_id, parent_agent_id = subagent_parent_ids(match[1])
 
       messages = chain.compact_map do |entry|
         next unless {"user", "assistant"}.includes?(string_field(entry, "type"))
-        to_session_message(entry)
+        to_session_message(entry, parent_tool_use_id, parent_agent_id)
       end
 
       start = Math.max(offset, 0)
@@ -671,7 +682,11 @@ module ClaudeAgent
       string_field(entry, "teamName").nil?
     end
 
-    private def to_session_message(entry : TranscriptEntry) : SessionMessage?
+    private def to_session_message(
+      entry : TranscriptEntry,
+      parent_tool_use_id : String? = nil,
+      parent_agent_id : String? = nil,
+    ) : SessionMessage?
       type = string_field(entry, "type")
       uuid = string_field(entry, "uuid")
       session_id = string_field(entry, "sessionId") || string_field(entry, "session_id")
@@ -683,9 +698,75 @@ module ClaudeAgent
         uuid: uuid,
         session_id: session_id,
         message: message,
-        parent_tool_use_id: string_field(entry, "parentToolUseId") || string_field(entry, "parent_tool_use_id"),
-        parent_agent_id: string_field(entry, "parentAgentId") || string_field(entry, "parent_agent_id"),
+        parent_tool_use_id: string_field(entry, "parentToolUseId") ||
+                            string_field(entry, "parent_tool_use_id") || parent_tool_use_id,
+        parent_agent_id: string_field(entry, "parentAgentId") ||
+                         string_field(entry, "parent_agent_id") || parent_agent_id,
       )
+    end
+
+    # Read the `.meta.json` sidecar beside a subagent transcript. Returns
+    # nil when the sidecar is missing, unreadable-as-absent
+    # (`File::NotFoundError`), not valid JSON, or not a JSON object — an
+    # unusable optional sidecar degrades to an absent one. Other read
+    # errors propagate to the caller, which degrades them the same way.
+    # Mirrors Python's `_read_agent_metadata_sidecar` (0.2.140).
+    private def read_agent_metadata_sidecar(transcript_path : String) : Hash(String, JSON::Any)?
+      raw = begin
+        File.read(ClaudeAgent.agent_metadata_sidecar_path(transcript_path))
+      rescue File::NotFoundError
+        return
+      end
+      parsed = begin
+        JSON.parse(raw)
+      rescue JSON::ParseException
+        return
+      end
+      parsed.as_h?
+    end
+
+    # Extract `(tool_use_id, parent_agent_id)` from an agent metadata
+    # dict — the on-disk `.meta.json` sidecar or the synthetic
+    # `agent_metadata` entry a `SessionStore` carries in its place.
+    # Mirrors Python's `_parent_ids_from_agent_metadata` (0.2.140).
+    private def parent_ids_from_agent_metadata(meta : Hash(String, JSON::Any)?) : {String?, String?}
+      return {nil, nil} unless meta
+
+      tool_use_id = meta["toolUseId"]?.try(&.as_s?)
+      parent_agent_id = meta["parentAgentId"]?.try(&.as_s?)
+      {tool_use_id, parent_agent_id}
+    end
+
+    # Recover `(parent_tool_use_id, parent_agent_id)` for a subagent
+    # transcript from its `.meta.json` sidecar. Like the transcript read
+    # itself, any failure to read the sidecar degrades to "no metadata"
+    # rather than raising from this best-effort read helper. Mirrors
+    # Python's `get_subagent_messages` (0.2.140).
+    private def subagent_parent_ids(transcript_path : String) : {String?, String?}
+      parent_ids_from_agent_metadata(read_agent_metadata_sidecar(transcript_path))
+    rescue File::Error
+      {nil, nil}
+    end
+
+    # Separate the synthetic `agent_metadata` entry from transcript
+    # lines. A subagent's `SessionStore` stream carries its `.meta.json`
+    # sidecar as `{"type": "agent_metadata", ...}` entries alongside the
+    # transcript. Returns `(metadata, transcript)` where metadata is the
+    # *last* such entry (rewritten on resume, so last wins) or nil.
+    # Mirrors Python's `_split_agent_metadata` (0.2.140).
+    private def split_agent_metadata(
+      entries : Array(SessionStoreEntry),
+    ) : {Hash(String, JSON::Any)?, Array(Hash(String, JSON::Any))}
+      metadata = nil.as(Hash(String, JSON::Any)?)
+      transcript = [] of Hash(String, JSON::Any)
+      entries.each do |entry|
+        if entry.type == "agent_metadata"
+          metadata = entry.to_h
+        else
+          transcript << entry.to_h
+        end
+      end
+      {metadata, transcript}
     end
 
     private def extract_first_prompt(entries : Array(TranscriptEntry)) : String?
@@ -1300,10 +1381,18 @@ module ClaudeAgent
         meta_path = sub_path.rchop(".jsonl") + ".meta.json"
         next unless File.exists?(meta_path)
 
+        # A missing, corrupt, or non-object sidecar is treated as absent
+        # (the transcript is still imported); other read errors
+        # propagate. Mirrors Python's `import_session_to_store` (0.2.140):
+        # the synthetic discriminator is assigned (not merged) so a
+        # stray "type" key in the CLI-owned sidecar can never shadow it.
         begin
-          meta = JSON.parse(File.read(meta_path)).as_h.dup
-          meta["type"] = JSON::Any.new("agent_metadata")
-          store.append(sub_key, [SessionStoreEntry.from_hash(meta)])
+          parsed = JSON.parse(File.read(meta_path))
+          if meta = parsed.as_h?
+            meta = meta.dup
+            meta["type"] = JSON::Any.new("agent_metadata")
+            store.append(sub_key, [SessionStoreEntry.from_hash(meta)])
+          end
         rescue JSON::ParseException
         end
       end
@@ -1505,11 +1594,7 @@ module ClaudeAgent
       append_fork_footer(lines, forked_session_id, content, content_replacements, title)
 
       forked_entries = lines.compact_map do |line|
-        begin
-          SessionStoreEntry.from_hash(JSON.parse(line).as_h)
-        rescue
-          nil
-        end
+        fork_entry_from_line(line)
       end
 
       dst_key = SessionKey.new(project_key, forked_session_id)
@@ -1587,12 +1672,21 @@ module ClaudeAgent
     private def session_messages_from_store_entries(
       entries : Array(SessionStoreEntry),
     ) : Array(SessionMessage)
-      transcript = entries.reject { |e| e.type == "agent_metadata" }.map(&.to_h)
+      metadata, transcript = split_agent_metadata(entries)
+      parent_tool_use_id, parent_agent_id = parent_ids_from_agent_metadata(metadata)
       chain = build_subagent_chain(filter_transcript_hashes(transcript))
       chain.compact_map do |entry|
         next unless {"user", "assistant"}.includes?(string_field(entry, "type"))
-        to_session_message(entry)
+        to_session_message(entry, parent_tool_use_id, parent_agent_id)
       end
+    end
+
+    # Parse one forked JSONL line, skipping lines that do not decode.
+    # A corrupt line must not abort the fork of the remaining lines.
+    private def fork_entry_from_line(line : String) : SessionStoreEntry?
+      SessionStoreEntry.from_hash(JSON.parse(line).as_h)
+    rescue
+      nil
     end
 
     private def paginate_session_messages(

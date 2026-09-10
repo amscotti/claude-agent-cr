@@ -1664,3 +1664,266 @@ describe ClaudeAgent::ContentBlock do
     result.content["results"].as_a.should eq([] of JSON::Any)
   end
 end
+
+describe ClaudeAgent::ConversationResetMessage do
+  it "parses a conversation_reset frame" do
+    json = <<-JSON
+      {
+        "type": "conversation_reset",
+        "new_conversation_id": "conv-new",
+        "uuid": "u-1",
+        "session_id": "sess-old"
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::ConversationResetMessage)
+
+    if message.is_a?(ClaudeAgent::ConversationResetMessage)
+      message.type.should eq("conversation_reset")
+      message.new_conversation_id.should eq("conv-new")
+      message.uuid.should eq("u-1")
+      message.session_id.should eq("sess-old")
+    end
+  end
+end
+
+describe "message origin (Python 0.2.137 parity)" do
+  it "parses origin on user messages with peer fields and predicates" do
+    json = <<-JSON
+      {
+        "type": "user", "uuid": "u-1", "session_id": "s-1",
+        "message": {"role": "user", "content": "hello"},
+        "origin": {"kind": "peer", "from": "sess-abc", "name": "peer name",
+                   "fromSession": "sess-abc", "verifiedPeerPid": 1234,
+                   "senderTaskId": "task-1", "body": "hello"}
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::UserMessage)
+
+    if message.is_a?(ClaudeAgent::UserMessage)
+      origin = message.origin
+      origin.should_not be_nil
+      origin.try do |message_origin|
+        message_origin.kind.should eq("peer")
+        message_origin.from.should eq("sess-abc")
+        message_origin.name.should eq("peer name")
+        message_origin.from_session.should eq("sess-abc")
+        message_origin.verified_peer_pid.should eq(1234)
+        message_origin.sender_task_id.should eq("task-1")
+        message_origin.body.should eq("hello")
+        message_origin.human?.should be_false
+        message_origin.task_notification?.should be_false
+      end
+    end
+  end
+
+  it "parses a human origin and exposes human?/scheduled_trigger? predicates" do
+    json = <<-JSON
+      {
+        "type": "user", "uuid": "u-1", "session_id": "s-1",
+        "message": {"role": "user", "content": "hi"},
+        "origin": {"kind": "human"}
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::UserMessage)
+      message.origin.try(&.human?).should be_true
+    else
+      fail("expected UserMessage")
+    end
+  end
+
+  it "parses origin on result messages" do
+    json = <<-JSON
+      {
+        "type": "result", "uuid": "u-2", "session_id": "s-1",
+        "subtype": "success", "origin": {"kind": "task-notification"}
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::ResultMessage)
+      message.origin.try(&.task_notification?).should be_true
+    else
+      fail("expected ResultMessage")
+    end
+  end
+
+  it "treats a malformed origin as absent instead of failing the envelope" do
+    ["{\"kind\": 42}", "[1, 2]", "\"human\"", "42"].each do |malformed|
+      user_json = <<-JSON
+        {"type": "user", "uuid": "u-1", "session_id": "s-1",
+         "message": {"role": "user", "content": "hi"}, "origin": #{malformed}}
+        JSON
+      user_message = ClaudeAgent::Message.parse(user_json)
+      if user_message.is_a?(ClaudeAgent::UserMessage)
+        user_message.origin.should be_nil
+      else
+        fail("expected UserMessage for origin #{malformed}")
+      end
+
+      result_json = <<-JSON
+        {"type": "result", "uuid": "u-2", "session_id": "s-1",
+         "subtype": "success", "origin": #{malformed}}
+        JSON
+      result_message = ClaudeAgent::Message.parse(result_json)
+      if result_message.is_a?(ClaudeAgent::ResultMessage)
+        result_message.origin.should be_nil
+      else
+        fail("expected ResultMessage for origin #{malformed}")
+      end
+    end
+  end
+
+  it "leaves origin nil when the CLI omits it" do
+    json = %({"type": "user", "uuid": "u-1", "session_id": "s-1", "message": {"role": "user", "content": "hi"}})
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::UserMessage)
+      message.origin.should be_nil
+    else
+      fail("expected UserMessage")
+    end
+  end
+end
+
+describe "new result/model/task/stream fields (TS 0.3.243-0.3.260 parity)" do
+  it "parses user_message_uuids, queued_turn_count, and latency fields" do
+    json = <<-JSON
+      {
+        "type": "result", "uuid": "u-2", "session_id": "s-1", "subtype": "success",
+        "user_message_uuid": "umu-1", "user_message_uuids": ["umu-1", "umu-2"],
+        "queued_turn_count": 2, "first_content_frame_ms": 11,
+        "first_stream_post_ms": 22, "first_stream_post_ack_ms": 33,
+        "first_stream_post_wall_ms": 44, "request_sent_wall_ms": 55
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::ResultMessage)
+      message.user_message_uuid.should eq("umu-1")
+      message.user_message_uuids.should eq(["umu-1", "umu-2"])
+      message.queued_turn_count.should eq(2)
+      message.first_content_frame_ms.should eq(11)
+      message.first_stream_post_ms.should eq(22)
+      message.first_stream_post_ack_ms.should eq(33)
+      message.first_stream_post_wall_ms.should eq(44)
+      message.request_sent_wall_ms.should eq(55)
+    else
+      fail("expected ResultMessage")
+    end
+  end
+
+  it "parses thinkingTokens and costBasis on model usage entries" do
+    json = <<-JSON
+      {
+        "type": "result", "uuid": "u-2", "session_id": "s-1", "subtype": "success",
+        "modelUsage": {"claude-opus-4-7": {"inputTokens": 10, "outputTokens": 20,
+          "thinkingTokens": 5, "costBasis": "list", "costUSD": 0.1}}
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::ResultMessage)
+      usage = message.model_usage.try(&.["claude-opus-4-7"])
+      usage.should_not be_nil
+      usage.try do |model_usage|
+        model_usage.input_tokens.should eq(10)
+        model_usage.output_tokens.should eq(20)
+        model_usage.thinking_tokens.should eq(5)
+        model_usage.cost_basis.should eq("list")
+      end
+    else
+      fail("expected ResultMessage")
+    end
+  end
+
+  it "parses is_backgrounded, spawn_depth, and ambient on task_started" do
+    json = <<-JSON
+      {
+        "type": "system", "subtype": "task_started", "session_id": "s-1",
+        "uuid": "u-1", "task_id": "t-1", "description": "work",
+        "is_backgrounded": true, "spawn_depth": 2, "ambient": true
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::TaskStartedMessage)
+      message.is_backgrounded.should be_true
+      message.spawn_depth.should eq(2)
+      message.ambient.should be_true
+    else
+      fail("expected TaskStartedMessage")
+    end
+  end
+
+  it "parses resource_links and ambient on task_notification" do
+    json = <<-JSON
+      {
+        "type": "system", "subtype": "task_notification", "session_id": "s-1",
+        "uuid": "u-1", "task_id": "t-1", "status": "completed",
+        "tool_use_id": "tool-1", "ambient": false,
+        "resource_links": [{"uri": "file:///tmp/a.txt", "name": "a.txt"}]
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::TaskNotificationMessage)
+      message.tool_use_id.should eq("tool-1")
+      message.ambient.should be_false
+      links = message.resource_links
+      links.should_not be_nil
+      links.try(&.size.should eq(1))
+      links.try(&.first["uri"]?.try(&.as_s?).should eq("file:///tmp/a.txt"))
+    else
+      fail("expected TaskNotificationMessage")
+    end
+  end
+
+  it "parses ambient on background_tasks_changed entries" do
+    json = <<-JSON
+      {
+        "type": "system", "subtype": "background_tasks_changed", "session_id": "s-1",
+        "tasks": [{"task_id": "t-1", "task_type": "shell", "ambient": true},
+                  {"task_id": "t-2", "task_type": "agent"}]
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if message.is_a?(ClaudeAgent::BackgroundTasksChangedMessage)
+      message.tasks.size.should eq(2)
+      message.tasks[0].ambient.should be_true
+      message.tasks[1].ambient.should be_nil
+    else
+      fail("expected BackgroundTasksChangedMessage")
+    end
+  end
+
+  it "parses user_message_uuid on stream events and assistant messages" do
+    stream_json = <<-JSON
+      {"type": "stream_event", "uuid": "u-1", "session_id": "s-1",
+       "user_message_uuid": "umu-9", "event": {"type": "content_block_delta"}}
+      JSON
+    stream_message = ClaudeAgent::Message.parse(stream_json)
+    if stream_message.is_a?(ClaudeAgent::StreamEvent)
+      stream_message.user_message_uuid.should eq("umu-9")
+    else
+      fail("expected StreamEvent")
+    end
+
+    assistant_json = <<-JSON
+      {"type": "assistant", "uuid": "u-2", "session_id": "s-1",
+       "user_message_uuid": "umu-9",
+       "message": {"content": [{"type": "text", "text": "hi"}]}}
+      JSON
+    assistant_message = ClaudeAgent::Message.parse(assistant_json)
+    if assistant_message.is_a?(ClaudeAgent::AssistantMessage)
+      assistant_message.user_message_uuid.should eq("umu-9")
+    else
+      fail("expected AssistantMessage")
+    end
+  end
+end
