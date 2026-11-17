@@ -796,3 +796,133 @@ describe ClaudeAgent::SDKTool do
     end
   end
 end
+
+describe "MCP server validation, tool policies, and manifests" do
+  describe "RESERVED_MCP_SERVER_NAMES and .validate_mcp_server_name!" do
+    it "rejects every reserved JavaScript prototype name" do
+      ClaudeAgent::RESERVED_MCP_SERVER_NAMES.should eq(
+        Set{"__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__"}
+      )
+
+      ClaudeAgent::RESERVED_MCP_SERVER_NAMES.each do |reserved|
+        expect_raises(ClaudeAgent::ConfigurationError, /reserved/) do
+          ClaudeAgent.validate_mcp_server_name!(reserved)
+        end
+      end
+    end
+
+    it "accepts valid MCP server names" do
+      ["tools", "my-server", "server_2", "constructor", "toString"].each do |name|
+        ClaudeAgent.validate_mcp_server_name!(name)
+      end
+    end
+  end
+
+  describe ClaudeAgent::MCPServerToolPolicy do
+    it "serializes with snake_case wire keys and omits nil fields" do
+      policy = ClaudeAgent::MCPServerToolPolicy.new(
+        name: "delete_item",
+        permission_policy: "always_ask",
+        org_max_permission: "ask",
+      )
+
+      parsed = JSON.parse(policy.to_json).as_h
+      parsed["name"].as_s.should eq("delete_item")
+      parsed["permission_policy"].as_s.should eq("always_ask")
+      parsed["org_max_permission"].as_s.should eq("ask")
+
+      minimal = ClaudeAgent::MCPServerToolPolicy.new("read_item")
+      minimal_parsed = JSON.parse(minimal.to_json).as_h
+      minimal_parsed.keys.should eq(["name"])
+    end
+
+    it "round-trips through JSON" do
+      original = ClaudeAgent::MCPServerToolPolicy.new(
+        name: "run_query",
+        permission_policy: "always_deny",
+        org_max_permission: "blocked",
+      )
+      restored = ClaudeAgent::MCPServerToolPolicy.from_json(original.to_json)
+      restored.should eq(original)
+    end
+  end
+
+  describe "SDKMCPServer timeout and tool_policies" do
+    it "stores optional timeout and tool_policies on SDKMCPServer and create_sdk_mcp_server" do
+      policies = [
+        ClaudeAgent::MCPServerToolPolicy.new("ping", permission_policy: "always_ask"),
+      ]
+      server = ClaudeAgent.create_sdk_mcp_server(
+        name: "policy-server",
+        version: "1.2.0",
+        timeout: 15_000,
+        tool_policies: policies,
+      )
+
+      server.timeout.should eq(15_000)
+      server.tool_policies.should eq(policies)
+
+      default_server = ClaudeAgent::SDKMCPServer.new("default-server")
+      default_server.timeout.should be_nil
+      default_server.tool_policies.should be_nil
+    end
+  end
+
+  describe "SDKMCPServer#build_manifest" do
+    it "captures initializeResult and toolsListResult via internal JSON-RPC calls" do
+      tool = ClaudeAgent.tool(
+        name: "add",
+        description: "Add numbers",
+        schema: {
+          "type"       => JSON::Any.new("object"),
+          "properties" => JSON::Any.new({"a" => JSON::Any.new({"type" => JSON::Any.new("number")})}),
+        },
+      ) { |_args| ClaudeAgent::ToolResult.text("3") }
+
+      server = ClaudeAgent.create_sdk_mcp_server(
+        name: "math-tools",
+        version: "2.1.0",
+        tools: [tool],
+      )
+
+      manifest = server.build_manifest
+      init_res = manifest["initializeResult"].as_h
+      init_res["protocolVersion"].as_s.should eq(ClaudeAgent::SDKMCPServer::PROTOCOL_VERSION)
+      init_res["serverInfo"].as_h["name"].as_s.should eq("math-tools")
+      init_res["serverInfo"].as_h["version"].as_s.should eq("2.1.0")
+
+      tools_res = manifest["toolsListResult"].as_h
+      tools = tools_res["tools"].as_a
+      tools.size.should eq(1)
+      tools[0].as_h["name"].as_s.should eq("add")
+      tools[0].as_h["description"].as_s.should eq("Add numbers")
+    end
+
+    it "omits tools whose input_schema fails serialization and invokes logger" do
+      good_tool = ClaudeAgent::SDKTool.new(
+        name: "good",
+        description: "Valid tool",
+        input_schema: {"type" => JSON::Any.new("object")},
+        handler: ->(_args : Hash(String, JSON::Any)) { ClaudeAgent::ToolResult.text("ok") },
+      )
+      bad_tool = ClaudeAgent::SDKTool.new(
+        name: "bad",
+        description: "Unserializable schema",
+        input_schema: {"default" => JSON::Any.new(Float64::NAN)},
+        handler: ->(_args : Hash(String, JSON::Any)) { ClaudeAgent::ToolResult.text("nope") },
+      )
+
+      server = ClaudeAgent::SDKMCPServer.new("mixed-server", tools: [good_tool, bad_tool])
+      warnings = [] of String
+      logger = ->(msg : String) { warnings << msg; nil }
+
+      manifest = server.build_manifest(logger)
+      tools = manifest["toolsListResult"].as_h["tools"].as_a
+      tools.map(&.as_h["name"].as_s).should eq(["good"])
+
+      warnings.size.should eq(1)
+      warnings.first.should contain("bad")
+      warnings.first.should contain("mixed-server")
+    end
+  end
+end

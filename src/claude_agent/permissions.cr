@@ -1,4 +1,5 @@
 require "json"
+require "./types/control_messages"
 
 module ClaudeAgent
   # Where permission updates should be stored
@@ -167,6 +168,46 @@ module ClaudeAgent
     # correlate out-of-band permission responses when suppressing the SDK's
     # automatic control_response (TS 0.3.199).
     property request_id : String?
+    # Provenance of the MCP server exposing the tool when applicable.
+    property mcp_server : MCPServerProvenance? = nil
+    # Structured reason category (e.g. "rule", "mode", "classifier", "hook").
+    property decision_reason_type : String? = nil
+    # Machine-readable code qualifying `decision_reason_type`.
+    property decision_reason_code : String? = nil
+    # True when server/org policy restricts the tool to "ask" only.
+    property server_policy_ask_only : Bool? = nil
+    # True when an auto-mode classifier could evaluate this request.
+    property classifier_approvable : Bool? = nil
+    # True when the UI should suppress any "Always Allow" persistence option.
+    property suppress_always_allow_rule : Bool? = nil
+    # True when prompts should default focus/selection to "No" / deny.
+    property default_to_no : Bool? = nil
+    # Ask-mode rule that matched and triggered this permission request.
+    property matched_ask_rule : MatchedAskRule? = nil
+    # True when this prompt explicitly requires interactive user input.
+    property requires_user_interaction : Bool? = nil
+    # Primary prompt text provided by the server when present.
+    property server_prompt : String? = nil
+
+    def server_policy_ask_only? : Bool?
+      @server_policy_ask_only
+    end
+
+    def classifier_approvable? : Bool?
+      @classifier_approvable
+    end
+
+    def suppress_always_allow_rule? : Bool?
+      @suppress_always_allow_rule
+    end
+
+    def default_to_no? : Bool?
+      @default_to_no
+    end
+
+    def requires_user_interaction? : Bool?
+      @requires_user_interaction
+    end
 
     def initialize(
       @tool_name : String,
@@ -181,6 +222,16 @@ module ClaudeAgent
       @display_name : String? = nil,
       @description : String? = nil,
       @request_id : String? = nil,
+      @mcp_server : MCPServerProvenance? = nil,
+      @decision_reason_type : String? = nil,
+      @decision_reason_code : String? = nil,
+      @server_policy_ask_only : Bool? = nil,
+      @classifier_approvable : Bool? = nil,
+      @suppress_always_allow_rule : Bool? = nil,
+      @default_to_no : Bool? = nil,
+      @matched_ask_rule : MatchedAskRule? = nil,
+      @requires_user_interaction : Bool? = nil,
+      @server_prompt : String? = nil,
     )
     end
   end

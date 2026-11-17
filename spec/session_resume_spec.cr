@@ -127,4 +127,103 @@ describe ClaudeAgent do
       end
     end
   end
+
+  describe ".copy_auth_files legacy and OAuth configs (TS 0.3.271 parity)" do
+    it "copies legacy .config.json when .claude.json is absent, and OAuth-suffixed configs" do
+      src_config = File.join("/tmp", "claude-agent-cr-auth-#{Random.rand(1_000_000)}")
+      FileUtils.mkdir_p(src_config)
+
+      begin
+        File.write(File.join(src_config, ".config.json"), %({"legacyToken":"abc"}))
+        File.write(File.join(src_config, ".claude-staging-oauth.json"), %({"env":"staging"}))
+        File.write(File.join(src_config, ".claude-local-oauth.json"), %({"env":"local"}))
+        File.write(File.join(src_config, ".claude-custom-oauth.json"), %({"env":"custom"}))
+
+        store = ClaudeAgent::InMemorySessionStore.new
+        project_key = ClaudeAgent::SessionStorage.project_key_for_directory(nil)
+        session_id = UUID.random.to_s
+        store.append(
+          ClaudeAgent::SessionKey.new(project_key, session_id),
+          [
+            ClaudeAgent::SessionStoreEntry.from_hash({
+              "type" => JSON::Any.new("user"),
+              "uuid" => JSON::Any.new(UUID.random.to_s),
+            } of String => JSON::Any),
+          ],
+        )
+
+        options = ClaudeAgent::AgentOptions.new(
+          session_store: store,
+          resume: session_id,
+          env: {"CLAUDE_CONFIG_DIR" => src_config},
+        )
+        materialized = ClaudeAgent.materialize_resume_session(options)
+        materialized.should_not be_nil
+        next unless materialized
+
+        begin
+          legacy = File.join(materialized.config_dir, ".config.json")
+          File.exists?(legacy).should be_true
+          File.read(legacy).should eq(%({"legacyToken":"abc"}))
+          File.info(legacy).permissions.value.should eq(0o600)
+
+          {
+            ".claude-staging-oauth.json" => %({"env":"staging"}),
+            ".claude-local-oauth.json"   => %({"env":"local"}),
+            ".claude-custom-oauth.json"  => %({"env":"custom"}),
+          }.each do |filename, expected|
+            dst = File.join(materialized.config_dir, filename)
+            File.exists?(dst).should be_true
+            File.read(dst).should eq(expected)
+            File.info(dst).permissions.value.should eq(0o600)
+          end
+        ensure
+          materialized.cleanup
+        end
+      ensure
+        FileUtils.rm_rf(src_config)
+      end
+    end
+
+    it "skips legacy .config.json when .claude.json is present" do
+      src_config = File.join("/tmp", "claude-agent-cr-auth2-#{Random.rand(1_000_000)}")
+      FileUtils.mkdir_p(src_config)
+
+      begin
+        File.write(File.join(src_config, ".claude.json"), %({"primary":true}))
+        File.write(File.join(src_config, ".config.json"), %({"legacy":true}))
+
+        store = ClaudeAgent::InMemorySessionStore.new
+        project_key = ClaudeAgent::SessionStorage.project_key_for_directory(nil)
+        session_id = UUID.random.to_s
+        store.append(
+          ClaudeAgent::SessionKey.new(project_key, session_id),
+          [
+            ClaudeAgent::SessionStoreEntry.from_hash({
+              "type" => JSON::Any.new("user"),
+              "uuid" => JSON::Any.new(UUID.random.to_s),
+            } of String => JSON::Any),
+          ],
+        )
+
+        options = ClaudeAgent::AgentOptions.new(
+          session_store: store,
+          resume: session_id,
+          env: {"CLAUDE_CONFIG_DIR" => src_config},
+        )
+        materialized = ClaudeAgent.materialize_resume_session(options)
+        materialized.should_not be_nil
+        next unless materialized
+
+        begin
+          File.exists?(File.join(materialized.config_dir, ".claude.json")).should be_true
+          File.exists?(File.join(materialized.config_dir, ".config.json")).should be_false
+        ensure
+          materialized.cleanup
+        end
+      ensure
+        FileUtils.rm_rf(src_config)
+      end
+    end
+  end
 end

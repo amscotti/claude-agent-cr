@@ -26,13 +26,15 @@ module ClaudeAgent
   def self.query(
     prompt : String,
     options : AgentOptions? = nil,
+    *,
+    cli_client : CLIClient? = nil,
     &block : Message ->
   ) : ResultMessage
     if options.try(&.needs_control_protocol?)
       return query_via_agent(prompt, options, &block)
     end
 
-    client = CLIClient.new(options)
+    client = cli_client || CLIClient.new(options)
 
     begin
       client.start
@@ -41,6 +43,8 @@ module ClaudeAgent
       result : ResultMessage? = nil
 
       client.each_message do |message|
+        next if internal_host_frame?(message)
+
         block.call(message)
         if message.is_a?(ResultMessage)
           result = message
@@ -52,6 +56,13 @@ module ClaudeAgent
     ensure
       client.stop
     end
+  end
+
+  # True when `message` is an internal host signal (`sdk_host_only: true` or
+  # `keep_alive`) that must be hidden from caller-visible message streams.
+  def self.internal_host_frame?(message : Message) : Bool
+    message.sdk_host_only_frame? ||
+      (message.is_a?(UnknownMessage) && message.type == "keep_alive")
   end
 
   # One-shot query over `AgentClient`, for options that need the control
@@ -102,8 +113,8 @@ module ClaudeAgent
     @channel : Channel(Message | Iterator::Stop | Exception)
     @started : Bool = false
 
-    def initialize(@prompt : String, @options : AgentOptions?)
-      @client = CLIClient.new(@options)
+    def initialize(@prompt : String, @options : AgentOptions?, cli_client : CLIClient? = nil)
+      @client = cli_client || CLIClient.new(@options)
       @agent_client = nil
       @channel = Channel(Message | Iterator::Stop | Exception).new
     end
@@ -152,6 +163,7 @@ module ClaudeAgent
         @client.send_prompt(@prompt)
 
         @client.each_message do |message|
+          next if ClaudeAgent.internal_host_frame?(message)
           forward(message)
         end
       rescue ex
@@ -191,6 +203,8 @@ module ClaudeAgent
     # (and Python's `query()`): an error result is delivered first, then
     # a `ResultError` so the failure cannot pass silently.
     private def forward(message : Message) : Nil
+      return if ClaudeAgent.internal_host_frame?(message)
+
       @channel.send(message)
       if message.is_a?(ResultMessage) && message.is_error == true
         @channel.send(ResultError.from_result(message)) unless @channel.closed?

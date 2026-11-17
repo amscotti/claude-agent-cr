@@ -5,6 +5,19 @@ require "./errors"
 
 module ClaudeAgent
   class CLIClient
+    MINIMUM_CLAUDE_CODE_VERSION                  = "2.0.0"
+    VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION = "2.1.248"
+
+    private SANDBOX_RESTRICTION_ARRAY_PATHS = Set{
+      "filesystem.denyRead",
+      "filesystem.denyWrite",
+      "network.deniedDomains",
+      "credentials.files",
+      "credentials.envVars",
+    }
+    private SANDBOX_REPLACE_PATHS  = Set{"ripgrep", "network.tlsTerminate"}
+    private SANDBOX_PROTOTYPE_KEYS = Set{"__proto__", "constructor", "prototype"}
+
     # Forward-compatible option flags that the SDK may append but that older
     # Claude Code CLI releases do not understand. When a capability probe
     # confirms the CLI advertises none of these, they are silently stripped
@@ -41,6 +54,7 @@ module ClaudeAgent
     @output : IO?
     @error : IO?
     @running : Bool = false
+    @version_checked : Bool = false
     @session_id : String?
     @sdk_mcp_servers : Hash(String, SDKMCPServer)
     @stderr_tail : Array(String) = [] of String
@@ -56,6 +70,12 @@ module ClaudeAgent
     def replace_options(options : AgentOptions?) : Nil
       @options = options
       @sdk_mcp_servers = extract_sdk_servers
+    end
+
+    # Replace the active SDK MCP server registry cleanly (e.g. when
+    # `AgentClient#set_mcp_servers` swaps in-process SDK servers mid-session).
+    def replace_sdk_servers(servers : Hash(String, SDKMCPServer)) : Nil
+      @sdk_mcp_servers = servers.dup
     end
 
     # Get SDK MCP server by name (for routing control requests)
@@ -111,12 +131,14 @@ module ClaudeAgent
 
       cwd = @options.try(&.cwd)
       env = build_env
+      @version_checked = false
 
       begin
         process = Process.new(
           command: cli_path,
           args: args,
           env: env,
+          clear_env: true,
           input: Process::Redirect::Pipe,
           output: Process::Redirect::Pipe,
           error: Process::Redirect::Pipe,
@@ -144,20 +166,27 @@ module ClaudeAgent
     end
 
     private def build_env : Hash(String, String)?
-      # options.env overlays onto the parent process environment (Process.new
-      # merges when clear_env is false). We start from a copy of options.env
-      # so callers can inject/override vars without mutating their hash.
-      base_env = @options.try(&.env).try(&.dup) || {} of String => String
+      # Start from parent ENV so `clear_env: true` can scrub inherited
+      # CLAUDECODE / CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP before merging options.env.
+      base_env = ENV.to_h
+      base_env.delete("CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP")
+      base_env.delete("CLAUDECODE")
+
+      opts_env = @options.try(&.env)
+      opts_env.try(&.each { |key, value| base_env[key] = value })
 
       # SDK entrypoint identifier used by Claude Code to distinguish clients.
-      base_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cr"
+      unless opts_env.try(&.has_key?("CLAUDE_CODE_ENTRYPOINT"))
+        base_env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cr"
+      end
 
       # Always stamp the SDK version for User-Agent / telemetry unless the
-      # caller already set it in options.env. Matches the TS SDK: the version
-      # is never dropped when a custom env map is supplied.
-      unless base_env.has_key?("CLAUDE_AGENT_SDK_VERSION")
+      # caller explicitly set it in options.env.
+      unless opts_env.try(&.has_key?("CLAUDE_AGENT_SDK_VERSION"))
         base_env["CLAUDE_AGENT_SDK_VERSION"] = VERSION
       end
+
+      apply_client_app_env!(base_env, opts_env)
 
       if @options.try(&.include_partial_messages?)
         base_env["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
@@ -178,18 +207,43 @@ module ClaudeAgent
         base_env["CLAUDE_CODE_USER"] = user
       end
 
-      # Propagate W3C trace context to the subprocess when the caller has
-      # already populated it in their environment, so CLI spans parent
-      # under the caller's distributed trace. Explicit values in
-      # options.env always win.
-      %w[TRACEPARENT TRACESTATE].each do |key|
-        next if base_env.has_key?(key)
-        if value = ENV[key]?
-          base_env[key] = value
-        end
+      unless has_env_key_ci?(base_env, "CLAUDE_CODE_SDK_READS_SESSION_STATE")
+        base_env["CLAUDE_CODE_SDK_READS_SESSION_STATE"] = "1"
+      end
+      unless has_env_key_ci?(base_env, "CLAUDE_CODE_SDK_READS_STARTUP_MARKS")
+        base_env["CLAUDE_CODE_SDK_READS_STARTUP_MARKS"] = "1"
       end
 
       base_env
+    end
+
+    private def apply_client_app_env!(base_env : Hash(String, String), opts_env : Hash(String, String)?) : Nil
+      resolved = if app = @options.try(&.client_app)
+                   app
+                 elsif opts_env && opts_env.has_key?("CLAUDE_AGENT_SDK_CLIENT_APP")
+                   opts_env["CLAUDE_AGENT_SDK_CLIENT_APP"]
+                 else
+                   ENV["CLAUDE_AGENT_SDK_CLIENT_APP"]?
+                 end
+      return unless resolved
+
+      if resolved.empty?
+        base_env.delete("CLAUDE_AGENT_SDK_CLIENT_APP")
+        return
+      end
+
+      if bad_char = resolved.each_char.find { |char| char.ord > 0xFF }
+        raise ConfigurationError.new(
+          "Invalid client_app #{resolved.inspect}: character #{bad_char.inspect} " \
+          "(U+#{bad_char.ord.to_s(16).upcase.rjust(4, '0')}) exceeds U+00FF and is not valid in an HTTP header.",
+        )
+      end
+
+      base_env["CLAUDE_AGENT_SDK_CLIENT_APP"] = resolved
+    end
+
+    private def has_env_key_ci?(env : Hash(String, String), target : String) : Bool
+      env.keys.any? { |key| key.compare(target, case_insensitive: true) == 0 }
     end
 
     # Stop the CLI subprocess with a three-stage cascade:
@@ -265,6 +319,7 @@ module ClaudeAgent
       # Wire name is camelCase per the stream-json contract (matches the
       # TypeScript SDK's `SDKUserMessage.shouldQuery` field).
       message["shouldQuery"] = false unless should_query
+      message["client_composed"] = true if @options.try(&.verbatim_prompts?)
 
       send_json(message)
     end
@@ -312,6 +367,9 @@ module ClaudeAgent
 
             # Capture session_id from messages
             case message
+            when InitMessage
+              @session_id = message.session_id
+              check_claude_version(message.claude_code_version)
             when SystemMessage
               @session_id = message.session_id
             when AssistantMessage
@@ -520,6 +578,39 @@ module ClaudeAgent
       end
     end
 
+    private def check_claude_version(version : String?) : Nil
+      return if @version_checked
+      @version_checked = true
+
+      skip = ENV["CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"]?
+      return if skip && !skip.empty?
+
+      parsed = parse_semver(version)
+      if parsed.nil? || (parsed <=> {2, 0, 0}) < 0
+        log_message(
+          "[claude-agent-cr] Claude Code at #{find_cli_path} " \
+          "(#{version || "unknown"}) is older than minimum required version " \
+          "#{MINIMUM_CLAUDE_CODE_VERSION}; some features may not work correctly.\n",
+        )
+      end
+
+      if @options.try(&.verbatim_prompts?) && (parsed.nil? || (parsed <=> {2, 1, 248}) < 0)
+        log_message(
+          "[claude-agent-cr] verbatim_prompts is enabled, but Claude Code version " \
+          "#{version || "unknown"} at #{find_cli_path} ignores it: prompts will still " \
+          "have @path mentions expanded and slash commands dispatched. Claude Code " \
+          "#{VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION} or later is required.\n",
+        )
+      end
+    end
+
+    private def parse_semver(version : String?) : {Int32, Int32, Int32}?
+      return unless version
+      match = version.match(/\A(\d{1,9})\.(\d{1,9})\.(\d{1,9})/)
+      return unless match
+      {match[1].to_i, match[2].to_i, match[3].to_i}
+    end
+
     # Test-only: inject an IO as the subprocess input, so specs can inspect
     # what `send_prompt` / `send_json` actually writes without spawning a
     # real subprocess.
@@ -583,7 +674,7 @@ module ClaudeAgent
       opts.model.try { |model| args << "--model" << model }
       opts.fallback_model.try { |model| args << "--fallback-model" << model }
 
-      args << "--permission-mode" << opts.permission_mode.to_cli_value
+      opts.permission_mode.try { |mode| args << "--permission-mode" << mode.to_cli_value }
       args << "--allow-dangerously-skip-permissions" if opts.allow_dangerously_skip_permissions?
 
       add_system_prompt_args(args, opts)
@@ -640,9 +731,12 @@ module ClaudeAgent
         args << "--system-prompt" << system_prompt
       when SystemPromptPreset
         # Preset is implicit when only append is set. `exclude_dynamic_sections`
-        # is communicated via the initialize control request (as
-        # `excludeDynamicSections`), not via argv.
+        # and `snapshot` are communicated via the initialize control request,
+        # not via argv.
         system_prompt.append.try { |append| args << "--append-system-prompt" << append }
+      when SystemPromptCustom
+        # `snapshot` flows through the initialize control request (`systemPromptSnapshot`).
+        args << "--system-prompt" << system_prompt.prompt
       when SystemPromptFile
         args << "--system-prompt-file" << system_prompt.path
       when Nil
@@ -899,6 +993,8 @@ module ClaudeAgent
         defn.background?.try { |background| agent_obj["background"] = JSON::Any.new(background) }
         defn.effort.try { |effort| agent_obj["effort"] = effort }
         defn.permission_mode.try { |mode| agent_obj["permissionMode"] = JSON::Any.new(mode) }
+        defn.auto_compact_window.try { |win| agent_obj["autoCompactWindow"] = JSON::Any.new(win.to_i64) }
+        defn.omit_claude_md.try { |omit| agent_obj["omitClaudeMd"] = JSON::Any.new(omit) }
         result[name] = JSON::Any.new(agent_obj)
       end
       result.to_json
@@ -908,6 +1004,7 @@ module ClaudeAgent
       mcp_servers = {} of String => JSON::Any
 
       servers.each do |name, config|
+        ClaudeAgent.validate_mcp_server_name!(name)
         server_config = build_server_config(config)
         next unless server_config
         mcp_servers[name] = JSON::Any.new(server_config)
@@ -941,8 +1038,13 @@ module ClaudeAgent
           server_config["headers"] = JSON::Any.new(headers_any)
         end
 
+        config.timeout.try { |v| server_config["timeout"] = JSON::Any.new(v.to_i64) }
+        config.always_load.try { |v| server_config["alwaysLoad"] = JSON::Any.new(v) }
+        config.tools.try { |policies| server_config["tools"] = JSON::Any.new(build_tool_policies_json(policies)) }
+
         server_config
       when SDKMCPServer
+        ClaudeAgent.validate_mcp_server_name!(config.name)
         # SDK MCP servers still need to be declared to the CLI via
         # `--mcp-config` so the CLI knows to route tool calls back as
         # `mcp_message` control requests. The `instance` itself stays
@@ -951,7 +1053,18 @@ module ClaudeAgent
         sdk_config["type"] = JSON::Any.new("sdk")
         sdk_config["name"] = JSON::Any.new(config.name)
         sdk_config["version"] = JSON::Any.new(config.version)
+        config.timeout.try { |v| sdk_config["timeout"] = JSON::Any.new(v.to_i64) }
+        config.tool_policies.try { |policies| sdk_config["tools"] = JSON::Any.new(build_tool_policies_json(policies)) }
         sdk_config
+      end
+    end
+
+    private def build_tool_policies_json(policies : Array(MCPServerToolPolicy)) : Array(JSON::Any)
+      policies.map do |policy|
+        obj = {"name" => JSON::Any.new(policy.name)}
+        policy.permission_policy.try { |perm| obj["permission_policy"] = JSON::Any.new(perm) }
+        policy.org_max_permission.try { |org| obj["org_max_permission"] = JSON::Any.new(org) }
+        JSON::Any.new(obj)
       end
     end
 
@@ -1013,8 +1126,11 @@ module ClaudeAgent
         args << "--setting-sources=#{sources.join(",")}"
       end
 
+      opts.project_config_root.try do |root|
+        args << "--project-config-root=#{root}"
+      end
+
       # --settings takes a path or JSON string
-      # If sandbox settings are provided without a settings_path, serialize them
       settings_json = build_settings_json(opts)
       if settings_json
         args << "--settings" << settings_json
@@ -1030,46 +1146,20 @@ module ClaudeAgent
     end
 
     private def build_settings_json(opts : AgentOptions) : String?
-      settings = {} of String => JSON::Any
+      return if opts.sandbox.nil? && opts.workflow_size_guideline.nil?
+
+      settings = if settings_path = opts.settings_path
+                   load_settings_base_object(settings_path, opts.cwd)
+                 else
+                   {} of String => JSON::Any
+                 end
 
       if sandbox = opts.sandbox
-        # Build sandbox settings object
-        sandbox_obj = {} of String => JSON::Any
-        sandbox_obj["enabled"] = JSON::Any.new(sandbox.enabled?) if sandbox.enabled?
-        sandbox_obj["autoAllowBashIfSandboxed"] = JSON::Any.new(sandbox.auto_allow_bash_if_sandboxed?) if sandbox.auto_allow_bash_if_sandboxed?
-        sandbox_obj["allowUnsandboxedCommands"] = JSON::Any.new(sandbox.allow_unsandboxed_commands?) if sandbox.allow_unsandboxed_commands?
-        sandbox_obj["enableWeakerNestedSandbox"] = JSON::Any.new(sandbox.enable_weaker_nested_sandbox?) if sandbox.enable_weaker_nested_sandbox?
-        # Always emit failIfUnavailable explicitly when the sandbox is enabled
-        # so callers who rely on the default (fail fast) behavior get it even
-        # on CLIs that historically defaulted to silent fallback.
-        if sandbox.enabled?
-          sandbox_obj["failIfUnavailable"] = JSON::Any.new(sandbox.fail_if_unavailable?)
-        end
-
-        sandbox.excluded_commands.try do |cmds|
-          sandbox_obj["excludedCommands"] = JSON::Any.new(cmds.map { |cmd| JSON::Any.new(cmd) })
-        end
-
-        sandbox.network.try do |net|
-          net_obj = build_sandbox_network_json(net)
-          sandbox_obj["network"] = JSON::Any.new(net_obj) unless net_obj.empty?
-        end
-
-        sandbox.ignore_violations.try do |ignore|
-          ignore_obj = {} of String => JSON::Any
-          ignore.file.try { |files| ignore_obj["file"] = JSON::Any.new(files.map { |path| JSON::Any.new(path) }) }
-          ignore.network.try { |networks| ignore_obj["network"] = JSON::Any.new(networks.map { |pattern| JSON::Any.new(pattern) }) }
-          sandbox_obj["ignoreViolations"] = JSON::Any.new(ignore_obj) unless ignore_obj.empty?
-        end
-
-        sandbox.credentials.try do |creds|
-          # The structs carry the wire-format keys (path/mode, name/mode/
-          # injectHosts, allowPlaintextInject) via JSON::Serializable, so a
-          # serialize round-trip is the least error-prone way to attach them.
-          sandbox_obj["credentials"] = JSON.parse(creds.to_json)
-        end
-
-        settings["sandbox"] = JSON::Any.new(sandbox_obj) unless sandbox_obj.empty?
+        sandbox_obj = build_sandbox_json(sandbox)
+        base_sandbox = settings["sandbox"]?.try(&.as_h?) || {} of String => JSON::Any
+        merged_sandbox = merge_sandbox_json(base_sandbox, sandbox_obj)
+        sanitize_merged_sandbox!(merged_sandbox, sandbox)
+        settings["sandbox"] = JSON::Any.new(merged_sandbox) unless merged_sandbox.empty?
       end
 
       # Top-level settings key for the advisory Dynamic workflow size guideline
@@ -1078,8 +1168,188 @@ module ClaudeAgent
         settings["workflowSizeGuideline"] = JSON::Any.new(guideline)
       end
 
-      return if settings.empty?
+      return if opts.settings_path.nil? && settings.empty?
       settings.to_json
+    end
+
+    private def load_settings_base_object(settings_path : String, cwd : String?) : Hash(String, JSON::Any)
+      trimmed = settings_path.strip
+      content = if trimmed.starts_with?('{')
+                  unless trimmed.ends_with?('}')
+                    raise ConnectionError.new("Failed to load settings: malformed inline JSON settings")
+                  end
+                  trimmed
+                else
+                  resolved = Path[trimmed].absolute? ? trimmed : (cwd ? File.join(cwd, trimmed) : trimmed)
+                  begin
+                    File.read(resolved).lchop('\uFEFF')
+                  rescue ex : File::Error | IO::Error
+                    raise ConnectionError.new("Failed to load settings file '#{trimmed}': #{ex.message}")
+                  end
+                end
+
+      parsed = begin
+        JSON.parse(content)
+      rescue ex : JSON::ParseException
+        raise ConnectionError.new("Failed to parse settings JSON: #{ex.message}")
+      end
+
+      obj = parsed.as_h?
+      raise ConnectionError.new("Failed to load settings: expected a JSON object") unless obj
+      obj.dup
+    end
+
+    private def build_sandbox_json(sandbox : SandboxSettings) : Hash(String, JSON::Any)
+      sandbox_obj = {} of String => JSON::Any
+      sandbox_obj["enabled"] = JSON::Any.new(sandbox.enabled?) if sandbox.enabled?
+      if sandbox.auto_allow_bash_if_sandboxed?
+        sandbox_obj["autoAllowBashIfSandboxed"] = JSON::Any.new(sandbox.auto_allow_bash_if_sandboxed?)
+      end
+      if sandbox.allow_unsandboxed_commands?
+        sandbox_obj["allowUnsandboxedCommands"] = JSON::Any.new(sandbox.allow_unsandboxed_commands?)
+      end
+      if sandbox.enable_weaker_nested_sandbox?
+        sandbox_obj["enableWeakerNestedSandbox"] = JSON::Any.new(sandbox.enable_weaker_nested_sandbox?)
+      end
+      sandbox.allow_nested_user_namespaces.try do |val|
+        sandbox_obj["allowNestedUserNamespaces"] = JSON::Any.new(val)
+      end
+      sandbox.enable_weaker_network_isolation.try do |val|
+        sandbox_obj["enableWeakerNetworkIsolation"] = JSON::Any.new(val)
+      end
+      sandbox.allow_apple_events.try do |val|
+        sandbox_obj["allowAppleEvents"] = JSON::Any.new(val)
+      end
+      # Always emit failIfUnavailable explicitly when the sandbox is enabled
+      # so callers who rely on the default (fail fast) behavior get it even
+      # on CLIs that historically defaulted to silent fallback.
+      if sandbox.enabled?
+        sandbox_obj["failIfUnavailable"] = JSON::Any.new(sandbox.fail_if_unavailable?)
+      end
+
+      sandbox.excluded_commands.try do |cmds|
+        sandbox_obj["excludedCommands"] = JSON::Any.new(cmds.map { |cmd| JSON::Any.new(cmd) })
+      end
+
+      sandbox.filesystem.try do |filesystem|
+        fs_obj = build_sandbox_filesystem_json(filesystem)
+        sandbox_obj["filesystem"] = JSON::Any.new(fs_obj) unless fs_obj.empty?
+      end
+
+      sandbox.network.try do |net|
+        net_obj = build_sandbox_network_json(net)
+        sandbox_obj["network"] = JSON::Any.new(net_obj) unless net_obj.empty?
+      end
+
+      sandbox.ripgrep.try do |ripgrep|
+        sandbox_obj["ripgrep"] = JSON::Any.new(ripgrep)
+      end
+
+      build_sandbox_ignore_violations_json(sandbox.ignore_violations).try do |ignore_obj|
+        sandbox_obj["ignoreViolations"] = JSON::Any.new(ignore_obj) unless ignore_obj.empty?
+      end
+
+      sandbox.credentials.try do |creds|
+        # The structs carry the wire-format keys (path/mode, name/mode/
+        # injectHosts, allowPlaintextInject, awsPairs) via JSON::Serializable.
+        creds_obj = JSON.parse(creds.to_json).as_h?
+        sandbox_obj["credentials"] = JSON::Any.new(creds_obj) if creds_obj && !creds_obj.empty?
+      end
+
+      sandbox_obj
+    end
+
+    private def build_sandbox_filesystem_json(fs : SandboxFilesystemSettings) : Hash(String, JSON::Any)
+      fs_obj = {} of String => JSON::Any
+      fs.allow_write.try { |paths| fs_obj["allowWrite"] = JSON::Any.new(paths.map { |path| JSON::Any.new(path) }) }
+      fs.deny_write.try { |paths| fs_obj["denyWrite"] = JSON::Any.new(paths.map { |path| JSON::Any.new(path) }) }
+      fs.deny_read.try { |paths| fs_obj["denyRead"] = JSON::Any.new(paths.map { |path| JSON::Any.new(path) }) }
+      fs.allow_read.try { |paths| fs_obj["allowRead"] = JSON::Any.new(paths.map { |path| JSON::Any.new(path) }) }
+      fs.allow_managed_read_paths_only.try { |val| fs_obj["allowManagedReadPathsOnly"] = JSON::Any.new(val) }
+      fs.disabled.try { |val| fs_obj["disabled"] = JSON::Any.new(val) }
+      fs_obj
+    end
+
+    private def build_sandbox_ignore_violations_json(
+      ignore : (SandboxIgnoreViolationsMap | SandboxIgnoreViolations)?,
+    ) : Hash(String, JSON::Any)?
+      return unless ignore
+
+      ignore_obj = {} of String => JSON::Any
+      case ignore
+      when SandboxIgnoreViolationsMap
+        ignore.each do |pattern, entries|
+          ignore_obj[pattern] = JSON::Any.new(entries.map { |entry| JSON::Any.new(entry) })
+        end
+      when SandboxIgnoreViolations
+        ignore.file.try { |files| ignore_obj["file"] = JSON::Any.new(files.map { |path| JSON::Any.new(path) }) }
+        ignore.network.try do |networks|
+          ignore_obj["network"] = JSON::Any.new(networks.map { |pattern| JSON::Any.new(pattern) })
+        end
+      end
+      ignore_obj
+    end
+
+    private def merge_sandbox_json(
+      base : Hash(String, JSON::Any),
+      overlay : Hash(String, JSON::Any),
+      prefix : String = "",
+    ) : Hash(String, JSON::Any)
+      merged = base.dup
+      overlay.each do |key, overlay_val|
+        next if SANDBOX_PROTOTYPE_KEYS.includes?(key)
+
+        field_path = prefix.empty? ? key : "#{prefix}.#{key}"
+        base_val = merged[key]?
+
+        if SANDBOX_RESTRICTION_ARRAY_PATHS.includes?(field_path) &&
+           (base_arr = base_val.try(&.as_a?)) &&
+           (overlay_arr = overlay_val.as_a?)
+          merged[key] = JSON::Any.new((base_arr + overlay_arr).uniq)
+        elsif (base_hash = base_val.try(&.as_h?)) &&
+              (overlay_hash = overlay_val.as_h?) &&
+              !SANDBOX_REPLACE_PATHS.includes?(field_path)
+          merged[key] = JSON::Any.new(merge_sandbox_json(base_hash, overlay_hash, field_path))
+        else
+          merged[key] = overlay_val
+        end
+      end
+      merged
+    end
+
+    private def sanitize_merged_sandbox!(merged : Hash(String, JSON::Any), sandbox : SandboxSettings) : Nil
+      strip_disabled_filesystem!(merged, sandbox)
+      strip_conflicting_proxy_ports!(merged, sandbox)
+    end
+
+    private def strip_disabled_filesystem!(merged : Hash(String, JSON::Any), sandbox : SandboxSettings) : Nil
+      has_deny_cred_files = sandbox.credentials.try(&.files).try(&.any? { |file| file.mode == "deny" }) || false
+      return unless sandbox.filesystem || has_deny_cred_files
+      return unless sandbox.filesystem.try(&.disabled).nil?
+
+      fs_any = merged["filesystem"]?.try(&.as_h?)
+      return unless fs_any && fs_any["disabled"]?.try(&.as_bool?) == true
+
+      fs_dup = fs_any.dup
+      fs_dup.delete("disabled")
+      merged["filesystem"] = JSON::Any.new(fs_dup)
+    end
+
+    private def strip_conflicting_proxy_ports!(merged : Hash(String, JSON::Any), sandbox : SandboxSettings) : Nil
+      net = sandbox.network
+      return unless net
+
+      denied_non_empty = net.denied_domains.try { |domains| !domains.empty? } || false
+      has_network_restrictions = !net.allowed_domains.nil? || denied_non_empty || net.strict_allowlist? == true
+      return unless has_network_restrictions
+
+      net_any = merged["network"]?.try(&.as_h?)
+      return unless net_any
+
+      net_dup = net_any.dup
+      net_dup.delete("httpProxyPort") if net.http_proxy_port.nil?
+      net_dup.delete("socksProxyPort") if net.socks_proxy_port.nil?
+      merged["network"] = JSON::Any.new(net_dup)
     end
 
     private def build_sandbox_network_json(net : SandboxNetworkSettings) : Hash(String, JSON::Any)
@@ -1106,6 +1376,9 @@ module ClaudeAgent
       # Emit strictAllowlist whenever explicitly set (true or false).
       if (strict = net.strict_allowlist?).is_a?(Bool)
         net_obj["strictAllowlist"] = JSON::Any.new(strict)
+      end
+      net.tls_terminate.try do |tls|
+        net_obj["tlsTerminate"] = JSON::Any.new(tls)
       end
       net_obj
     end

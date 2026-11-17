@@ -24,6 +24,37 @@ module ClaudeAgent
       "control_response"   => ->(json : String, _data : MessageData) { ControlResponseMessage.from_json(json).as(Message) },
     }
 
+    SYSTEM_PARSERS = {
+      "init" => ->(data : MessageData, session_id : String) do
+        InitMessage.new(session_id, data, ServerInfo.from_data(data)).as(Message)
+      end,
+      "compact_boundary"         => ->parse_compact_boundary(MessageData, String),
+      "task_started"             => ->parse_task_started(MessageData, String),
+      "task_progress"            => ->parse_task_progress(MessageData, String),
+      "task_notification"        => ->parse_task_notification(MessageData, String),
+      "task_updated"             => ->parse_task_updated(MessageData, String),
+      "elicitation_complete"     => ->parse_elicitation_complete(MessageData, String),
+      "api_retry"                => ->parse_api_retry(MessageData, String),
+      "memory_recall"            => ->parse_memory_recall(MessageData, String),
+      "status"                   => ->parse_status_message(MessageData, String),
+      "hook_started"             => ->parse_hook_event(MessageData, String),
+      "hook_response"            => ->parse_hook_event(MessageData, String),
+      "command_lifecycle"        => ->parse_command_lifecycle(MessageData, String),
+      "background_tasks_changed" => ->parse_background_tasks_changed(MessageData, String),
+      "model_fallback"           => ->parse_model_fallback(MessageData, String),
+      "worker_shutting_down"     => ->parse_worker_shutting_down(MessageData, String),
+      "session_state_changed"    => ->parse_session_state_changed(MessageData, String),
+      "session_writes_lost"      => ->parse_session_writes_lost(MessageData, String),
+      "informational"            => ->parse_informational(MessageData, String),
+    }
+
+    # True when this message is an internal transport frame sent only because
+    # the SDK opted into host signals (e.g. `session_state_changed` with
+    # `sdk_host_only: true`) and must be hidden from caller-visible streams.
+    def sdk_host_only_frame? : Bool
+      false
+    end
+
     def self.parse(json : String) : Message
       message = parse_message_data(json)
       type = parse_message_type(message)
@@ -85,40 +116,8 @@ module ClaudeAgent
       parsed || GenericSystemMessage.new(subtype, session_id, message)
     end
 
-    # ameba:disable Metrics/CyclomaticComplexity
     private def self.parse_known_system_message?(subtype : String, message : MessageData, session_id : String) : Message?
-      case subtype
-      when "init"
-        InitMessage.new(session_id, message, ServerInfo.from_data(message))
-      when "compact_boundary"
-        parse_compact_boundary(message, session_id)
-      when "task_started"
-        parse_task_started(message, session_id)
-      when "task_progress"
-        parse_task_progress(message, session_id)
-      when "task_notification"
-        parse_task_notification(message, session_id)
-      when "task_updated"
-        parse_task_updated(message, session_id)
-      when "elicitation_complete"
-        parse_elicitation_complete(message, session_id)
-      when "api_retry"
-        parse_api_retry(message, session_id)
-      when "memory_recall"
-        parse_memory_recall(message, session_id)
-      when "status"
-        parse_status_message(message, session_id)
-      when "hook_started", "hook_response"
-        parse_hook_event(message, session_id)
-      when "command_lifecycle"
-        parse_command_lifecycle(message, session_id)
-      when "background_tasks_changed"
-        parse_background_tasks_changed(message, session_id)
-      when "model_fallback"
-        parse_model_fallback(message, session_id)
-      when "worker_shutting_down"
-        parse_worker_shutting_down(message, session_id)
-      end
+      SYSTEM_PARSERS[subtype]?.try(&.call(message, session_id))
     end
 
     private def self.parse_api_retry(data : MessageData, session_id : String) : Message
@@ -155,12 +154,10 @@ module ClaudeAgent
       metadata_data = data["compact_metadata"]?.try(&.as_h?)
       return GenericSystemMessage.new("compact_boundary", session_id, data) unless uuid && metadata_data
 
-      CompactBoundaryMessage.new(
-        session_id,
-        data,
-        uuid,
-        CompactBoundaryMessage::CompactMetadata.from_json(metadata_data.to_json),
-      )
+      metadata = CompactBoundaryMessage::CompactMetadata.from_data?(metadata_data)
+      return GenericSystemMessage.new("compact_boundary", session_id, data) unless metadata
+
+      CompactBoundaryMessage.new(session_id, data, uuid, metadata)
     end
 
     private def self.parse_task_started(data : MessageData, session_id : String) : Message
@@ -181,6 +178,9 @@ module ClaudeAgent
         data["is_backgrounded"]?.try(&.as_bool?),
         spawn_depth,
         data["ambient"]?.try(&.as_bool?),
+        data["run_id"]?.try(&.as_s?),
+        data["parent_task_id"]?.try(&.as_s?),
+        data["subagent_type"]?.try(&.as_s?),
       )
     end
 
@@ -201,6 +201,8 @@ module ClaudeAgent
         data["tool_use_id"]?.try(&.as_s?),
         data["last_tool_name"]?.try(&.as_s?),
         data["summary"]?.try(&.as_s?),
+        data["run_id"]?.try(&.as_s?),
+        data["subagent_type"]?.try(&.as_s?),
       )
     end
 
@@ -222,6 +224,8 @@ module ClaudeAgent
         data["tool_use_id"]?.try(&.as_s?),
         data["resource_links"]?.try(&.as_a?),
         data["ambient"]?.try(&.as_bool?),
+        data["run_id"]?.try(&.as_s?),
+        data["reason"]?.try(&.as_s?),
       )
     end
 
@@ -247,6 +251,7 @@ module ClaudeAgent
         patch,
         status,
         data["uuid"]?.try(&.as_s?),
+        data["run_id"]?.try(&.as_s?),
       )
     end
 
@@ -299,6 +304,8 @@ module ClaudeAgent
         uuid,
         state,
         data["message_uuid"]?.try(&.as_s?) || data["messageUuid"]?.try(&.as_s?),
+        data["wakeup_source"]?.try(&.as_s?) || data["wakeupSource"]?.try(&.as_s?),
+        data["scheduled_for"]?.try(&.as_s?) || data["scheduledFor"]?.try(&.as_s?),
       )
     end
 
@@ -318,6 +325,9 @@ module ClaudeAgent
           task_type: hash["task_type"]?.try(&.as_s?) || hash["taskType"]?.try(&.as_s?),
           description: hash["description"]?.try(&.as_s?),
           ambient: hash["ambient"]?.try(&.as_bool?),
+          run_id: hash["run_id"]?.try(&.as_s?) || hash["runId"]?.try(&.as_s?),
+          subagent_type: hash["subagent_type"]?.try(&.as_s?) || hash["subagentType"]?.try(&.as_s?),
+          parent_task_id: hash["parent_task_id"]?.try(&.as_s?) || hash["parentTaskId"]?.try(&.as_s?),
         )
       end
 
@@ -357,6 +367,64 @@ module ClaudeAgent
         data,
         reason,
         data["uuid"]?.try(&.as_s?),
+      )
+    end
+
+    # Session runtime state transitions (`"running"`, `"idle"`, `"requires_action"`).
+    # Frames with `sdk_host_only: true` are internal host signals.
+    private def self.parse_session_state_changed(data : MessageData, session_id : String) : Message
+      state = data["state"]?.try(&.as_s?)
+      return GenericSystemMessage.new("session_state_changed", session_id, data) unless state
+
+      sdk_host_only = data["sdk_host_only"]?.try(&.as_bool?)
+      sdk_host_only = data["sdkHostOnly"]?.try(&.as_bool?) if sdk_host_only.nil?
+
+      SessionStateChangedMessage.new(
+        session_id,
+        data,
+        state,
+        sdk_host_only == true,
+        data["uuid"]?.try(&.as_s?),
+      )
+    end
+
+    # Transcript / global-config durability failure notice (`ENOSPC` / `EDQUOT`).
+    private def self.parse_session_writes_lost(data : MessageData, session_id : String) : Message
+      error_code = data["error_code"]?.try(&.as_s?) || data["errorCode"]?.try(&.as_s?)
+      lost_raw = data["lost"]?.try(&.as_a?)
+      return GenericSystemMessage.new("session_writes_lost", session_id, data) unless error_code && lost_raw
+
+      transcript_ids = (data["transcript_session_ids"]? || data["transcriptSessionIds"]?)
+        .try(&.as_a?).try(&.compact_map(&.as_s?))
+
+      SessionWritesLostMessage.new(
+        session_id,
+        data,
+        data["uuid"]?.try(&.as_s?),
+        error_code,
+        lost_raw.compact_map(&.as_s?),
+        transcript_ids,
+      )
+    end
+
+    # Informational / notice / warning system message emitted mid-stream.
+    private def self.parse_informational(data : MessageData, session_id : String) : Message
+      content = data["content"]?.try(&.as_s?)
+      level = data["level"]?.try(&.as_s?)
+      return GenericSystemMessage.new("informational", session_id, data) unless content && level
+
+      prevent = data["prevent_continuation"]?.try(&.as_bool?)
+      prevent = data["preventContinuation"]?.try(&.as_bool?) if prevent.nil?
+
+      InformationalMessage.new(
+        session_id,
+        data,
+        data["uuid"]?.try(&.as_s?),
+        content,
+        level,
+        data["tool_use_id"]?.try(&.as_s?) || data["toolUseId"]?.try(&.as_s?),
+        prevent,
+        data["tag"]?.try(&.as_s?),
       )
     end
   end
@@ -410,10 +478,23 @@ module ClaudeAgent
     end
   end
 
-  # What triggered a message/result. Wire shape is a discriminated
-  # object: `{"kind": "human"}`, `{"kind": "task-notification"}`,
-  # `{"kind": "peer", "from": ..., "name": ...}`, etc. Only `kind` is
-  # always present; the other fields are variant-specific.
+  # Provenance of a user-role message, and — on a `ResultMessage` — of
+  # the message that started that turn.
+  #
+  # In streaming-input mode a single connection interleaves the turns you
+  # send with turns the session injects on its own (background-task
+  # notifications, scheduled-task prompts, MCP channel messages, messages
+  # relayed from peer sessions, ...). `origin` only reports what *started*
+  # a turn: a human prompt sent while an injected turn is running may be
+  # answered inside that turn, and the result then carries the injected
+  # turn's `origin`. To match a result to your prompts, send each prompt
+  # with a fresh `uuid` and check `ResultMessage#user_message_uuid` /
+  # `ResultMessage#user_message_uuids`.
+  #
+  # Wire shape is a discriminated object: `{"kind": "human"}`,
+  # `{"kind": "task-notification"}`, `{"kind": "peer", "from": ...,
+  # "name": ...}`, etc. Only `kind` is always present; the other fields are
+  # variant-specific.
   struct MessageOrigin
     include JSON::Serializable
 
@@ -430,9 +511,8 @@ module ClaudeAgent
     # subagent that sent the message.
     @[JSON::Field(key: "senderTaskId")]
     getter sender_task_id : String?
-    # For "task-notification": e.g. "scheduled-trigger" when the delivery
-    # is the fired prompt of a user-configured scheduled task. Matches
-    # the TS SDK's `SDKMessageOrigin` subkind (0.3.214+).
+    # For "task-notification": e.g. "scheduled-trigger", "peer-send-message",
+    # "session-inbox", or "projects-relay". Matches TS SDK `SDKMessageOrigin`.
     getter subkind : String?
     # For "peer": decoded message body with the peer envelope stripped.
     # Present only when the turn is a harness-formed envelope; render
@@ -447,6 +527,12 @@ module ClaudeAgent
     # for relayed traffic that is the relay). Absent when unverifiable.
     @[JSON::Field(key: "verifiedPeerPid")]
     getter verified_peer_pid : Int64?
+    # Scheduled run fire reason when `CLAUDE_CODE_HOST_SCHEDULED_RUN=1`.
+    @[JSON::Field(key: "fireReason")]
+    getter fire_reason : String?
+    # Run identifier linking correlated origin/task events.
+    @[JSON::Field(key: "runId")]
+    getter run_id : String?
 
     def initialize(
       @kind : String,
@@ -458,6 +544,8 @@ module ClaudeAgent
       @body : String? = nil,
       @from_session : String? = nil,
       @verified_peer_pid : Int64? = nil,
+      @fire_reason : String? = nil,
+      @run_id : String? = nil,
     )
     end
 
@@ -534,6 +622,10 @@ module ClaudeAgent
     getter context_management : JSON::Any?
   end
 
+  # Structured error attached to an `AssistantMessage` when generation fails.
+  # Known `type` values include `"authentication_failed"`, `"billing_error"`,
+  # `"rate_limit"`, `"invalid_request"`, `"server_error"`, `"max_output_tokens"`,
+  # `"verification_required"`, `"cloud_credential_error"`, and `"unknown"`.
   struct AssistantMessageError
     include JSON::Serializable
     getter type : String
@@ -611,6 +703,18 @@ module ClaudeAgent
     # UUID of the user message that triggered this turn, linking a reply
     # to the message it answers. Matches TS SDK 0.3.246+.
     getter user_message_uuid : String?
+    # UUID of every user message this turn has taken in so far. Set on the
+    # first top-level assistant message after the value is set or changes;
+    # nil on others. Matches Python #1505 / TS SDK.
+    getter user_message_uuids : Array(String)?
+    # Reason a session/turn resumed (e.g. `"interrupted_turn"`).
+    getter resume_reason : String?
+    # Envelope UUID of an earlier unparseable/superseded assistant message.
+    getter supersedes : String?
+    # Subagent identifier when emitted for an agent run.
+    getter agent_id : String?
+    # Headless `/usage` report payload attached to an assistant message.
+    getter usage_report : JSON::Any?
 
     def content
       message.content
@@ -834,6 +938,16 @@ module ClaudeAgent
     # Optional file attachments on live / replayed user messages.
     # Matches TS SDK `file_attachments` (0.3.181+).
     getter file_attachments : Array(FileAttachment)?
+    # Subagent identifier associated with this user message, when applicable.
+    getter agent_id : String?
+    # Subagent type name associated with this user message, when applicable.
+    getter subagent_type : String?
+    # Subagent task description associated with this user message.
+    getter task_description : String?
+    # Pasted content map/payload attached to a user message.
+    getter pasted_content : JSON::Any?
+    # Inline paste snippets attached to a user message.
+    getter inline_pastes : Array(String)?
 
     def initialize(
       @uuid : String? = nil,
@@ -846,6 +960,11 @@ module ClaudeAgent
       @is_meta : Bool? = nil,
       @is_synthetic : Bool? = nil,
       @file_attachments : Array(FileAttachment)? = nil,
+      @agent_id : String? = nil,
+      @subagent_type : String? = nil,
+      @task_description : String? = nil,
+      @pasted_content : JSON::Any? = nil,
+      @inline_pastes : Array(String)? = nil,
     )
       @type = "user"
     end
@@ -868,24 +987,20 @@ module ClaudeAgent
     def self.parse_envelope(json : String, data : MessageData) : UserMessage
       base = from_json(MessageOrigin.scrub_json(json, data))
 
-      is_synthetic = data["isSynthetic"]?.try(&.as_bool?)
-      is_synthetic = data["is_synthetic"]?.try(&.as_bool?) if is_synthetic.nil?
-      is_synthetic = base.is_synthetic if is_synthetic.nil?
-
-      is_meta = data["isMeta"]?.try(&.as_bool?)
-      is_meta = data["is_meta"]?.try(&.as_bool?) if is_meta.nil?
-      is_meta = base.is_meta if is_meta.nil?
+      is_synthetic = resolve_bool_flag(data, "isSynthetic", "is_synthetic", base.is_synthetic)
+      is_meta = resolve_bool_flag(data, "isMeta", "is_meta", base.is_meta)
       # TS SDK maps isSynthetic → isMeta on ingestion (0.3.198).
       is_meta = is_synthetic if is_meta.nil? && !is_synthetic.nil?
 
       # Prefer manual parse so mediaType / filename dual keys are handled.
-      attachments = FileAttachment.from_any_array(data["file_attachments"]?)
-      attachments = base.file_attachments if attachments.nil?
+      attachments = FileAttachment.from_any_array(data["file_attachments"]?) || base.file_attachments
 
       # CLI emits an array of meta entries (and historically may emit a
       # single object). Never go through JSON::Serializable for this field.
-      meta = ToolResultMeta.from_any_array(data["tool_result_meta"]?)
-      meta = ToolResultMeta.from_any_array(data["toolResultMeta"]?) if meta.nil?
+      meta = ToolResultMeta.from_any_array(data["tool_result_meta"]?) ||
+             ToolResultMeta.from_any_array(data["toolResultMeta"]?)
+
+      inline_pastes = base.inline_pastes || data["inlinePastes"]?.try(&.as_a?).try(&.compact_map(&.as_s?))
 
       new(
         uuid: base.uuid,
@@ -898,7 +1013,23 @@ module ClaudeAgent
         is_meta: is_meta,
         is_synthetic: is_synthetic,
         file_attachments: attachments,
+        agent_id: base.agent_id || data["agentId"]?.try(&.as_s?),
+        subagent_type: base.subagent_type || data["subagentType"]?.try(&.as_s?),
+        task_description: base.task_description || data["taskDescription"]?.try(&.as_s?),
+        pasted_content: base.pasted_content || data["pastedContent"]?,
+        inline_pastes: inline_pastes,
       )
+    end
+
+    private def self.resolve_bool_flag(
+      data : MessageData,
+      camel : String,
+      snake : String,
+      fallback : Bool?,
+    ) : Bool?
+      val = data[camel]?.try(&.as_bool?)
+      val = data[snake]?.try(&.as_bool?) if val.nil?
+      val.nil? ? fallback : val
     end
   end
 
@@ -1017,8 +1148,56 @@ module ClaudeAgent
       server_info.fast_mode_state
     end
 
+    def fast_mode_disabled_reason : String?
+      server_info.fast_mode_disabled_reason
+    end
+
     def claude_code_version : String?
       server_info.claude_code_version
+    end
+
+    def capabilities : Array(String)
+      server_info.capabilities
+    end
+
+    def plugin_errors : Array(ServerPluginError)
+      server_info.plugin_errors
+    end
+
+    def mcp_server_infos : Array(ServerMcpServerInfo)
+      server_info.mcp_server_infos
+    end
+
+    def plugin_infos : Array(ServerPluginInfo)
+      server_info.plugin_infos
+    end
+
+    def terminal_slash_commands : Array(String)?
+      server_info.terminal_slash_commands
+    end
+
+    def effort : JSON::Any?
+      server_info.effort
+    end
+
+    def api_key_source : String?
+      server_info.api_key_source
+    end
+
+    def betas : Array(String)
+      server_info.betas
+    end
+
+    def uuid : String?
+      server_info.uuid
+    end
+
+    def view_mode : String?
+      server_info.view_mode
+    end
+
+    def startup_timing : Hash(String, JSON::Any)?
+      server_info.startup_timing
     end
   end
 
@@ -1051,6 +1230,7 @@ module ClaudeAgent
     getter task_id : String
     getter description : String
     getter tool_use_id : String?
+    # Task type (e.g. `"local_agent"`, `"local_workflow"`, `"mcp_task"`).
     getter task_type : String?
     # True for subagent tasks (also on background Bash tasks) launched
     # detached. Matches TS SDK 0.3.238+.
@@ -1060,6 +1240,9 @@ module ClaudeAgent
     # True for housekeeping tasks; exclude from activity indicators.
     # Matches TS SDK 0.3.247+.
     getter ambient : Bool?
+    getter run_id : String?
+    getter parent_task_id : String?
+    getter subagent_type : String?
 
     def initialize(
       session_id : String,
@@ -1072,6 +1255,9 @@ module ClaudeAgent
       @is_backgrounded : Bool? = nil,
       @spawn_depth : Int32? = nil,
       @ambient : Bool? = nil,
+      @run_id : String? = nil,
+      @parent_task_id : String? = nil,
+      @subagent_type : String? = nil,
     )
       super("task_started", session_id, data)
     end
@@ -1085,6 +1271,8 @@ module ClaudeAgent
     getter tool_use_id : String?
     getter last_tool_name : String?
     getter summary : String?
+    getter run_id : String?
+    getter subagent_type : String?
 
     def initialize(
       session_id : String,
@@ -1096,6 +1284,8 @@ module ClaudeAgent
       @tool_use_id : String? = nil,
       @last_tool_name : String? = nil,
       @summary : String? = nil,
+      @run_id : String? = nil,
+      @subagent_type : String? = nil,
     )
       super("task_progress", session_id, data)
     end
@@ -1116,6 +1306,8 @@ module ClaudeAgent
     # True for housekeeping tasks; exclude from activity indicators.
     # Matches TS SDK 0.3.247+.
     getter ambient : Bool?
+    getter run_id : String?
+    getter reason : String?
 
     def initialize(
       session_id : String,
@@ -1129,6 +1321,8 @@ module ClaudeAgent
       @tool_use_id : String? = nil,
       @resource_links : Array(JSON::Any)? = nil,
       @ambient : Bool? = nil,
+      @run_id : String? = nil,
+      @reason : String? = nil,
     )
       super("task_notification", session_id, data)
     end
@@ -1159,6 +1353,7 @@ module ClaudeAgent
     getter patch : MessageData
     getter status : String?
     getter uuid : String?
+    getter run_id : String?
 
     def initialize(
       session_id : String,
@@ -1167,6 +1362,7 @@ module ClaudeAgent
       @patch : MessageData,
       @status : String? = nil,
       @uuid : String? = nil,
+      @run_id : String? = nil,
     )
       super("task_updated", session_id, data)
     end
@@ -1227,6 +1423,11 @@ module ClaudeAgent
     # Per-model weekly limit windows with utilization and reset times.
     getter model_scoped : Array(ModelScopedRateLimit)?
     getter raw : MessageData
+    getter overage_enabled : Bool?
+    getter overage_in_use : Bool?
+    getter is_using_overage : Bool?
+    getter surpassed_threshold : Float64?
+    getter limit_scope : String?
 
     def initialize(
       @status : String,
@@ -1241,6 +1442,11 @@ module ClaudeAgent
       @has_chargeable_saved_payment_method : Bool? = nil,
       @model_scoped : Array(ModelScopedRateLimit)? = nil,
       @raw : MessageData = {} of String => JSON::Any,
+      @overage_enabled : Bool? = nil,
+      @overage_in_use : Bool? = nil,
+      @is_using_overage : Bool? = nil,
+      @surpassed_threshold : Float64? = nil,
+      @limit_scope : String? = nil,
     )
     end
 
@@ -1255,26 +1461,37 @@ module ClaudeAgent
         arr.compact_map { |entry| ModelScopedRateLimit.from_any(entry) }
       end
 
-      can_purchase = data["canUserPurchaseCredits"]?.try(&.as_bool?)
-      can_purchase = data["can_user_purchase_credits"]?.try(&.as_bool?) if can_purchase.nil?
-
-      has_payment = data["hasChargeableSavedPaymentMethod"]?.try(&.as_bool?)
-      has_payment = data["has_chargeable_saved_payment_method"]?.try(&.as_bool?) if has_payment.nil?
-
       new(
         status: status,
         resets_at: data["resetsAt"]?.try(&.as_i64?),
         rate_limit_type: data["rateLimitType"]?.try(&.as_s?),
-        utilization: data["utilization"]?.try { |value| value.as_f? || value.as_i64?.try(&.to_f64) },
+        utilization: float_field(data, "utilization"),
         overage_status: data["overageStatus"]?.try(&.as_s?),
         overage_resets_at: data["overageResetsAt"]?.try(&.as_i64?),
         overage_disabled_reason: data["overageDisabledReason"]?.try(&.as_s?),
         error_code: data["errorCode"]?.try(&.as_s?) || data["error_code"]?.try(&.as_s?),
-        can_user_purchase_credits: can_purchase,
-        has_chargeable_saved_payment_method: has_payment,
+        can_user_purchase_credits: bool_field(data, "canUserPurchaseCredits", "can_user_purchase_credits"),
+        has_chargeable_saved_payment_method: bool_field(
+          data, "hasChargeableSavedPaymentMethod", "has_chargeable_saved_payment_method"
+        ),
         model_scoped: model_scoped,
         raw: data,
+        overage_enabled: bool_field(data, "overageEnabled", "overage_enabled"),
+        overage_in_use: bool_field(data, "overageInUse", "overage_in_use"),
+        is_using_overage: bool_field(data, "isUsingOverage", "is_using_overage"),
+        surpassed_threshold: float_field(data, "surpassedThreshold") || float_field(data, "surpassed_threshold"),
+        limit_scope: data["limitScope"]?.try(&.as_s?) || data["limit_scope"]?.try(&.as_s?),
       )
+    end
+
+    private def self.bool_field(data : MessageData, camel : String, snake : String) : Bool?
+      value = data[camel]?.try(&.as_bool?)
+      value = data[snake]?.try(&.as_bool?) if value.nil?
+      value
+    end
+
+    private def self.float_field(data : MessageData, key : String) : Float64?
+      data[key]?.try { |value| value.as_f? || value.as_i64?.try(&.to_f64) }
     end
   end
 
@@ -1414,11 +1631,18 @@ module ClaudeAgent
     getter new_conversation_id : String
     getter uuid : String
     getter session_id : String
+    # Reset trigger: `"clear"`, `"plan_mode_exit"`, `"fresh_session"`, or `"onboarding"`.
+    getter trigger : String?
+    getter user_message_uuid : String?
+    getter timestamp : String?
 
     def initialize(
       @new_conversation_id : String,
       @uuid : String,
       @session_id : String,
+      @trigger : String? = nil,
+      @user_message_uuid : String? = nil,
+      @timestamp : String? = nil,
     )
       @type = "conversation_reset"
     end
@@ -1464,8 +1688,38 @@ module ClaudeAgent
     # Metadata about the compaction event
     struct CompactMetadata
       include JSON::Serializable
+
       getter trigger : String # "manual" or "auto"
       getter pre_tokens : Int64
+      getter post_tokens : Int64?
+      getter duration_ms : Int64?
+      getter preserved_segment : JSON::Any?
+      getter preserved_messages : JSON::Any?
+
+      def initialize(
+        @trigger : String,
+        @pre_tokens : Int64,
+        @post_tokens : Int64? = nil,
+        @duration_ms : Int64? = nil,
+        @preserved_segment : JSON::Any? = nil,
+        @preserved_messages : JSON::Any? = nil,
+      )
+      end
+
+      def self.from_data?(data : MessageData) : CompactMetadata?
+        trigger = data["trigger"]?.try(&.as_s?)
+        pre_tokens = data["pre_tokens"]?.try(&.as_i64?) || data["preTokens"]?.try(&.as_i64?)
+        return unless trigger && pre_tokens
+
+        new(
+          trigger: trigger,
+          pre_tokens: pre_tokens,
+          post_tokens: data["post_tokens"]?.try(&.as_i64?) || data["postTokens"]?.try(&.as_i64?),
+          duration_ms: data["duration_ms"]?.try(&.as_i64?) || data["durationMs"]?.try(&.as_i64?),
+          preserved_segment: data["preserved_segment"]? || data["preservedSegment"]?,
+          preserved_messages: data["preserved_messages"]? || data["preservedMessages"]?,
+        )
+      end
     end
 
     getter compact_metadata : CompactMetadata
@@ -1514,6 +1768,10 @@ module ClaudeAgent
     getter state : String
     # The uuid of the tracked command/message when distinct from `uuid`.
     getter message_uuid : String?
+    # Wakeup source when emitted for scheduled wakeups/tasks.
+    getter wakeup_source : String?
+    # Scheduled target timestamp for scheduled wakeups/tasks.
+    getter scheduled_for : String?
 
     def initialize(
       session_id : String,
@@ -1521,6 +1779,8 @@ module ClaudeAgent
       @uuid : String,
       @state : String,
       @message_uuid : String? = nil,
+      @wakeup_source : String? = nil,
+      @scheduled_for : String? = nil,
     )
       super("command_lifecycle", session_id, data)
     end
@@ -1538,12 +1798,18 @@ module ClaudeAgent
     # True for housekeeping tasks; exclude from activity indicators.
     # Matches TS SDK 0.3.247+.
     getter ambient : Bool?
+    getter run_id : String?
+    getter subagent_type : String?
+    getter parent_task_id : String?
 
     def initialize(
       @task_id : String,
       @task_type : String? = nil,
       @description : String? = nil,
       @ambient : Bool? = nil,
+      @run_id : String? = nil,
+      @subagent_type : String? = nil,
+      @parent_task_id : String? = nil,
     )
     end
   end
@@ -1613,6 +1879,74 @@ module ClaudeAgent
     end
   end
 
+  # Session runtime state transition (`"running"`, `"idle"`, `"requires_action"`).
+  # Frames with `sdk_host_only: true` are internal signals emitted when
+  # `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` is set and must be hidden from
+  # caller-visible message streams (`sdk_host_only_frame?`).
+  struct SessionStateChangedMessage < SystemMessage
+    getter state : String
+    getter? sdk_host_only : Bool = false
+    getter uuid : String? = nil
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @state : String,
+      @sdk_host_only : Bool = false,
+      @uuid : String? = nil,
+    )
+      super("session_state_changed", session_id, data)
+    end
+
+    def sdk_host_only_frame? : Bool
+      sdk_host_only?
+    end
+  end
+
+  # Durability failure notice emitted when the CLI could not persist transcript
+  # or global-config writes (e.g. `"ENOSPC"` / `"EDQUOT"`).
+  struct SessionWritesLostMessage < SystemMessage
+    getter uuid : String?
+    getter error_code : String
+    getter lost : Array(String)
+    getter transcript_session_ids : Array(String)?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @uuid : String?,
+      @error_code : String,
+      @lost : Array(String),
+      @transcript_session_ids : Array(String)? = nil,
+    )
+      super("session_writes_lost", session_id, data)
+    end
+  end
+
+  # Informational / notice / suggestion / warning system message emitted
+  # mid-stream (e.g. `tag: "hook_no_verdict"`).
+  struct InformationalMessage < SystemMessage
+    getter uuid : String?
+    getter content : String
+    getter level : String
+    getter tool_use_id : String?
+    getter prevent_continuation : Bool?
+    getter tag : String?
+
+    def initialize(
+      session_id : String,
+      data : MessageData,
+      @uuid : String?,
+      @content : String,
+      @level : String,
+      @tool_use_id : String? = nil,
+      @prevent_continuation : Bool? = nil,
+      @tag : String? = nil,
+    )
+      super("informational", session_id, data)
+    end
+  end
+
   # Subagent rate-limit retry info nested on `tool_progress` messages.
   struct SubagentRetryInfo
     include JSON::Serializable
@@ -1635,7 +1969,9 @@ module ClaudeAgent
     end
   end
 
-  # Long-running tool progress (top-level `type: "tool_progress"`).
+  # Long-running tool progress (top-level `type: "tool_progress"`). Also
+  # emitted periodically while waiting on long-running hooks (`tool_name` is
+  # the hook event name and `tool_use_id` starts with `"hook-"`).
   # Matches the TS SDK's `SDKToolProgressMessage` (with 0.3.214+ fields).
   struct ToolProgressMessage < Message
     include JSON::Serializable
@@ -1703,6 +2039,12 @@ module ClaudeAgent
     # | "unknown"). Matches TS SDK 0.3.246+.
     @[JSON::Field(key: "costBasis")]
     getter cost_basis : String?
+    # Ephemeral 5-minute TTL cache creation input tokens.
+    @[JSON::Field(key: "cacheCreationEphemeral5mInputTokens")]
+    getter cache_creation_ephemeral_5m_input_tokens : Int64?
+    # Ephemeral 1-hour TTL cache creation input tokens.
+    @[JSON::Field(key: "cacheCreationEphemeral1hInputTokens")]
+    getter cache_creation_ephemeral_1h_input_tokens : Int64?
 
     def initialize(
       @input_tokens : Int64 = 0,
@@ -1717,7 +2059,79 @@ module ClaudeAgent
       @provider : String? = nil,
       @thinking_tokens : Int64 = 0,
       @cost_basis : String? = nil,
+      @cache_creation_ephemeral_5m_input_tokens : Int64? = nil,
+      @cache_creation_ephemeral_1h_input_tokens : Int64? = nil,
     )
+    end
+  end
+
+  # Invalid config file metadata emitted on `ResultMessage` when
+  # `startup_failure_reason == "config_file_invalid"`.
+  struct InvalidConfigFile
+    include JSON::Serializable
+
+    getter path : String
+    @[JSON::Field(key: "is_global")]
+    getter? is_global : Bool
+    @[JSON::Field(key: "backup_searched")]
+    getter? backup_searched : Bool
+    getter backup_path : String?
+
+    def initialize(
+      @path : String,
+      @is_global : Bool,
+      @backup_searched : Bool,
+      @backup_path : String? = nil,
+    )
+    end
+
+    def backup_searched : Bool
+      @backup_searched
+    end
+
+    def self.from_any(value : JSON::Any) : InvalidConfigFile?
+      data = value.as_h?
+      return unless data
+
+      path = data["path"]?.try(&.as_s?)
+      is_global = bool_field(data, "is_global", "isGlobal")
+      backup_searched = bool_field(data, "backup_searched", "backupSearched")
+      return if path.nil? || is_global.nil? || backup_searched.nil?
+
+      new(
+        path: path,
+        is_global: is_global,
+        backup_searched: backup_searched,
+        backup_path: data["backup_path"]?.try(&.as_s?) || data["backupPath"]?.try(&.as_s?),
+      )
+    end
+
+    private def self.bool_field(data : MessageData, snake : String, camel : String) : Bool?
+      val = data[snake]?.try(&.as_bool?)
+      val = data[camel]?.try(&.as_bool?) if val.nil?
+      val
+    end
+  end
+
+  # Converter for `ResultMessage#invalid_config_file` supporting both snake_case
+  # and camelCase keys.
+  module InvalidConfigFileConverter
+    def self.from_json(pull : JSON::PullParser) : InvalidConfigFile?
+      if pull.kind.null?
+        pull.read_null
+        return
+      end
+
+      raw = JSON.parse(pull.read_raw)
+      InvalidConfigFile.from_any(raw) || pull.raise("Invalid invalid_config_file payload")
+    end
+
+    def self.to_json(value : InvalidConfigFile?, builder : JSON::Builder)
+      if val = value
+        val.to_json(builder)
+      else
+        builder.null
+      end
     end
   end
 
@@ -1791,6 +2205,34 @@ module ClaudeAgent
     "resume",
   }
 
+  # Known values of `ResultMessage#startup_failure_reason` (`SDKStartupFailureReason`).
+  # Open set for forward compatibility with newer CLI builds.
+  STARTUP_FAILURE_REASONS = Set{
+    "org_pin_api_key_conflict",
+    "provider_not_allowed",
+    "org_verify_failed",
+    "org_pin_mismatch",
+    "managed_settings_invalid",
+    "remote_settings_required_unavailable",
+    "gateway_signin_required",
+    "gateway_access_denied",
+    "proxy_invalid",
+    "temp_dir_unusable",
+    "cwd_unavailable",
+    "shell_tool_missing",
+    "session_held_by_background",
+    "worktree_resume_refused",
+    "worktree_unverified",
+    "cli_version_too_old",
+    "bypass_root",
+    "org_config_required_unavailable",
+    "org_config_refused",
+    "sandbox_required_unavailable",
+    "initialize_not_first",
+    "config_file_invalid",
+    "managed_settings_not_delivered",
+  }
+
   # Final result message
   struct ResultMessage < Message
     include JSON::Serializable
@@ -1799,12 +2241,13 @@ module ClaudeAgent
     getter uuid : String
     getter session_id : String
     getter subtype : String
-    # What triggered this result, forwarded from the originating message's
-    # `origin` field. Wire shape is a `{"kind": ...}` object (e.g.
-    # `{"kind": "human"}`, `{"kind": "task-notification"}`) — use
-    # `origin.try(&.kind)` or the `human?`/`task_notification?` predicates
-    # to distinguish user-prompted results from background-task followups.
-    # Absent on older CLIs. Matches the TS SDK's `origin` (0.2.126).
+    # Origin of the user message that triggered this turn — see `MessageOrigin`.
+    # Describes only what *started* the turn (e.g. `{"kind": "human"}` or
+    # `{"kind": "task-notification"}`). A prompt sent while an injected turn is
+    # running may be answered inside that turn, and the result then carries the
+    # injected turn's `origin`; send each prompt with a fresh `uuid` and match
+    # against `user_message_uuid` / `user_message_uuids` to find the result for
+    # a specific prompt. Absent on older CLIs.
     getter origin : MessageOrigin?
     getter result : String?
     getter cost_usd : Float64?
@@ -1871,6 +2314,28 @@ module ClaudeAgent
     getter request_sent_wall_ms : Int64?
     @[JSON::Field(key: "deferred_tool_use")]
     getter deferred_tool_use : DeferredToolUse?
+    # Reason a session/turn resumed (e.g. `"interrupted_turn"`).
+    getter resume_reason : String?
+    # Local slash command name when the turn did not enter the model loop.
+    getter local_command : String?
+    # Zero-based delivery index across results in a session.
+    getter result_index : Int32?
+    # ISO-8601 timestamp when the active session credential expires.
+    getter credential_expires_at : String?
+    # Structured reason when CLI startup failed (see `STARTUP_FAILURE_REASONS`).
+    getter startup_failure_reason : String?
+    # Invalid configuration file details when `startup_failure_reason == "config_file_invalid"`.
+    @[JSON::Field(converter: ClaudeAgent::InvalidConfigFileConverter)]
+    getter invalid_config_file : InvalidConfigFile?
+    getter first_stream_post_queue_wait_ms : Int64?
+    getter first_stream_post_queued_behind : String?
+    getter first_text_post_ms : Int64?
+    getter first_text_post_queue_wait_ms : Int64?
+    getter first_text_post_queued_behind : String?
+    getter first_text_post_wall_ms : Int64?
+    getter time_to_request_from_spawn_ms : Int64?
+    getter warm_spare_claimed : Bool?
+    getter time_origin_ms : Int64?
 
     # Parse a result envelope, dropping a malformed `origin` member
     # (treated as absent) instead of failing the whole message.
@@ -1956,6 +2421,14 @@ module ClaudeAgent
     # UUID of the user message that triggered this turn, linking a reply
     # to the message it answers. Matches TS SDK 0.3.246+.
     getter user_message_uuid : String?
+    # UUID of every user message this turn has taken in so far. Set on the
+    # first top-level non-ping event after the value is set or changes;
+    # nil on others. Matches Python #1505 / TS SDK.
+    getter user_message_uuids : Array(String)?
+    # Reason a session/turn resumed (e.g. `"interrupted_turn"`).
+    getter resume_reason : String?
+    # Time to first token in milliseconds when reported by the CLI.
+    getter ttft_ms : Int64?
   end
 
   # Control request from CLI to SDK (for SDK MCP server integration)

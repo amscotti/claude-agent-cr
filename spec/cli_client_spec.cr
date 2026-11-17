@@ -1,3 +1,4 @@
+require "file_utils"
 require "./spec_helper"
 
 # Test helper to access private methods for testing
@@ -1515,6 +1516,571 @@ describe "can_use_tool start validation (Python 0.2.140 parity)" do
     client = ClaudeAgent::CLIClient.new(options)
     expect_raises(ClaudeAgent::ConfigurationError, "cannot be used with permission_prompt_tool_name") do
       client.start
+    end
+  end
+end
+
+private def with_env(overrides : Hash(String, String?), &)
+  saved = {} of String => String?
+  overrides.each_key do |key|
+    saved[key] = ENV.has_key?(key) ? ENV[key] : nil
+  end
+  begin
+    overrides.each do |key, value|
+      if value.nil?
+        ENV.delete(key)
+      else
+        ENV[key] = value
+      end
+    end
+    yield
+  ensure
+    saved.each do |key, value|
+      if value.nil?
+        ENV.delete(key)
+      else
+        ENV[key] = value
+      end
+    end
+  end
+end
+
+private def with_temp_dir(&)
+  dir = File.join(Dir.tempdir, "cli-client-spec-#{Process.pid}-#{Random.rand(1_000_000)}")
+  Dir.mkdir_p(dir)
+  begin
+    yield dir
+  ensure
+    FileUtils.rm_rf(dir)
+  end
+end
+
+describe "CLIClient v0.11.0 parity" do
+  describe "#replace_sdk_servers" do
+    it "replaces active SDK MCP servers cleanly" do
+      s1 = ClaudeAgent::SDKMCPServer.new("one")
+      s2 = ClaudeAgent::SDKMCPServer.new("two")
+      options = ClaudeAgent::AgentOptions.new(
+        mcp_servers: {"one" => s1.as(ClaudeAgent::MCPServerConfig)},
+      )
+      client = ClaudeAgent::CLIClient.new(options)
+      client.sdk_server_names.should eq(["one"])
+      client.get_sdk_server("one").should be(s1)
+
+      client.replace_sdk_servers({"two" => s2})
+      client.sdk_server_names.should eq(["two"])
+      client.get_sdk_server("one").should be_nil
+      client.get_sdk_server("two").should be(s2)
+
+      client.replace_sdk_servers({} of String => ClaudeAgent::SDKMCPServer)
+      client.has_sdk_servers?.should be_false
+    end
+  end
+
+  describe "CLI args updates" do
+    it "omits --permission-mode when permission_mode is nil" do
+      args = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_cli_args
+      args.should_not contain("--permission-mode")
+    end
+
+    it "emits --permission-mode when permission_mode is explicitly set" do
+      options = ClaudeAgent::AgentOptions.new(permission_mode: ClaudeAgent::PermissionMode::Default)
+      args = TestableCLIClient.new(options).test_build_cli_args
+      idx = args.index("--permission-mode")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("default") if idx
+    end
+
+    it "emits --project-config-root= when project_config_root is set" do
+      options = ClaudeAgent::AgentOptions.new(project_config_root: "/trusted/repo")
+      args = TestableCLIClient.new(options).test_build_cli_args
+      args.should contain("--project-config-root=/trusted/repo")
+    end
+
+    it "omits --project-config-root when unset" do
+      args = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_cli_args
+      args.any?(&.starts_with?("--project-config-root")).should be_false
+    end
+
+    it "emits --system-prompt for SystemPromptCustom" do
+      options = ClaudeAgent::AgentOptions.new(
+        system_prompt: ClaudeAgent::SystemPromptCustom.new("Custom instructions", snapshot: false),
+      )
+      args = TestableCLIClient.new(options).test_build_cli_args
+      idx = args.index("--system-prompt")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("Custom instructions") if idx
+    end
+  end
+
+  describe "verbatim_prompts" do
+    it "stamps client_composed: true on outgoing user prompts when enabled" do
+      options = ClaudeAgent::AgentOptions.new(verbatim_prompts: true)
+      client = ClaudeAgent::CLIClient.new(options)
+      buffer = IO::Memory.new
+      client.set_input_for_test(buffer)
+
+      client.send_prompt("Check @/etc/passwd and /help")
+      parsed = JSON.parse(buffer.to_s.strip).as_h
+      parsed["client_composed"].as_bool.should be_true
+      parsed["message"]["content"].as_s.should eq("Check @/etc/passwd and /help")
+    end
+
+    it "omits client_composed by default" do
+      client = ClaudeAgent::CLIClient.new(ClaudeAgent::AgentOptions.new)
+      buffer = IO::Memory.new
+      client.set_input_for_test(buffer)
+
+      client.send_prompt("hello")
+      parsed = JSON.parse(buffer.to_s.strip).as_h
+      parsed.has_key?("client_composed").should be_false
+    end
+  end
+
+  describe "#build_env hardening and client_app" do
+    it "copies parent ENV while scrubbing CLAUDECODE and CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP" do
+      with_env({
+        "CLAUDECODE"                          => "1",
+        "CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP" => "outer-app/1.0",
+        "SPEC_INHERITED_VAR"                  => "inherited-val",
+      }) do
+        env = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_env
+        env.should_not be_nil
+        if env
+          env.has_key?("CLAUDECODE").should be_false
+          env.has_key?("CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP").should be_false
+          env["SPEC_INHERITED_VAR"]?.should eq("inherited-val")
+          env["CLAUDE_CODE_SDK_READS_SESSION_STATE"]?.should eq("1")
+          env["CLAUDE_CODE_SDK_READS_STARTUP_MARKS"]?.should eq("1")
+        end
+      end
+    end
+
+    it "respects case-insensitive overrides for session state and startup marks env vars" do
+      options = ClaudeAgent::AgentOptions.new(
+        env: {
+          "claude_code_sdk_reads_session_state" => "0",
+          "claude_code_sdk_reads_startup_marks" => "0",
+        },
+      )
+      env = TestableCLIClient.new(options).test_build_env
+      env.should_not be_nil
+      if env
+        env.has_key?("CLAUDE_CODE_SDK_READS_SESSION_STATE").should be_false
+        env.has_key?("CLAUDE_CODE_SDK_READS_STARTUP_MARKS").should be_false
+        env["claude_code_sdk_reads_session_state"]?.should eq("0")
+        env["claude_code_sdk_reads_startup_marks"]?.should eq("0")
+      end
+    end
+
+    it "applies client_app precedence: opts.client_app > options.env > ENV" do
+      with_env({"CLAUDE_AGENT_SDK_CLIENT_APP" => "from-parent"}) do
+        env_parent = TestableCLIClient.new(ClaudeAgent::AgentOptions.new).test_build_env
+        env_parent.try(&.["CLAUDE_AGENT_SDK_CLIENT_APP"]?).should eq("from-parent")
+
+        opts_env = ClaudeAgent::AgentOptions.new(
+          env: {"CLAUDE_AGENT_SDK_CLIENT_APP" => "from-options-env"},
+        )
+        env_from_opts_env = TestableCLIClient.new(opts_env).test_build_env
+        env_from_opts_env.try(&.["CLAUDE_AGENT_SDK_CLIENT_APP"]?).should eq("from-options-env")
+
+        opts_explicit = ClaudeAgent::AgentOptions.new(
+          client_app: "from-option/1.0",
+          env: {"CLAUDE_AGENT_SDK_CLIENT_APP" => "from-options-env"},
+        )
+        env_explicit = TestableCLIClient.new(opts_explicit).test_build_env
+        env_explicit.try(&.["CLAUDE_AGENT_SDK_CLIENT_APP"]?).should eq("from-option/1.0")
+      end
+    end
+
+    it "opts out when client_app or env CLAUDE_AGENT_SDK_CLIENT_APP is empty string" do
+      with_env({"CLAUDE_AGENT_SDK_CLIENT_APP" => "from-parent"}) do
+        opts = ClaudeAgent::AgentOptions.new(
+          client_app: "",
+          env: {"CLAUDE_AGENT_SDK_CLIENT_APP" => "from-options-env"},
+        )
+        env = TestableCLIClient.new(opts).test_build_env
+        env.try(&.has_key?("CLAUDE_AGENT_SDK_CLIENT_APP")).should be_false
+
+        opts_empty_env = ClaudeAgent::AgentOptions.new(
+          env: {"CLAUDE_AGENT_SDK_CLIENT_APP" => ""},
+        )
+        env2 = TestableCLIClient.new(opts_empty_env).test_build_env
+        env2.try(&.has_key?("CLAUDE_AGENT_SDK_CLIENT_APP")).should be_false
+      end
+    end
+
+    it "raises ConfigurationError when client_app contains chars above U+00FF" do
+      options = ClaudeAgent::AgentOptions.new(client_app: "my-app/\u{2603}")
+      client = TestableCLIClient.new(options)
+      expect_raises(ClaudeAgent::ConfigurationError, /exceeds U\+00FF/) do
+        client.test_build_env
+      end
+    end
+  end
+
+  describe "AgentDefinition and MCP server config serialization" do
+    it "serializes autoCompactWindow and omitClaudeMd in build_agents_json" do
+      agents = {
+        "worker" => ClaudeAgent::AgentDefinition.new(
+          description: "Worker",
+          prompt: "Do work",
+          auto_compact_window: 32_000,
+          omit_claude_md: true,
+        ),
+      }
+      parsed = JSON.parse(TestableCLIClient.new.test_build_agents_json(agents))["worker"]
+      parsed["autoCompactWindow"].as_i.should eq(32_000)
+      parsed["omitClaudeMd"].as_bool.should be_true
+    end
+
+    it "serializes timeout, alwaysLoad, and tools for external and SDK MCP servers" do
+      policy = ClaudeAgent::MCPServerToolPolicy.new(
+        name: "write_item",
+        permission_policy: "always_ask",
+        org_max_permission: "ask",
+      )
+      ext = ClaudeAgent::ExternalMCPServerConfig.http(
+        "https://mcp.example.com",
+        timeout: 12_000,
+        always_load: false,
+        tools: [policy],
+      )
+      sdk = ClaudeAgent::SDKMCPServer.new(
+        "inproc",
+        version: "1.5.0",
+        timeout: 5_000,
+        tool_policies: [policy],
+      )
+      servers = {
+        "ext" => ext.as(ClaudeAgent::MCPServerConfig),
+        "sdk" => sdk.as(ClaudeAgent::MCPServerConfig),
+      }
+      parsed = JSON.parse(TestableCLIClient.new.test_build_mcp_servers_json(servers))["mcpServers"]
+      parsed["ext"]["timeout"].as_i.should eq(12_000)
+      parsed["ext"]["alwaysLoad"].as_bool.should be_false
+      parsed["ext"]["tools"].as_a.first["permission_policy"].as_s.should eq("always_ask")
+      parsed["ext"]["tools"].as_a.first["org_max_permission"].as_s.should eq("ask")
+
+      parsed["sdk"]["timeout"].as_i.should eq(5_000)
+      parsed["sdk"]["tools"].as_a.first["name"].as_s.should eq("write_item")
+    end
+
+    it "raises ConfigurationError for reserved MCP server names" do
+      ClaudeAgent::RESERVED_MCP_SERVER_NAMES.each do |reserved|
+        servers = {
+          reserved => ClaudeAgent::ExternalMCPServerConfig.stdio("node").as(ClaudeAgent::MCPServerConfig),
+        }
+        expect_raises(ClaudeAgent::ConfigurationError, /reserved/) do
+          TestableCLIClient.new.test_build_mcp_servers_json(servers)
+        end
+      end
+    end
+  end
+
+  describe "fail-closed settings_path + sandbox merging" do
+    it "passes settings_path unchanged when neither sandbox nor workflow_size_guideline is set" do
+      options = ClaudeAgent::AgentOptions.new(settings_path: "/nonexistent/path/settings.json")
+      args = TestableCLIClient.new(options).test_build_cli_args
+      idx = args.index("--settings")
+      idx.should_not be_nil
+      args[idx.as(Int32) + 1].should eq("/nonexistent/path/settings.json") if idx
+    end
+
+    it "merges inline JSON settings with sandbox settings" do
+      existing = %({"permissions":{"allow":["Bash(ls:*)"]},"verbose":true})
+      sandbox = ClaudeAgent::SandboxSettings.new(enabled: true, excluded_commands: ["git"])
+      options = ClaudeAgent::AgentOptions.new(settings_path: existing, sandbox: sandbox)
+
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        parsed = JSON.parse(json)
+        parsed["permissions"]["allow"].as_a.map(&.as_s).should eq(["Bash(ls:*)"])
+        parsed["verbose"].as_bool.should be_true
+        parsed["sandbox"]["enabled"].as_bool.should be_true
+        parsed["sandbox"]["excludedCommands"].as_a.map(&.as_s).should eq(["git"])
+      end
+    end
+
+    it "resolves relative settings_path against cwd and strips UTF-8 BOM" do
+      with_temp_dir do |dir|
+        File.write(File.join(dir, "settings.json"), "\uFEFF" + %({"permissions":{"deny":["Bash"]}}))
+        options = ClaudeAgent::AgentOptions.new(
+          settings_path: "settings.json",
+          sandbox: ClaudeAgent::SandboxSettings.new(enabled: true),
+          cwd: dir,
+        )
+        json = TestableCLIClient.new.test_build_settings_json(options)
+        json.should_not be_nil
+        if json
+          parsed = JSON.parse(json)
+          parsed["permissions"]["deny"].as_a.map(&.as_s).should eq(["Bash"])
+          parsed["sandbox"]["enabled"].as_bool.should be_true
+        end
+      end
+    end
+
+    it "raises ConnectionError on missing, malformed, or non-object settings without leaking inline secrets" do
+      with_temp_dir do |dir|
+        File.write(File.join(dir, "bad.json"), "{not json")
+        File.write(File.join(dir, "arr.json"), "[1, 2]")
+
+        [
+          "missing.json",
+          ".",
+          "bad.json",
+          "arr.json",
+        ].each do |path|
+          opts = ClaudeAgent::AgentOptions.new(
+            settings_path: path,
+            sandbox: ClaudeAgent::SandboxSettings.new(enabled: true),
+            cwd: dir,
+          )
+          expect_raises(ClaudeAgent::ConnectionError, /settings/) do
+            TestableCLIClient.new.test_build_settings_json(opts)
+          end
+        end
+
+        inline_secret = %({"env":{"SECRET":"super-secret-token",}})
+        opts_inline = ClaudeAgent::AgentOptions.new(
+          settings_path: inline_secret,
+          sandbox: ClaudeAgent::SandboxSettings.new(enabled: true),
+        )
+        ex = expect_raises(ClaudeAgent::ConnectionError) do
+          TestableCLIClient.new.test_build_settings_json(opts_inline)
+        end
+        ex.message.to_s.should_not contain("super-secret-token")
+
+        unclosed_secret = %({"env":{"SECRET":"super-secret-token")
+        opts_unclosed = ClaudeAgent::AgentOptions.new(
+          settings_path: unclosed_secret,
+          sandbox: ClaudeAgent::SandboxSettings.new(enabled: true),
+        )
+        ex2 = expect_raises(ClaudeAgent::ConnectionError) do
+          TestableCLIClient.new.test_build_settings_json(opts_unclosed)
+        end
+        ex2.message.to_s.should_not contain("super-secret-token")
+      end
+    end
+
+    it "deep-merges sandbox restrictions, replaces ripgrep/tlsTerminate wholesale, and strips conflicting disabled/proxy ports" do
+      existing = {
+        "sandbox" => {
+          "filesystem" => {
+            "denyRead"  => ["/secret-a", "/shared"],
+            "denyWrite" => ["/out-a"],
+            "allowRead" => ["/base-read"],
+            "disabled"  => true,
+          },
+          "network" => {
+            "deniedDomains"  => ["bad-a.example.com"],
+            "httpProxyPort"  => 8080,
+            "socksProxyPort" => 1080,
+            "tlsTerminate"   => {"caCertPath" => "/old/ca.pem", "caKeyPath" => "/old/key.pem"},
+          },
+          "credentials" => {
+            "files"   => [{"path" => "~/.ssh/id_rsa", "mode" => "deny"}],
+            "envVars" => [{"name" => "SECRET_A", "mode" => "deny"}],
+          },
+          "ripgrep" => {"command" => "/old/rg", "args" => ["--hidden"]},
+        },
+      }.to_json
+
+      sandbox = ClaudeAgent::SandboxSettings.new(
+        enabled: true,
+        allow_nested_user_namespaces: true,
+        enable_weaker_network_isolation: true,
+        allow_apple_events: false,
+        ignore_violations: {"*" => ["/etc/hosts"]},
+        filesystem: ClaudeAgent::SandboxFilesystemSettings.new(
+          deny_read: ["/shared", "/secret-b"],
+          deny_write: ["/out-b"],
+        ),
+        network: ClaudeAgent::SandboxNetworkSettings.new(
+          allowed_domains: ["api.example.com"],
+          denied_domains: ["bad-a.example.com", "bad-b.example.com"],
+          tls_terminate: {"caCertPath" => JSON::Any.new("/new/ca.pem")},
+        ),
+        credentials: ClaudeAgent::SandboxCredentialsSettings.new(
+          files: [
+            ClaudeAgent::SandboxCredentialFile.new("~/.ssh/id_rsa"),
+            ClaudeAgent::SandboxCredentialFile.new("~/.aws/credentials"),
+          ],
+          env_vars: [
+            ClaudeAgent::SandboxCredentialEnvVar.new("SECRET_A"),
+            ClaudeAgent::SandboxCredentialEnvVar.new("SECRET_B"),
+          ],
+          aws_pairs: [JSON::Any.new({"accessKeyIdVar" => JSON::Any.new("AK"), "secretAccessKeyVar" => JSON::Any.new("SK")})],
+        ),
+        ripgrep: {"command" => JSON::Any.new("/new/rg")},
+      )
+
+      options = ClaudeAgent::AgentOptions.new(settings_path: existing, sandbox: sandbox)
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        sb = JSON.parse(json)["sandbox"]
+        sb["allowNestedUserNamespaces"].as_bool.should be_true
+        sb["enableWeakerNetworkIsolation"].as_bool.should be_true
+        sb["allowAppleEvents"].as_bool.should be_false
+        sb["ignoreViolations"]["*"].as_a.map(&.as_s).should eq(["/etc/hosts"])
+
+        fs = sb["filesystem"].as_h
+        fs["denyRead"].as_a.map(&.as_s).should eq(["/secret-a", "/shared", "/secret-b"])
+        fs["denyWrite"].as_a.map(&.as_s).should eq(["/out-a", "/out-b"])
+        fs["allowRead"].as_a.map(&.as_s).should eq(["/base-read"])
+        fs.has_key?("disabled").should be_false
+
+        net = sb["network"].as_h
+        net["deniedDomains"].as_a.map(&.as_s).should eq(["bad-a.example.com", "bad-b.example.com"])
+        net.has_key?("httpProxyPort").should be_false
+        net.has_key?("socksProxyPort").should be_false
+        net["tlsTerminate"].as_h.keys.should eq(["caCertPath"])
+        net["tlsTerminate"]["caCertPath"].as_s.should eq("/new/ca.pem")
+
+        creds = sb["credentials"].as_h
+        creds["files"].as_a.map(&.["path"].as_s).should eq(["~/.ssh/id_rsa", "~/.aws/credentials"])
+        creds["envVars"].as_a.map(&.["name"].as_s).should eq(["SECRET_A", "SECRET_B"])
+        creds["awsPairs"].as_a.size.should eq(1)
+
+        rg = sb["ripgrep"].as_h
+        rg.keys.should eq(["command"])
+        rg["command"].as_s.should eq("/new/rg")
+      end
+    end
+
+    it "preserves explicit proxy ports and explicit filesystem.disabled=true during merge" do
+      existing = {
+        "sandbox" => {
+          "filesystem" => {"disabled" => true},
+          "network"    => {"httpProxyPort" => 8080, "socksProxyPort" => 1080},
+        },
+      }.to_json
+
+      sandbox = ClaudeAgent::SandboxSettings.new(
+        filesystem: ClaudeAgent::SandboxFilesystemSettings.new(disabled: true),
+        network: ClaudeAgent::SandboxNetworkSettings.new(
+          strict_allowlist: true,
+          http_proxy_port: 9090,
+        ),
+      )
+
+      options = ClaudeAgent::AgentOptions.new(settings_path: existing, sandbox: sandbox)
+      json = TestableCLIClient.new.test_build_settings_json(options)
+      json.should_not be_nil
+      if json
+        sb = JSON.parse(json)["sandbox"]
+        sb["filesystem"]["disabled"].as_bool.should be_true
+        sb["network"]["httpProxyPort"].as_i.should eq(9090)
+        sb["network"].as_h.has_key?("socksProxyPort").should be_false
+      end
+    end
+  end
+
+  describe "CLI version check in #each_message" do
+    it "warns once per connection when claude_code_version is missing or < 2.0.0" do
+      with_env({"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK" => nil}) do
+        warnings = [] of String
+        options = ClaudeAgent::AgentOptions.new(
+          cli_path: "/opt/claude",
+          stderr: ->(line : String) { warnings << line; nil },
+        )
+        init_no_ver = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+        client = ClaudeAgent::CLIClient.new(options)
+        client.set_output_for_test(IO::Memory.new("#{init_no_ver}\n#{init_no_ver}\n"))
+        client.each_message { |_msg| }
+
+        warnings.size.should eq(1)
+        warnings.first.should contain("2.0.0")
+
+        warnings_old = [] of String
+        options_old = ClaudeAgent::AgentOptions.new(
+          cli_path: "/opt/claude",
+          stderr: ->(line : String) { warnings_old << line; nil },
+        )
+        init_old = {
+          "type"                => "system",
+          "subtype"             => "init",
+          "session_id"          => "s-1",
+          "claude_code_version" => "1.9.9",
+        }.to_json
+        client_old = ClaudeAgent::CLIClient.new(options_old)
+        client_old.set_output_for_test(IO::Memory.new("#{init_old}\n"))
+        client_old.each_message { |_msg| }
+
+        warnings_old.size.should eq(1)
+        warnings_old.first.should contain("1.9.9")
+      end
+    end
+
+    it "does not warn for >= 2.0.0 without verbatim_prompts, and checks >= 2.1.248 with verbatim_prompts" do
+      with_env({"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK" => nil}) do
+        warnings = [] of String
+        options_ok = ClaudeAgent::AgentOptions.new(
+          stderr: ->(line : String) { warnings << line; nil },
+        )
+        init_20 = {
+          "type"                => "system",
+          "subtype"             => "init",
+          "session_id"          => "s-1",
+          "claude_code_version" => "2.0.20",
+        }.to_json
+        client_ok = ClaudeAgent::CLIClient.new(options_ok)
+        client_ok.set_output_for_test(IO::Memory.new("#{init_20}\n"))
+        client_ok.each_message { |_msg| }
+        warnings.should be_empty
+
+        warnings_vp_old = [] of String
+        options_vp_old = ClaudeAgent::AgentOptions.new(
+          verbatim_prompts: true,
+          stderr: ->(line : String) { warnings_vp_old << line; nil },
+        )
+        init_21_247 = {
+          "type"                => "system",
+          "subtype"             => "init",
+          "session_id"          => "s-1",
+          "claude_code_version" => "2.1.247",
+        }.to_json
+        client_vp_old = ClaudeAgent::CLIClient.new(options_vp_old)
+        client_vp_old.set_output_for_test(IO::Memory.new("#{init_21_247}\n"))
+        client_vp_old.each_message { |_msg| }
+        warnings_vp_old.size.should eq(1)
+        warnings_vp_old.first.should contain("verbatim_prompts")
+        warnings_vp_old.first.should contain("2.1.248")
+
+        warnings_vp_ok = [] of String
+        options_vp_ok = ClaudeAgent::AgentOptions.new(
+          verbatim_prompts: true,
+          stderr: ->(line : String) { warnings_vp_ok << line; nil },
+        )
+        init_21_248 = {
+          "type"                => "system",
+          "subtype"             => "init",
+          "session_id"          => "s-1",
+          "claude_code_version" => "2.1.248",
+        }.to_json
+        client_vp_ok = ClaudeAgent::CLIClient.new(options_vp_ok)
+        client_vp_ok.set_output_for_test(IO::Memory.new("#{init_21_248}\n"))
+        client_vp_ok.each_message { |_msg| }
+        warnings_vp_ok.should be_empty
+      end
+    end
+
+    it "skips version check warnings when CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK is non-empty" do
+      with_env({"CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK" => "1"}) do
+        warnings = [] of String
+        options = ClaudeAgent::AgentOptions.new(
+          verbatim_prompts: true,
+          stderr: ->(line : String) { warnings << line; nil },
+        )
+        init_no_ver = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+        client = ClaudeAgent::CLIClient.new(options)
+        client.set_output_for_test(IO::Memory.new("#{init_no_ver}\n"))
+        client.each_message { |_msg| }
+
+        warnings.should be_empty
+      end
     end
   end
 end

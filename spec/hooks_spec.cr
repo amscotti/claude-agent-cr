@@ -457,4 +457,142 @@ describe ClaudeAgent::HookInput do
     input.agent_transcript_path.should eq("/tmp/a.jsonl")
     input.stop_hook_active.should be_true
   end
+
+  it "supports mcp_server, effort, duration_ms, last_assistant_message, background_tasks, and session_crons" do
+    provenance = ClaudeAgent::MCPServerProvenance.new("docs", "sdk")
+    effort = ClaudeAgent::HookEffort.new("high")
+    tasks = [
+      ClaudeAgent::BackgroundTaskSummary.new(
+        id: "t-1",
+        type: "shell",
+        status: "running",
+        description: "Run test suite",
+        command: "crystal spec",
+      ),
+    ]
+    crons = [
+      ClaudeAgent::SessionCronSummary.new(
+        id: "c-1",
+        schedule: "0 9 * * 1-5",
+        recurring: true,
+        prompt: "Check status",
+      ),
+    ]
+
+    input = ClaudeAgent::HookInput.new(
+      hook_event_name: "Stop",
+      mcp_server: provenance,
+      effort: effort,
+      duration_ms: 420_i64,
+      last_assistant_message: "All checks passed.",
+      background_tasks: tasks,
+      session_crons: crons,
+    )
+
+    input.mcp_server.should eq(provenance)
+    input.effort.try(&.level).should eq("high")
+    input.duration_ms.should eq(420_i64)
+    input.last_assistant_message.should eq("All checks passed.")
+    input.background_tasks.try(&.first.command).should eq("crystal spec")
+    input.session_crons.try(&.first.recurring?).should be_true
+
+    round_tripped = ClaudeAgent::HookInput.from_json(input.to_json)
+    round_tripped.mcp_server.try(&.name).should eq("docs")
+    round_tripped.effort.try(&.level).should eq("high")
+    round_tripped.duration_ms.should eq(420_i64)
+    round_tripped.last_assistant_message.should eq("All checks passed.")
+    round_tripped.background_tasks.try(&.size).should eq(1)
+    round_tripped.session_crons.try(&.first.schedule).should eq("0 9 * * 1-5")
+  end
+end
+
+describe "v0.11.0 Hook parity" do
+  it "supports on_failure on HookMatcher" do
+    matcher = ClaudeAgent::HookMatcher.new(matcher: "Bash", on_failure: "block")
+    matcher.on_failure.should eq("block")
+
+    default_matcher = ClaudeAgent::HookMatcher.new(matcher: "Read")
+    default_matcher.on_failure.should be_nil
+  end
+
+  it "includes all 33 HookEvent members" do
+    ClaudeAgent::HookEvent.values.size.should eq(33)
+    [
+      ClaudeAgent::HookEvent::PostToolBatch,
+      ClaudeAgent::HookEvent::UserPromptExpansion,
+      ClaudeAgent::HookEvent::StopFailure,
+      ClaudeAgent::HookEvent::PostCompact,
+      ClaudeAgent::HookEvent::PreModelSwitch,
+      ClaudeAgent::HookEvent::PostModelSwitch,
+      ClaudeAgent::HookEvent::PermissionDenied,
+      ClaudeAgent::HookEvent::Setup,
+      ClaudeAgent::HookEvent::TaskCreated,
+      ClaudeAgent::HookEvent::WorktreeCreate,
+      ClaudeAgent::HookEvent::WorktreeRemove,
+      ClaudeAgent::HookEvent::InstructionsLoaded,
+      ClaudeAgent::HookEvent::CwdChanged,
+      ClaudeAgent::HookEvent::FileChanged,
+    ].each do |event|
+      ClaudeAgent::HookEvent.values.should contain(event)
+    end
+  end
+
+  it "accepts both Array(HookMatcher) and Array(HookCallback) on non-tool and new HookConfig events" do
+    cb = ->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+      ClaudeAgent::HookResult.allow
+    }
+    matcher = ClaudeAgent::HookMatcher.new(hooks: [cb], on_failure: "block")
+
+    config = ClaudeAgent::HookConfig.new(
+      user_prompt_submit: [matcher],
+      session_start: [cb],
+      post_tool_batch: [matcher],
+      user_prompt_expansion: [cb],
+      stop_failure: [cb],
+      post_compact: [cb],
+      pre_model_switch: [matcher],
+      post_model_switch: [cb],
+      permission_denied: [matcher],
+      setup: [cb],
+      task_created: [cb],
+      worktree_create: [cb],
+      worktree_remove: [cb],
+      instructions_loaded: [cb],
+      cwd_changed: [cb],
+      file_changed: [cb],
+    )
+
+    config.user_prompt_submit.should be_a(Array(ClaudeAgent::HookMatcher))
+    config.session_start.should be_a(Array(ClaudeAgent::HookCallback))
+    config.permission_denied.should be_a(Array(ClaudeAgent::HookMatcher))
+    config.file_changed.try(&.size).should eq(1)
+  end
+
+  it "serializes new HookSpecificOutput fields with expected camelCase wire keys" do
+    output = ClaudeAgent::HookSpecificOutput.new(
+      hook_event_name: "SessionStart",
+      session_title: "Investigate flaky spec",
+      initial_user_message: "Start with spec/hooks_spec.cr",
+      watch_paths: ["/tmp/a", "/tmp/b"],
+      reload_skills: true,
+      retry: false,
+      worktree_path: "/tmp/wt-1",
+    )
+
+    parsed = JSON.parse(output.to_json).as_h
+    parsed["sessionTitle"].as_s.should eq("Investigate flaky spec")
+    parsed["initialUserMessage"].as_s.should eq("Start with spec/hooks_spec.cr")
+    parsed["watchPaths"].as_a.map(&.as_s).should eq(["/tmp/a", "/tmp/b"])
+    parsed["reloadSkills"].as_bool.should be_true
+    parsed["retry"].as_bool.should be_false
+    parsed["worktreePath"].as_s.should eq("/tmp/wt-1")
+
+    restored = ClaudeAgent::HookSpecificOutput.from_json(output.to_json)
+    restored.session_title.should eq("Investigate flaky spec")
+    restored.initial_user_message.should eq("Start with spec/hooks_spec.cr")
+    restored.watch_paths.should eq(["/tmp/a", "/tmp/b"])
+    restored.reload_skills.should be_true
+    restored.retry.should be_false
+    restored.worktree_path.should eq("/tmp/wt-1")
+  end
 end

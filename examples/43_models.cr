@@ -15,6 +15,13 @@ options = ClaudeAgent::AgentOptions.new(
 
 puts "Known model constants (subset):"
 [
+  ClaudeAgent::Models::OPUS_5_5,
+  ClaudeAgent::Models::SONNET_5_5,
+  ClaudeAgent::Models::HAIKU_5_5,
+  ClaudeAgent::Models::FABLE_5_2,
+  ClaudeAgent::Models::FABLE_5_1,
+  ClaudeAgent::Models::MYTHOS_5_2,
+  ClaudeAgent::Models::MYTHOS_5_1,
   ClaudeAgent::Models::SONNET_5,
   ClaudeAgent::Models::OPUS_5,
   ClaudeAgent::Models::FABLE_5,
@@ -40,6 +47,7 @@ ClaudeAgent::AgentClient.open(options) do |client|
       caps << "effort" if model.supports_effort?
       caps << "adaptive_thinking" if model.supports_adaptive_thinking?
       caps << "fast_mode" if model.supports_fast_mode?
+      caps << "auto_mode" if model.supports_auto_mode?
       suffix = caps.empty? ? "" : " (#{caps.join(", ")})"
       puts "  #{model.value}#{suffix}"
     end

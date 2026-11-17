@@ -16,33 +16,33 @@ This library provides a programmatic interface to the [Claude Code](https://code
 *   **External MCP Servers**: Connect to external MCP servers (stdio, HTTP, SSE transports).
 *   **Runtime MCP Management**: `set_mcp_servers`, `enable_mcp_channel`, and `reload_plugins` to mutate the session without restarting the subprocess.
 *   **Preset Types**: Type-safe presets for system prompts and tools to prevent typos.
-*   **System Prompt Options**: Inline strings, `SystemPromptPreset` (with `exclude_dynamic_sections` for cache-friendly prompts), or `SystemPromptFile` loaded from disk.
+*   **System Prompt Options**: Inline strings, `SystemPromptPreset` (with `exclude_dynamic_sections` and `snapshot`), `SystemPromptCustom`, or `SystemPromptFile` loaded from disk.
 *   **Type-Safe Schemas**: Crystal's answer to Zod - generate JSON schemas from types.
 *   **Structured Outputs**: Get validated JSON responses matching your schema.
-*   **Dynamic Controls**: Change model and permission mode live, inspect MCP status, stop tasks, `get_context_usage`, `prompt_suggestion`.
+*   **Dynamic Controls**: Change model, permission mode, and thinking budget/display (`set_max_thinking_tokens`) live, inspect MCP status, stop tasks, `get_context_usage`, `prompt_suggestion`, `rename_session`.
 *   **Skills**: Enable SDK-managed skill access (`"all"` or a named list) with automatic `setting_sources` defaults.
 *   **Task Budgets**: API-side token budget awareness via `task_budget` so the model paces tool use.
-*   **Server Info**: Access CLI initialization metadata like commands, models, and output styles.
-*   **Subagents**: Define specialized agents with rich fields (`disallowed_tools`, `memory`, `initial_prompt`, `max_turns`, `background`, `effort`, `permission_mode`, per-agent `mcp_servers`).
-*   **Hooks & Permissions**: Granular control over what the agent is allowed to do with full hook support (PreToolUse, PostToolUse, PreCompact, Notification, TeammateIdle, TaskCompleted, ConfigChange, etc.).
-*   **Permission Modes**: `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk`.
-*   **Session Management**: Resume, fork, delete, and continue conversations with precise message-level resume.
-*   **Session History & Subagents**: List saved sessions, fork a session branch (`fork_session`), list subagents (`list_subagents`), read subagent transcripts (`get_subagent_messages`), delete sessions (`delete_session`).
+*   **Server Info**: Access CLI initialization metadata like commands, models, output styles, `capabilities`, `plugin_errors`, `mcp_server_infos`, `view_mode`, and `startup_timing`.
+*   **Subagents**: Define specialized agents with rich fields (`disallowed_tools`, `memory`, `initial_prompt`, `max_turns`, `background`, `effort`, `permission_mode`, `auto_compact_window`, `omit_claude_md`, per-agent `mcp_servers`).
+*   **Hooks & Permissions**: Granular control over what the agent is allowed to do across all 33 `HookEvent`s (`PreToolUse`, `PostToolUse`, `PostToolBatch`, `StopFailure`, `PostCompact`, `PreModelSwitch`, `PostModelSwitch`, `PermissionDenied`, `Setup`, `TaskCreated`, `WorktreeCreate`/`WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`, etc.) with `HookMatcher#on_failure`, `HookEntryList`, and rich `PermissionContext`.
+*   **Permission Modes**: `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk` (defaults to `nil` so the CLI resolves from settings).
+*   **Session Management**: Resume, fork, delete, archive/unarchive, and continue conversations with precise message-level resume.
+*   **Session History & Subagents**: List saved sessions, archive/unarchive sessions (`archive_session`, `unarchive_session`), fork a session branch (`fork_session`), list subagents (`list_subagents`), read subagent transcripts (`get_subagent_messages`), delete sessions (`delete_session`).
 *   **SessionStore**: Mirror transcripts to external storage (`InMemorySessionStore`, `FileSessionStore`, or a custom adapter). Live CLI `--session-mirror` via `TranscriptMirrorBatcher`; resume materialization from the store; `SessionStoreConformance` suite for adapter authors.
-*   **Models**: Free-form model strings plus `ClaudeAgent::Models::*` convenience constants (Sonnet/Opus/Haiku 4.x–5.x, Fable, Mythos — no `claude-mythos-preview`).
-*   **Tool Output Helpers**: Optional parsers for Bash / Agent / Skill / NotebookEdit / MCP resource / WebSearch tool results (`BuiltinTools` name constants).
-*   **Transcript Controls**: `should_query: false` to append user messages without triggering a turn; `include_system_messages` on `get_session_messages`.
-*   **Debug / Telemetry**: `debug` / `debug_file` CLI flags; always stamp `CLAUDE_AGENT_SDK_VERSION` on the subprocess.
+*   **Models**: Free-form model strings plus `ClaudeAgent::Models::*` convenience constants (Sonnet/Opus/Haiku 4.x–5.5, Fable 5/5.1/5.2, Mythos 5/5.1/5.2 — no `claude-mythos-preview`).
+*   **Tool Output Helpers**: Optional parsers for Bash / Agent / Skill / NotebookEdit / MCP resource / WebSearch / OfferChromeSetup tool results (`BuiltinTools` 54 canonical constants + `LEGACY_TOOL_NAME_ALIASES`).
+*   **Transcript Controls**: `should_query: false` to append user messages without triggering a turn; `verbatim_prompts` to send `client_composed: true` verbatim text; `include_system_messages` on `get_session_messages`.
+*   **Debug / Telemetry**: `debug` / `debug_file` CLI flags; `client_app` attribution; always stamp `CLAUDE_AGENT_SDK_VERSION` on the subprocess.
 *   **File Checkpointing**: Track and rewind file changes, plus `rewind_conversation` to truncate the transcript itself.
-*   **Sandbox Support**: Configure sandboxed execution environments, including credential masking/denial via `sandbox.credentials`.
+*   **Sandbox Support**: Configure sandboxed execution environments (`SandboxFilesystemSettings`, `SandboxNetworkSettings#tls_terminate`, `SandboxCredentialsSettings#aws_pairs`, fail-closed `settings_path` + `sandbox` merging).
 *   **Managed Settings**: Pass policy-tier settings to the CLI in-memory via `managed_settings` (honored below IT-controlled managed sources).
 *   **Subagent Streaming**: `forward_subagent_text` streams subagent text deltas into the SDK message stream.
 *   **Plugin Configs**: `PluginConfig` with per-plugin `skip_mcp_discovery` for hosts that manage a plugin's MCP connections themselves.
 *   **Extended Thinking**: `ThinkingConfig.adaptive` / `enabled` / `disabled` (with `display` support for `"summarized"` / `"omitted"` thinking blocks), plus fine-grained `effort` tiers (`Low`, `Medium`, `High`, `Xhigh`, `Max`) — `xhigh` is the default Claude Code tier for Opus 4.7.
 *   **Pre-warming**: `ClaudeAgent.startup` spins up the CLI subprocess ahead of the first query.
 *   **Tracing**: Automatic W3C trace context propagation (`TRACEPARENT` / `TRACESTATE`) when present in the caller's environment.
-*   **Streaming**: Real-time message streaming using Crystal's native fibers.
-*   **Type Safety**: Fully typed message and event structures, including `TaskUpdatedMessage` (with `TERMINAL_TASK_STATUSES`), `tool_use_meta` sidecar, `stop_details`/`refusal?`, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, and `MirrorErrorMessage`, with graceful handling of unknown content types.
+*   **Streaming**: Real-time message streaming using Crystal's native fibers, with `session_state_changed` idle tracking and `sdk_host_only` frame filtering.
+*   **Type Safety**: Fully typed message and event structures, including `TaskUpdatedMessage` (with `TERMINAL_TASK_STATUSES`), `tool_use_meta` sidecar, `stop_details`/`refusal?`, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`, `SessionStateChangedMessage`, `SessionWritesLostMessage`, and `InformationalMessage`, with graceful handling of unknown content types.
 
 ## Prerequisites
 
@@ -59,7 +59,7 @@ This library provides a programmatic interface to the [Claude Code](https://code
     dependencies:
       claude-agent-cr:
         github: amscotti/claude-agent-cr
-        version: ~> 0.10.0
+        version: ~> 0.11.0
     ```
 
 2.  Run `shards install`
@@ -315,6 +315,13 @@ them to an enum. Common IDs (and convenience constants under
 
 | Constant | Model ID | Notes |
 | --- | --- | --- |
+| `Models::OPUS_5_5` | `claude-opus-5-5` | Claude 5.5 Opus |
+| `Models::SONNET_5_5` | `claude-sonnet-5-5` | Claude 5.5 Sonnet |
+| `Models::HAIKU_5_5` | `claude-haiku-5-5` | Claude 5.5 Haiku |
+| `Models::FABLE_5_2` | `claude-fable-5-2` | Claude 5.2 Fable |
+| `Models::FABLE_5_1` | `claude-fable-5-1` | Claude 5.1 Fable |
+| `Models::MYTHOS_5_2` | `claude-mythos-5-2` | Claude 5.2 Mythos |
+| `Models::MYTHOS_5_1` | `claude-mythos-5-1` | Claude 5.1 Mythos |
 | `Models::SONNET_5` | `claude-sonnet-5` | Claude 5 Sonnet |
 | `Models::OPUS_5` | `claude-opus-5` | Claude 5 Opus |
 | `Models::FABLE_5` | `claude-fable-5` | Claude 5 Fable (`Models::FABLE` → `"fable"` alias) |
@@ -324,7 +331,7 @@ them to an enum. Common IDs (and convenience constants under
 | `Models::OPUS_4_6` | `claude-opus-4-6` | Opus 4.6 |
 | `Models::OPUS_4_5` | `claude-opus-4-5` | Opus 4.5 |
 | `Models::SONNET_4_6` | `claude-sonnet-4-6` | Sonnet 4.6 |
-| `Models::SONNET_4_5` | `claude-sonnet-4-5` | Sonnet 4.5 |
+| `Models::SONNET_4_5` | `claude-sonnet-4-5` | Sonnet 4.5 (deprecated upstream; EOL Nov 30, 2026) |
 | `Models::HAIKU_4_5` | `claude-haiku-4-5` | Haiku 4.5 (good fallback) |
 
 ```crystal
@@ -581,23 +588,23 @@ end
 
 ### Hooks
 
-Intercept tool usage to block or modify actions. All hook inputs include common context fields (`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`) plus event-specific fields. The SDK supports all hook events:
+Intercept tool usage to block or modify actions. All hook inputs include common context fields (`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`) plus event-specific fields. The SDK supports all 33 `HookEvent`s (including the core events below plus `MessageDisplay`, `DirectoryAdded`, `PostToolBatch`, `UserPromptExpansion`, `StopFailure`, `PostCompact`, `PreModelSwitch`, `PostModelSwitch`, `PermissionDenied`, `Setup`, `TaskCreated`, `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, and `FileChanged`):
 
 | Event | Event-Specific Fields |
 |-------|----------------------|
-| **PreToolUse** | `tool_name`, `tool_input`, `tool_use_id` |
-| **PostToolUse** | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response` |
-| **PostToolUseFailure** | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt` |
-| **PermissionRequest** | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions` |
+| **PreToolUse** | `tool_name`, `tool_input`, `tool_use_id`, `mcp_server` |
+| **PostToolUse** | `tool_name`, `tool_input`, `tool_use_id`, `tool_result`/`tool_response`, `duration_ms`, `mcp_server` |
+| **PostToolUseFailure** | `tool_name`, `tool_input`, `tool_use_id`, `error`, `is_interrupt`, `duration_ms`, `mcp_server` |
+| **PermissionRequest** | `tool_name`, `tool_input`, `tool_use_id`, `permission_suggestions`, `mcp_server` |
 | **Elicitation** | `mcp_server_name`, `elicitation_message`, `elicitation_mode`, `elicitation_url`, `elicitation_id`, `requested_schema` |
 | **ElicitationResult** | `mcp_server_name`, `elicitation_action`, `elicitation_content`, `elicitation_id` |
 | **PreCompact** | `trigger`, `custom_instructions` |
 | **Notification** | `notification_message`, `notification_title`, `notification_type` |
 | **UserPromptSubmit** | `user_prompt` |
-| **Stop** | `stop_hook_active` |
+| **Stop** | `stop_hook_active`, `last_assistant_message`, `background_tasks`, `session_crons` |
 | **SubagentStart** | `agent_id`, `agent_type` |
-| **SubagentStop** | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active` |
-| **SessionStart** | `source` ("startup", "resume", "clear", "compact") |
+| **SubagentStop** | `agent_id`, `agent_type`, `agent_transcript_path`, `stop_hook_active`, `last_assistant_message`, `background_tasks`, `session_crons` |
+| **SessionStart** | `source` ("startup", "resume", "clear", "compact", "fork") |
 | **SessionEnd** | `session_end_reason` ("clear", "logout", etc.) |
 | **TeammateIdle** | `agent_id`, `agent_type` — background agent is idle and available |
 | **TaskCompleted** | `task_id`, `task_status`, `task_summary`, `tool_use_id` |
@@ -606,7 +613,7 @@ Intercept tool usage to block or modify actions. All hook inputs include common 
 For local hook callbacks, `permission_mode` is normalized to the CLI-style values such as
 `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, and `dontAsk`.
 
-`HookMatcher` also supports an optional `timeout` value in seconds for control-protocol hook registrations.
+`HookMatcher` also supports an optional `timeout` in seconds and `on_failure` (`"continue"` or `"block"`), and `HookConfig` accepts either `HookMatcher` arrays or bare `HookCallback` arrays (`HookEntryList`) for every event.
 
 ```crystal
 # Block 'rm' commands (PreToolUse with tool_use_id)
@@ -919,9 +926,11 @@ end
 info = ClaudeAgent.get_session_info("session-uuid-here", directory: Dir.current)
 puts info.try(&.summary)
 
-# Rename or tag a session
+# Rename, tag, or archive a session
 ClaudeAgent.rename_session("session-uuid-here", "Refactor investigation", directory: Dir.current)
 ClaudeAgent.tag_session("session-uuid-here", "experiment", directory: Dir.current)
+ClaudeAgent.archive_session("session-uuid-here", directory: Dir.current)
+ClaudeAgent.unarchive_session("session-uuid-here", directory: Dir.current)
 
 # Clear a tag
 ClaudeAgent.tag_session("session-uuid-here", nil, directory: Dir.current)
@@ -1301,8 +1310,7 @@ options = ClaudeAgent::AgentOptions.new(
   skills: "all",                                       # or ["git", "playwright"]
 
   # --- Permissions ---------------------------------------------------------
-  permission_mode: ClaudeAgent::PermissionMode::AcceptEdits,
-  # Other modes: Default, Plan, BypassPermissions, Auto, DontAsk
+  permission_mode: nil,                                # defaults to nil (CLI chooses); or AcceptEdits, Default, Plan, BypassPermissions, Auto, DontAsk
   allow_dangerously_skip_permissions: false,
   permission_prompt_tool_name: nil,                    # delegate prompts to a tool
   can_use_tool: nil,                                   # PermissionCallback
@@ -1355,6 +1363,8 @@ options = ClaudeAgent::AgentOptions.new(
   # --- CLI / environment ---------------------------------------------------
   cli_path: nil,                                       # override discovery
   env: {"CLAUDE_AGENT_TRACING" => "1"},
+  client_app: "my-app/1.0.0",                          # CLAUDE_AGENT_SDK_CLIENT_APP
+  project_config_root: nil,                            # --project-config-root=... for worktree cwd
   betas: ["extended-thinking-2025-01-24"],
   add_dirs: ["./vendor"],
   # Plugins accept bare paths OR PluginConfig entries:
@@ -1366,6 +1376,7 @@ options = ClaudeAgent::AgentOptions.new(
   user: "alice",
   stderr: ->(line : String) { STDERR.puts(line) },     # observe CLI stderr
   max_buffer_size: nil,                                # override stream buffer
+  verbatim_prompts: false,                             # stamp client_composed: true on user prompts
 
   # --- Settings sources ----------------------------------------------------
   setting_sources: ["user", "project"],                # [] disables all
@@ -1397,8 +1408,9 @@ end
 
 ## Status
 
-> Developed against Claude Code CLI **v2.1.220**, with SDK-surface parity through
-> Python `0.2.152` / TypeScript `0.3.263`. The SDK is forward-compatible:
+> SDK-surface parity through Python `0.2.182` / TypeScript `0.3.325` (CLI
+> **v2.1.325** wire surface; live-tested against CLI v2.1.220 with newer wire
+> shapes covered by canned-payload specs). The SDK is forward-compatible:
 > features that require newer CLI versions are gracefully no-op or surface a
 > clear error on older CLIs.
 
@@ -1420,25 +1432,25 @@ Refer to the dedicated [Deployment Guide](DEPLOYMENT.md) for:
 | External MCP Servers | ✅ Working | Stdio, HTTP, and SSE transports |
 | Runtime MCP Management | ✅ Working | `set_mcp_servers`, `enable_mcp_channel`, `reload_plugins` |
 | Schema Builder | ✅ Working | Type-safe JSON schema generation |
-| Hooks | ✅ Working | PreToolUse, PostToolUse, PreCompact, Notification, TeammateIdle, TaskCompleted, ConfigChange, and more |
+| Hooks | ✅ Working | All 33 `HookEvent`s, `HookEntryList`, `HookMatcher#on_failure` handshake validation |
 | V2 Streaming | ✅ Working | Send/receive patterns |
-| Subagents | ✅ Working | Rich `AgentDefinition` fields for specialized agents |
+| Subagents | ✅ Working | Rich `AgentDefinition` fields (`auto_compact_window`, `omit_claude_md`, etc.) |
 | Structured Outputs | ✅ Working | JSON schema validation |
-| Session Management | ✅ Working | Resume, fork, continue, resume_session_at, delete |
-| Session Fork / Subagent Transcripts | ✅ Working | `fork_session`, `list_subagents`, `get_subagent_messages`, `delete_session` |
-| Dynamic Controls | ✅ Working | Model, permissions, MCP status, flag settings, remote control, proactive mode, session titles, `get_context_usage`, `prompt_suggestion` |
-| Permission Modes | ✅ Working | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk` |
+| Session Management | ✅ Working | Resume, fork, continue, resume_session_at, archive/unarchive, delete |
+| Session Fork / Subagent Transcripts | ✅ Working | `fork_session` (compaction-aware + non-UUID cutoffs), `list_subagents`, `get_subagent_messages` (`isMeta`), `delete_session` |
+| Dynamic Controls | ✅ Working | Model, permissions, `set_max_thinking_tokens`, MCP status, flag settings, remote control, proactive mode, `rename_session`, `get_context_usage`, `prompt_suggestion` |
+| Permission Modes | ✅ Working | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`, `dontAsk` (defaults to `nil`) |
 | Skills | ✅ Working | `"all"` or a named list; auto-injects `Skill`/`Skill(name)` and default setting sources |
 | Task Budgets | ✅ Working | `task_budget` + `title` options |
-| System Prompt Variants | ✅ Working | Strings, `SystemPromptPreset` (with `exclude_dynamic_sections`), and `SystemPromptFile` |
-| Server Info | ✅ Working | Access initialization metadata like commands and output styles |
-| Rich Event Messages | ✅ Working | Typed init/task/rate-limit/prompt-suggestion/elicitation events, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`, and unknown-message fallback |
-| Hook Propagation | ✅ Working | Hook callbacks can modify inputs and return CLI hook outputs |
-| Permission Propagation | ✅ Working | Permission callbacks can update input, permissions, interrupt; context now exposes `tool_use_id`, `agent_id`, `blocked_path` |
-| Session History | ✅ Working | List, inspect, rename, and tag local sessions |
+| System Prompt Variants | ✅ Working | Strings, `SystemPromptPreset` (`exclude_dynamic_sections` + `snapshot`), `SystemPromptCustom`, and `SystemPromptFile` |
+| Server Info | ✅ Working | Initialization metadata (`commands`, `models`, `capabilities`, `plugin_errors`, `mcp_server_infos`, `view_mode`, `startup_timing`) |
+| Rich Event Messages | ✅ Working | Typed init/task/rate-limit/prompt-suggestion/elicitation events, `ApiRetryMessage`, `MemoryRecallMessage`, `StatusMessage`, `MirrorErrorMessage`, `SessionStateChangedMessage`, `SessionWritesLostMessage`, `InformationalMessage`, and unknown-message fallback |
+| Hook Propagation | ✅ Working | Hook callbacks can modify inputs and return CLI hook outputs (`session_title`, `watch_paths`, `reload_skills`, `retry`, `worktree_path`, etc.) |
+| Permission Propagation | ✅ Working | Permission callbacks can update input, permissions, interrupt; `PermissionContext` includes `mcp_server`, `matched_ask_rule`, `decision_reason_type`/`code`, and prompt hints |
+| Session History | ✅ Working | List, inspect, rename, tag, archive, and unarchive local sessions |
 | SessionStore | ✅ Working | InMemory + File adapters, live `--session-mirror`, resume materialize, conformance suite |
-| Models helpers | ✅ Working | `ClaudeAgent::Models::*` constants; free-form model strings |
-| Tool output helpers | ✅ Working | Bash/Agent/Skill/Notebook/MCP resource/WebSearch parsers |
+| Models helpers | ✅ Working | `ClaudeAgent::Models::*` constants (4.x–5.5, Fable, Mythos); free-form model strings |
+| Tool output helpers | ✅ Working | Bash/Agent/Skill/Notebook/MCP resource/WebSearch/OfferChromeSetup parsers; 54 `BuiltinTools` + `LEGACY_TOOL_NAME_ALIASES` |
 | File Checkpointing | ✅ Working | Track and rewind file changes |
 | Sandbox Configuration | ✅ Working | Full sandbox settings support |
 | Extended Thinking | ✅ Working | `thinking` (adaptive/enabled/disabled), `effort` (including `xhigh`), `max_thinking_tokens` |
@@ -1501,6 +1513,45 @@ delta events such as `content_block_delta` and `input_json_delta` when the CLI
 emits them.
 
 ## Changelog
+
+### 0.11.0
+
+Parity release covering the official Python SDK (`0.2.153`–`0.2.182+`) and TypeScript SDK (`0.3.264`–`0.3.325`) wire surface (CLI **v2.1.325**). Newer wire shapes are verified via canned-payload specs alongside unit coverage across options, control protocol, hooks, permissions, and sessions.
+
+**Behavior changes** (read before upgrading):
+- **`AgentOptions#permission_mode` defaults to `nil`**: `--permission-mode` is omitted from CLI argv unless explicitly configured, letting Claude Code resolve the starting mode from settings or provider defaults. Pass `PermissionMode::Default` explicitly to force manual prompting.
+- **`set_mcp_servers` control wire key fixed**: `ControlSetMcpServersRequest` and `AgentClient#set_mcp_servers` now send `"servers"` instead of `"mcpServers"` (matching the CLI control protocol; `ControlSetMcpServersRequest#mcp_servers` remains as a getter alias). Server names matching `RESERVED_MCP_SERVER_NAMES` raise `ConfigurationError`.
+- **Fail-closed `settings_path` + `sandbox` merge**: when `sandbox` or `workflow_size_guideline` is set alongside `settings_path`, relative paths resolve against `cwd`, UTF-8 BOMs are stripped, `sandbox` is deep-merged (union-deduping restriction arrays such as `denyRead`/`denyWrite`/`deniedDomains`/`files`/`envVars`, replacing `ripgrep`/`tlsTerminate`, stripping inherited proxy ports when allow/deny rules require it, and clearing `filesystem.disabled` when filesystem/credential rules are present), and file/JSON/non-object errors raise `ConnectionError` without leaking inline JSON contents.
+- **`HookMatcher#on_failure` fail-closed handshake**: setting `on_failure: "block"` (or anything other than `nil`/`"continue"`) requires `hook_on_failure_supported: true` on `initialize`/`reinitialize` and `hooks_applied != false` on `start`, raising `ConnectionError` otherwise.
+- **`delete_session` retry and error propagation**: removing the sibling `<projectDir>/<sessionId>` directory now retries up to 3 attempts with backoff (`50ms * attempt`) and propagates `File::Error` on final failure instead of silently ignoring errors.
+
+**New features**:
+- **Models**:
+  - Added `ClaudeAgent::Models` constants `OPUS_5_5`, `SONNET_5_5`, `HAIKU_5_5`, `FABLE_5_2`, `FABLE_5_1`, `MYTHOS_5_2`, `MYTHOS_5_1` (keeping `claude-mythos-preview` omitted; `SONNET_4_5` marked deprecated upstream).
+  - `ServerModelInfo` adds `resolved_model` and `supports_auto_mode?` / `supports_auto_mode`.
+- **Options, CLI, Sandbox & MCP**:
+  - Added `AgentOptions#verbatim_prompts` (`"client_composed": true` on outgoing user messages + CLI `< 2.1.248` init warning), `client_app` (`CLAUDE_AGENT_SDK_CLIENT_APP` precedence, Latin-1 validation, and stripping inherited `CLAUDE_AGENT_SDK_DERIVED_CLIENT_APP` / `CLAUDECODE`), and `project_config_root` (`--project-config-root=`).
+  - Added `SystemPromptPreset#snapshot` and `SystemPromptCustom` (`systemPromptSnapshot` in `initialize` + `--system-prompt` CLI flag).
+  - Extended `AgentDefinition` with `auto_compact_window` (`autoCompactWindow`) and `omit_claude_md` (`omitClaudeMd`).
+  - Extended `ExternalMCPServerConfig` (`timeout`, `always_load`, `tools`) and `SDKMCPServer` (`timeout`, `tool_policies`, `build_manifest`), plus `MCPServerToolPolicy` (`name`, `permission_policy`, `org_max_permission`) and `RESERVED_MCP_SERVER_NAMES` / `ClaudeAgent.validate_mcp_server_name!`.
+  - Extended sandbox types: `SandboxFilesystemSettings`, `SandboxIgnoreViolationsConverter` (command-pattern `SandboxIgnoreViolationsMap` alongside legacy `{file, network}`), `SandboxNetworkSettings#tls_terminate`, `SandboxCredentialsSettings#aws_pairs`, and `SandboxSettings#allow_nested_user_namespaces` / `#enable_weaker_network_isolation` / `#allow_apple_events` / `#filesystem` / `#ripgrep`.
+  - `CLIClient` now injects `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` and `CLAUDE_CODE_SDK_READS_STARTUP_MARKS=1` unless already set, and performs a once-per-connection `claude_code_version` check on init (bypassed with `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK`).
+- **Messages, ServerInfo & Tool Outputs**:
+  - Added `SessionStateChangedMessage` (`subtype == "session_state_changed"`, `sdk_host_only_frame?`), `SessionWritesLostMessage`, and `InformationalMessage` (`uuid`, `content`, `level`, `tool_use_id`, `prevent_continuation`, `tag`); frames where `sdk_host_only_frame?` is `true` are filtered across `AgentClient#each_response`, `ClaudeAgent.query`, `QueryIterator`, and `StreamingSession`.
+  - Extended `ServerInfo` with `capabilities`, `plugin_errors` (`ServerPluginError`), `mcp_server_infos` (`ServerMcpServerInfo`, `mcp_server_named?`), `api_key_source`, `betas`, `uuid`, `view_mode`, `startup_timing`, `ServerCommand#aliases`/`#builtin`, `FAST_MODE_STATES`, `FAST_MODE_DISABLED_REASONS`, and matching convenience forwarders on `InitMessage`.
+  - Extended `ResultMessage` with `InvalidConfigFile` (`invalid_config_file`), `STARTUP_FAILURE_REASONS`, `startup_failure_reason`, `resume_reason`, `local_command`, `result_index`, `credential_expires_at`, and queue/stream timing metrics; `ModelUsage` adds 5m/1h ephemeral cache creation token fields.
+  - Extended `RateLimitInfo` (`overage_enabled`, `overage_in_use`, `is_using_overage`, `surpassed_threshold`, `limit_scope`), `AssistantMessage` (`user_message_uuids`, `resume_reason`, `supersedes`, `agent_id`, `usage_report`), `StreamEvent` (`user_message_uuids`, `resume_reason`, `ttft_ms`), `ConversationResetMessage` (`trigger`, `user_message_uuid`, `timestamp`), `UserMessage` (`agent_id`, `subagent_type`, `task_description`, `pasted_content`, `inline_pastes`), task lifecycle messages (`run_id`, `parent_task_id`, `subagent_type`, `reason`), `MessageOrigin` (`fire_reason`, `run_id`), `CommandLifecycleMessage` (`wakeup_source`, `scheduled_for`), and `CompactMetadata` (`post_tokens`, `duration_ms`, `preserved_segment`, `preserved_messages`).
+  - Expanded `BuiltinTools` to all 54 canonical built-in tool constants (`BUILTIN_TOOL_NAMES`, preserving legacy aliases in `LEGACY_TOOL_NAME_ALIASES`), added `OfferChromeSetupOutput`, and updated `BashToolOutput` (`background_ends_with_final_response`, `background_wakes_owner`) and `AgentToolCompletedOutput` (`tools_used`, `usage`, `tool_stats`, `worktree_path`, `worktree_branch`).
+- **Control Protocol, Client, Hooks & Permissions**:
+  - Expanded `HookEvent` to all 33 events (`PostToolBatch`, `UserPromptExpansion`, `StopFailure`, `PostCompact`, `PreModelSwitch`, `PostModelSwitch`, `PermissionDenied`, `Setup`, `TaskCreated`, `WorktreeCreate`, `WorktreeRemove`, `InstructionsLoaded`, `CwdChanged`, `FileChanged`) and widened `HookConfig` to `HookEntryList` (`Array(HookMatcher) | Array(HookCallback)`) on every event.
+  - Added `HookEffort`, `BackgroundTaskSummary`, `SessionCronSummary`, `HookInput` (`mcp_server`, `effort`, `duration_ms`, `last_assistant_message`, `background_tasks`, `session_crons`), and `HookSpecificOutput` (`session_title`, `initial_user_message`, `watch_paths`, `reload_skills`, `retry`, `worktree_path`).
+  - Extended `PermissionContext` and `ControlPermissionRequest` (`MCPServerProvenance`, `MatchedAskRule`, `decision_reason_type`, `decision_reason_code`, `server_policy_ask_only`, `classifier_approvable`, `suppress_always_allow_rule`, `default_to_no`, `requires_user_interaction`, `server_prompt`), plus `ElicitationRequest` / `ControlElicitationRequest` (`property_order`, `title`, `display_name`, `description`).
+  - `AgentClient` adds `session_state_changed` idle tracking bounded by `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (`600_000` ms default), `keep_alive` `startup_mark` initialize timeout extension, `pending_permission_requests` / `pending_elicitation_requests` replay on `initialize`/`reinitialize`, `sdkMcpServerConfigs` / `sdkMcpServerManifests`, `set_max_thinking_tokens` (`OMITTED` sentinel vs explicit `nil` + `thinking_display`), `reload_plugins` (`hold_on_cache_impact`, `add_plugins`, `refuse_if_busy`), `get_mcp_status(live_reply:)`, `get_context_usage(detail:)`, `rename_session(title, source:, session_id:)`, typed `MCPServerConfig` overloads on `set_mcp_servers`, and `ControlError` (`error_code` on control responses).
+- **Sessions & Resume**:
+  - Added `ClaudeAgent.archive_session` / `unarchive_session` (persisting `<projectDir>/<sessionId>/archived.json` with auto-unarchive detection on newer user/queued prompts) and `SDKSessionInfo#archived`.
+  - Updated `get_session_messages` / `get_session_messages_from_store` to recover orphaned parallel tool calls/results (`recover_orphaned_parallel_tool_results`), retain queued user prompts, and select active branches past trailing `isMeta`/local-command leaves; `get_subagent_messages` now includes `isMeta: true` entries.
+  - Updated `fork_session` to accept non-UUID `up_to_message_id` (`uuid` or `delivery_id`) and handle compaction-aware slicing (`compact_boundary` / `isCompactSummary`).
+  - Updated `SessionResume.copy_auth_files` to copy legacy `.config.json` (when `.claude.json` is absent) and OAuth-suffixed config files (`.claude-staging-oauth.json`, `.claude-local-oauth.json`, `.claude-custom-oauth.json`).
 
 ### 0.10.0
 

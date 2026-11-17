@@ -214,6 +214,13 @@ describe ClaudeAgent::ServerInfo do
   end
 
   it "exposes ClaudeAgent::Models string constants without restricting AgentOptions" do
+    ClaudeAgent::Models::OPUS_5_5.should eq("claude-opus-5-5")
+    ClaudeAgent::Models::SONNET_5_5.should eq("claude-sonnet-5-5")
+    ClaudeAgent::Models::HAIKU_5_5.should eq("claude-haiku-5-5")
+    ClaudeAgent::Models::FABLE_5_2.should eq("claude-fable-5-2")
+    ClaudeAgent::Models::FABLE_5_1.should eq("claude-fable-5-1")
+    ClaudeAgent::Models::MYTHOS_5_2.should eq("claude-mythos-5-2")
+    ClaudeAgent::Models::MYTHOS_5_1.should eq("claude-mythos-5-1")
     ClaudeAgent::Models::SONNET_5.should eq("claude-sonnet-5")
     ClaudeAgent::Models::OPUS_5.should eq("claude-opus-5")
     ClaudeAgent::Models::FABLE_5.should eq("claude-fable-5")
@@ -225,12 +232,187 @@ describe ClaudeAgent::ServerInfo do
     ClaudeAgent::Models::OPUS_4_5.should eq("claude-opus-4-5")
     ClaudeAgent::Models::SONNET_4_6.should eq("claude-sonnet-4-6")
     ClaudeAgent::Models::SONNET_4_5.should eq("claude-sonnet-4-5")
+    ClaudeAgent::Models::SONNET_4_5_20250929.should eq("claude-sonnet-4-5-20250929")
     ClaudeAgent::Models::HAIKU_4_5.should eq("claude-haiku-4-5")
 
+    # Ensure claude-mythos-preview remains strictly omitted.
+    {% begin %}
+      {{ ClaudeAgent::Models.constants.stringify }}.includes?("PREVIEW").should be_false
+    {% end %}
+
     # Free-form String model field still accepts arbitrary IDs.
-    opts = ClaudeAgent::AgentOptions.new(model: ClaudeAgent::Models::OPUS_4_7)
-    opts.model.should eq("claude-opus-4-7")
+    opts = ClaudeAgent::AgentOptions.new(model: ClaudeAgent::Models::OPUS_5_5)
+    opts.model.should eq("claude-opus-5-5")
     opts2 = ClaudeAgent::AgentOptions.new(model: "custom-internal-model")
     opts2.model.should eq("custom-internal-model")
+  end
+
+  it "parses ServerCommand aliases and builtin flag" do
+    data = {
+      "commands" => JSON::Any.new([
+        JSON::Any.new({
+          "name"         => JSON::Any.new("review"),
+          "description"  => JSON::Any.new("Review code"),
+          "argumentHint" => JSON::Any.new("[path]"),
+          "aliases"      => JSON::Any.new([JSON::Any.new("rev"), JSON::Any.new("code-review")]),
+          "builtin"      => JSON::Any.new(true),
+        }),
+        JSON::Any.new({
+          "name"    => JSON::Any.new("custom-cmd"),
+          "builtin" => JSON::Any.new(false),
+        }),
+        JSON::Any.new({
+          "name" => JSON::Any.new("legacy-cmd"),
+        }),
+      ]),
+    }
+
+    info = ClaudeAgent::ServerInfo.from_data(data)
+    info.commands.size.should eq(3)
+
+    first = info.commands[0]
+    first.aliases.should eq(["rev", "code-review"])
+    first.builtin.should be_true
+    first.builtin?.should be_true
+
+    second = info.commands[1]
+    second.aliases.should be_nil
+    second.builtin.should be_false
+    second.builtin?.should be_false
+
+    third = info.commands[2]
+    third.aliases.should be_nil
+    third.builtin.should be_nil
+    third.builtin?.should be_false
+  end
+
+  it "parses ServerModelInfo resolved_model and supports_auto_mode from camel and snake keys" do
+    data = {
+      "models" => JSON::Any.new([
+        JSON::Any.new({
+          "value"            => JSON::Any.new("default"),
+          "resolvedModel"    => JSON::Any.new("claude-opus-5-5"),
+          "supportsAutoMode" => JSON::Any.new(true),
+        }),
+        JSON::Any.new({
+          "value"              => JSON::Any.new("haiku"),
+          "resolved_model"     => JSON::Any.new("claude-haiku-5-5"),
+          "supports_auto_mode" => JSON::Any.new(false),
+        }),
+        JSON::Any.new({
+          "value" => JSON::Any.new("legacy"),
+        }),
+      ]),
+    }
+
+    info = ClaudeAgent::ServerInfo.from_data(data)
+    info.models.size.should eq(3)
+
+    info.models[0].resolved_model.should eq("claude-opus-5-5")
+    info.models[0].supports_auto_mode?.should be_true
+    info.models[0].supports_auto_mode.should be_true
+
+    info.models[1].resolved_model.should eq("claude-haiku-5-5")
+    info.models[1].supports_auto_mode?.should be_false
+    info.models[1].supports_auto_mode.should be_false
+
+    info.models[2].resolved_model.should be_nil
+    info.models[2].supports_auto_mode?.should be_nil
+  end
+
+  it "parses capabilities, plugin_errors, mcp_server_infos, api_key_source, betas, uuid, view_mode, startup_timing" do
+    data = {
+      "uuid"         => JSON::Any.new("init-uuid-1"),
+      "apiKeySource" => JSON::Any.new("ANTHROPIC_API_KEY"),
+      "betas"        => JSON::Any.new([JSON::Any.new("interleaved-thinking-2025-05-14")]),
+      "capabilities" => JSON::Any.new([
+        JSON::Any.new("interrupt_receipt_v1"),
+        JSON::Any.new("reload_plugins_refuse_if_busy_v1"),
+      ]),
+      "viewMode"      => JSON::Any.new("focus"),
+      "startupTiming" => JSON::Any.new({"total_ms" => JSON::Any.new(42_i64)}),
+      "mcp_servers"   => JSON::Any.new([
+        JSON::Any.new({
+          "name"   => JSON::Any.new("github"),
+          "status" => JSON::Any.new("connected"),
+          "source" => JSON::Any.new("plugin"),
+        }),
+        JSON::Any.new({
+          "name"   => JSON::Any.new("local-tools"),
+          "status" => JSON::Any.new("failed"),
+        }),
+      ]),
+      "plugin_errors" => JSON::Any.new([
+        JSON::Any.new({
+          "plugin"          => JSON::Any.new("bad@marketplace"),
+          "type"            => JSON::Any.new("manifest-validation-error"),
+          "message"         => JSON::Any.new("Invalid plugin.json"),
+          "path"            => JSON::Any.new("/plugins/bad"),
+          "install_command" => JSON::Any.new("claude plugin install bad@marketplace"),
+          "managed_lock"    => JSON::Any.new({
+            "plugin_enabled" => JSON::Any.new(true),
+            "name"           => JSON::Any.new("bad"),
+            "marketplace"    => JSON::Any.new("marketplace"),
+          }),
+        }),
+        JSON::Any.new({"plugin" => JSON::Any.new("incomplete-error")}),
+      ]),
+    }
+
+    info = ClaudeAgent::ServerInfo.from_data(data)
+
+    info.uuid.should eq("init-uuid-1")
+    info.api_key_source.should eq("ANTHROPIC_API_KEY")
+    info.betas.should eq(["interleaved-thinking-2025-05-14"])
+    info.capabilities.should eq(["interrupt_receipt_v1", "reload_plugins_refuse_if_busy_v1"])
+    info.view_mode.should eq("focus")
+    info.startup_timing.try(&.["total_ms"].as_i64).should eq(42_i64)
+
+    # Raw mcp_servers preserved alongside typed mcp_server_infos.
+    info.mcp_servers.size.should eq(2)
+    info.mcp_server_infos.size.should eq(2)
+    info.mcp_server_infos[0].name.should eq("github")
+    info.mcp_server_infos[0].status.should eq("connected")
+    info.mcp_server_infos[0].source.should eq("plugin")
+    info.mcp_server_infos[1].name.should eq("local-tools")
+    info.mcp_server_infos[1].source.should be_nil
+    info.mcp_server_named?("github").try(&.status).should eq("connected")
+    info.mcp_server_named?("missing").should be_nil
+
+    # Malformed plugin_errors entries without type/message are ignored.
+    info.plugin_errors.size.should eq(1)
+    err = info.plugin_errors.first
+    err.plugin.should eq("bad@marketplace")
+    err.type.should eq("manifest-validation-error")
+    err.message.should eq("Invalid plugin.json")
+    err.path.should eq("/plugins/bad")
+    err.install_command.should eq("claude plugin install bad@marketplace")
+    err.managed_lock.try(&.["plugin_enabled"].as_bool).should be_true
+  end
+
+  it "supports snake_case fallbacks and defaults for new ServerInfo fields and exposes fast-mode sets" do
+    snake = ClaudeAgent::ServerInfo.from_data({
+      "api_key_source" => JSON::Any.new("none"),
+      "view_mode"      => JSON::Any.new("default"),
+      "startup_timing" => JSON::Any.new({"init_ms" => JSON::Any.new(10_i64)}),
+    })
+    snake.api_key_source.should eq("none")
+    snake.view_mode.should eq("default")
+    snake.startup_timing.try(&.["init_ms"].as_i64).should eq(10_i64)
+
+    empty = ClaudeAgent::ServerInfo.from_data({} of String => JSON::Any)
+    empty.capabilities.should be_empty
+    empty.plugin_errors.should be_empty
+    empty.mcp_server_infos.should be_empty
+    empty.betas.should be_empty
+    empty.api_key_source.should be_nil
+    empty.uuid.should be_nil
+    empty.view_mode.should be_nil
+    empty.startup_timing.should be_nil
+
+    ClaudeAgent::FAST_MODE_STATES.should eq(Set{"off", "cooldown", "on"})
+    ClaudeAgent::FAST_MODE_DISABLED_REASONS.should contain("sdk_opt_in_required")
+    ClaudeAgent::FAST_MODE_DISABLED_REASONS.should contain("model_not_allowed")
+    ClaudeAgent::FAST_MODE_DISABLED_REASONS.size.should eq(10)
   end
 end

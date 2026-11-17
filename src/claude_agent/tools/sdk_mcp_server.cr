@@ -1,9 +1,47 @@
 require "json"
 require "./sdk_tool"
 require "../errors"
+require "../version"
 require "../types/control_messages"
 
 module ClaudeAgent
+  # Reserved JavaScript Object.prototype property names rejected as MCP server
+  # names to match upstream TypeScript SDK / CLI validation.
+  RESERVED_MCP_SERVER_NAMES = Set{
+    "__proto__",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+  }
+
+  # Validate an MCP server name, raising `ConfigurationError` if it is reserved.
+  def self.validate_mcp_server_name!(name : String) : Nil
+    if RESERVED_MCP_SERVER_NAMES.includes?(name)
+      raise ConfigurationError.new(
+        "Invalid MCP server name #{name.inspect}: reserved property names are not allowed.",
+      )
+    end
+  end
+
+  # Per-tool permission policy for an MCP server.
+  # Matches TypeScript `McpServerToolPolicy`: wire keys are snake_case
+  # (`permission_policy`, `org_max_permission`).
+  struct MCPServerToolPolicy
+    include JSON::Serializable
+
+    property name : String
+    property permission_policy : String? = nil
+    property org_max_permission : String? = nil
+
+    def initialize(
+      @name : String,
+      @permission_policy : String? = nil,
+      @org_max_permission : String? = nil,
+    )
+    end
+  end
+
   # SDK MCP Server - defines tools that run in-process
   #
   # This implements the control protocol used by the official Claude Code SDKs.
@@ -43,13 +81,21 @@ module ClaudeAgent
     getter name : String
     getter version : String
     getter tools : Array(SDKTool)
+    getter timeout : Int32?
+    getter tool_policies : Array(MCPServerToolPolicy)?
 
     # MCP protocol version we support
     # Updated to 2025-03-26 to match official Claude Code SDKs
     # See: https://github.com/modelcontextprotocol/typescript-sdk/issues/378
     PROTOCOL_VERSION = "2025-03-26"
 
-    def initialize(@name : String, @version : String = "1.0.0", @tools : Array(SDKTool) = [] of SDKTool)
+    def initialize(
+      @name : String,
+      @version : String = "1.0.0",
+      @tools : Array(SDKTool) = [] of SDKTool,
+      @timeout : Int32? = nil,
+      @tool_policies : Array(MCPServerToolPolicy)? = nil,
+    )
     end
 
     def add_tool(tool : SDKTool)
@@ -210,6 +256,110 @@ module ClaudeAgent
       raise Error.new("Tool not found: #{tool_name}") unless found_tool
       found_tool.call(args)
     end
+
+    # Build an in-process startup manifest by running internal `initialize` and
+    # `tools/list` JSON-RPC calls. Returns `{"initializeResult" => ..., "toolsListResult" => ...}`
+    # (omitting any tool whose `input_schema` serialization fails, invoking `logger` if provided).
+    def build_manifest(logger : Proc(String, Nil)? = nil) : Hash(String, JSON::Any)
+      manifest = {} of String => JSON::Any
+
+      init_result = capture_initialize_manifest(logger)
+      return manifest unless init_result
+
+      manifest["initializeResult"] = init_result
+      handle_jsonrpc(JSONRPCMessage.new(method: "notifications/initialized"))
+
+      if tools_list = capture_tools_list_manifest(init_result, logger)
+        manifest["toolsListResult"] = tools_list
+      end
+
+      manifest
+    end
+
+    private def capture_initialize_manifest(logger : Proc(String, Nil)?) : JSON::Any?
+      init_response = handle_jsonrpc(
+        JSONRPCMessage.new(
+          method: "initialize",
+          id: JSON::Any.new("manifest-initialize"),
+          params: {
+            "protocolVersion" => JSON::Any.new(PROTOCOL_VERSION),
+            "capabilities"    => JSON::Any.new({} of String => JSON::Any),
+            "clientInfo"      => JSON::Any.new({
+              "name"    => JSON::Any.new("claude-agent-cr"),
+              "version" => JSON::Any.new(VERSION),
+            }),
+          },
+        )
+      )
+      init_result = init_response.result
+      if init_response.error || init_result.nil?
+        logger.try(&.call(
+          "SDK MCP server #{@name.inspect} initialize failed during manifest capture: " \
+          "#{init_response.error.try(&.message) || "missing result"}",
+        ))
+        return
+      end
+
+      init_result
+    end
+
+    private def capture_tools_list_manifest(
+      init_result : JSON::Any,
+      logger : Proc(String, Nil)?,
+    ) : JSON::Any?
+      capabilities = init_result.as_h?.try(&.["capabilities"]?.try(&.as_h?))
+      tools_cap = capabilities.try(&.["tools"]?)
+      return if tools_cap.nil? || tools_cap.raw.nil?
+
+      tools_response = handle_jsonrpc(
+        JSONRPCMessage.new(
+          method: "tools/list",
+          id: JSON::Any.new("manifest-tools-list"),
+        )
+      )
+      tools_result = tools_response.result
+      if tools_response.error || tools_result.nil?
+        logger.try(&.call(
+          "SDK MCP server #{@name.inspect} tools/list failed during manifest capture: " \
+          "#{tools_response.error.try(&.message) || "missing result"}",
+        ))
+        return
+      end
+
+      tools_hash = tools_result.as_h?
+      return unless tools_hash
+
+      next_cursor = tools_hash["nextCursor"]?
+      return if next_cursor && !next_cursor.raw.nil?
+
+      sanitize_tools_list_result(tools_hash, logger)
+    end
+
+    private def sanitize_tools_list_result(
+      tools_hash : Hash(String, JSON::Any),
+      logger : Proc(String, Nil)?,
+    ) : JSON::Any
+      tools = tools_hash["tools"]?.try(&.as_a?)
+      return JSON::Any.new(tools_hash) unless tools
+
+      valid_tools = [] of JSON::Any
+      tools.each do |entry|
+        tool_name = entry.as_h?.try(&.["name"]?.try(&.as_s?)) || "<unknown>"
+        begin
+          entry.to_json
+          valid_tools << entry
+        rescue ex
+          logger.try(&.call(
+            "Tool #{tool_name.inspect} on SDK MCP server #{@name.inspect} was omitted from " \
+            "the manifest because its input_schema serialization failed: #{ex.message}",
+          ))
+        end
+      end
+
+      sanitized = tools_hash.dup
+      sanitized["tools"] = JSON::Any.new(valid_tools)
+      JSON::Any.new(sanitized)
+    end
   end
 
   # Helper to create SDK MCP servers
@@ -217,7 +367,15 @@ module ClaudeAgent
     name : String,
     version : String = "1.0.0",
     tools : Array(SDKTool) = [] of SDKTool,
+    timeout : Int32? = nil,
+    tool_policies : Array(MCPServerToolPolicy)? = nil,
   ) : SDKMCPServer
-    SDKMCPServer.new(name, version, tools)
+    SDKMCPServer.new(
+      name: name,
+      version: version,
+      tools: tools,
+      timeout: timeout,
+      tool_policies: tool_policies,
+    )
   end
 end

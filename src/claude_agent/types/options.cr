@@ -50,6 +50,18 @@ module ClaudeAgent
     property effort : JSON::Any?
     @[JSON::Field(key: "permissionMode")]
     property permission_mode : String?
+    # Token count at which this subagent auto-compacts its own conversation
+    # (only lowers the inherited window; ignored on main session agent).
+    @[JSON::Field(key: "autoCompactWindow")]
+    property auto_compact_window : Int32? = nil
+    # Exclude user/project/local CLAUDE.md files from subagent context
+    # (managed policy files still load; ignored on main session agent).
+    @[JSON::Field(key: "omitClaudeMd")]
+    property omit_claude_md : Bool? = nil
+
+    def omit_claude_md? : Bool?
+      @omit_claude_md
+    end
 
     def initialize(
       @description : String,
@@ -66,6 +78,8 @@ module ClaudeAgent
       @background : Bool? = nil,
       @effort : JSON::Any? = nil,
       @permission_mode : String? = nil,
+      @auto_compact_window : Int32? = nil,
+      @omit_claude_md : Bool? = nil,
     )
     end
   end
@@ -148,6 +162,8 @@ module ClaudeAgent
     # hosts (TS SDK 0.3.219 / Claude Code v2.1.219).
     @[JSON::Field(key: "strictAllowlist")]
     property? strict_allowlist : Bool?
+    @[JSON::Field(key: "tlsTerminate")]
+    property tls_terminate : Hash(String, JSON::Any)? = nil
 
     def initialize(
       @allow_local_binding : Bool = false,
@@ -160,11 +176,12 @@ module ClaudeAgent
       @allow_managed_domains_only : Bool? = nil,
       @allow_mach_lookup : Array(String)? = nil,
       @strict_allowlist : Bool? = nil,
+      @tls_terminate : Hash(String, JSON::Any)? = nil,
     )
     end
   end
 
-  # Sandbox violation patterns to ignore
+  # Sandbox violation patterns to ignore (legacy `{file, network}` shape).
   struct SandboxIgnoreViolations
     include JSON::Serializable
     property file : Array(String)?
@@ -173,6 +190,71 @@ module ClaudeAgent
     def initialize(
       @file : Array(String)? = nil,
       @network : Array(String)? = nil,
+    )
+    end
+  end
+
+  # Command-pattern map for sandbox `ignoreViolations`
+  # (e.g. `{"*" => ["/etc/hosts"]}`).
+  alias SandboxIgnoreViolationsMap = Hash(String, Array(String))
+
+  # JSON converter supporting both command-pattern maps and the legacy
+  # `{file, network}` `SandboxIgnoreViolations` struct.
+  module SandboxIgnoreViolationsConverter
+    def self.from_json(pull : JSON::PullParser) : (SandboxIgnoreViolationsMap | SandboxIgnoreViolations)?
+      if pull.kind.null?
+        pull.read_null
+        return
+      end
+
+      raw = JSON.parse(pull.read_raw).as_h
+      if !raw.empty? && raw.keys.all? { |key| key == "file" || key == "network" }
+        SandboxIgnoreViolations.from_json(raw.to_json)
+      else
+        result = SandboxIgnoreViolationsMap.new
+        raw.each do |pattern, entries|
+          result[pattern] = entries.as_a.map(&.as_s)
+        end
+        result
+      end
+    end
+
+    def self.to_json(value : SandboxIgnoreViolationsMap | SandboxIgnoreViolations, builder : JSON::Builder) : Nil
+      value.to_json(builder)
+    end
+  end
+
+  # Filesystem access restrictions for sandboxed commands.
+  struct SandboxFilesystemSettings
+    include JSON::Serializable
+
+    @[JSON::Field(key: "allowWrite")]
+    property allow_write : Array(String)? = nil
+    @[JSON::Field(key: "denyWrite")]
+    property deny_write : Array(String)? = nil
+    @[JSON::Field(key: "denyRead")]
+    property deny_read : Array(String)? = nil
+    @[JSON::Field(key: "allowRead")]
+    property allow_read : Array(String)? = nil
+    @[JSON::Field(key: "allowManagedReadPathsOnly")]
+    property allow_managed_read_paths_only : Bool? = nil
+    property disabled : Bool? = nil
+
+    def allow_managed_read_paths_only? : Bool?
+      @allow_managed_read_paths_only
+    end
+
+    def disabled? : Bool?
+      @disabled
+    end
+
+    def initialize(
+      @allow_write : Array(String)? = nil,
+      @deny_write : Array(String)? = nil,
+      @deny_read : Array(String)? = nil,
+      @allow_read : Array(String)? = nil,
+      @allow_managed_read_paths_only : Bool? = nil,
+      @disabled : Bool? = nil,
     )
     end
   end
@@ -220,11 +302,14 @@ module ClaudeAgent
     # Defaults to false; only enable for trusted-network test fixtures.
     @[JSON::Field(key: "allowPlaintextInject")]
     property? allow_plaintext_inject : Bool?
+    @[JSON::Field(key: "awsPairs")]
+    property aws_pairs : Array(JSON::Any)? = nil
 
     def initialize(
       @files : Array(SandboxCredentialFile)? = nil,
       @env_vars : Array(SandboxCredentialEnvVar)? = nil,
       @allow_plaintext_inject : Bool? = nil,
+      @aws_pairs : Array(JSON::Any)? = nil,
     )
     end
   end
@@ -237,7 +322,8 @@ module ClaudeAgent
     property excluded_commands : Array(String)?
     property? allow_unsandboxed_commands : Bool = false
     property network : SandboxNetworkSettings?
-    property ignore_violations : SandboxIgnoreViolations?
+    @[JSON::Field(converter: ClaudeAgent::SandboxIgnoreViolationsConverter)]
+    property ignore_violations : (SandboxIgnoreViolationsMap | SandboxIgnoreViolations)? = nil
     property? enable_weaker_nested_sandbox : Bool = false
     # Credential file/env-var denial (or masking) for sandboxed commands.
     # Matches the TS SDK's `sandbox.credentials` (0.3.187 / 0.3.199).
@@ -247,6 +333,26 @@ module ClaudeAgent
     # safer default) or silently fall back to running unsandboxed (false).
     @[JSON::Field(key: "failIfUnavailable")]
     property? fail_if_unavailable : Bool = true
+    @[JSON::Field(key: "allowNestedUserNamespaces")]
+    property allow_nested_user_namespaces : Bool? = nil
+    @[JSON::Field(key: "enableWeakerNetworkIsolation")]
+    property enable_weaker_network_isolation : Bool? = nil
+    @[JSON::Field(key: "allowAppleEvents")]
+    property allow_apple_events : Bool? = nil
+    property filesystem : SandboxFilesystemSettings? = nil
+    property ripgrep : Hash(String, JSON::Any)? = nil
+
+    def allow_nested_user_namespaces? : Bool?
+      @allow_nested_user_namespaces
+    end
+
+    def enable_weaker_network_isolation? : Bool?
+      @enable_weaker_network_isolation
+    end
+
+    def allow_apple_events? : Bool?
+      @allow_apple_events
+    end
 
     def initialize(
       @enabled : Bool = false,
@@ -254,10 +360,15 @@ module ClaudeAgent
       @excluded_commands : Array(String)? = nil,
       @allow_unsandboxed_commands : Bool = false,
       @network : SandboxNetworkSettings? = nil,
-      @ignore_violations : SandboxIgnoreViolations? = nil,
+      @ignore_violations : (SandboxIgnoreViolationsMap | SandboxIgnoreViolations)? = nil,
       @enable_weaker_nested_sandbox : Bool = false,
       @credentials : SandboxCredentialsSettings? = nil,
       @fail_if_unavailable : Bool = true,
+      @allow_nested_user_namespaces : Bool? = nil,
+      @enable_weaker_network_isolation : Bool? = nil,
+      @allow_apple_events : Bool? = nil,
+      @filesystem : SandboxFilesystemSettings? = nil,
+      @ripgrep : Hash(String, JSON::Any)? = nil,
     )
     end
   end
@@ -315,11 +426,15 @@ module ClaudeAgent
     # is identical across users. The stripped content is re-injected into the
     # first user message. Requires CLI support; older CLIs ignore this field.
     property? exclude_dynamic_sections : Bool = false
+    # Whether the session keeps the system prompt recorded on its first request
+    # (`true` or default except `--bare`), or rebuilds it per request (`false`).
+    property snapshot : Bool? = nil
 
     def initialize(
       @preset : String,
       @append : String? = nil,
       @exclude_dynamic_sections : Bool = false,
+      @snapshot : Bool? = nil,
     )
       @type = "preset"
     end
@@ -327,8 +442,21 @@ module ClaudeAgent
     def self.claude_code(
       append : String? = nil,
       exclude_dynamic_sections : Bool = false,
+      snapshot : Bool? = nil,
     ) : SystemPromptPreset
-      new("claude_code", append, exclude_dynamic_sections)
+      new("claude_code", append, exclude_dynamic_sections, snapshot)
+    end
+  end
+
+  # Custom system prompt with optional snapshot control (`type: "custom"`).
+  struct SystemPromptCustom
+    include JSON::Serializable
+    property type : String = "custom"
+    property prompt : String
+    property snapshot : Bool? = nil
+
+    def initialize(@prompt : String, @snapshot : Bool? = nil)
+      @type = "custom"
     end
   end
 
@@ -343,8 +471,8 @@ module ClaudeAgent
     end
   end
 
-  # Union types for preset support - allows both strings and preset objects
-  alias SystemPromptOption = String | SystemPromptPreset | SystemPromptFile
+  # Union types for preset support - allows strings, custom, preset, and file objects
+  alias SystemPromptOption = String | SystemPromptPreset | SystemPromptCustom | SystemPromptFile
   alias ToolsOption = Array(String) | ToolsPreset
 
   # Skills option: "all", a list of skill names, or an empty list to suppress.
@@ -376,6 +504,16 @@ module ClaudeAgent
     property url : String?
     property headers : Hash(String, String)?
 
+    # Per-server tool-call timeout (ms) and deferred-loading / tool policies
+    property timeout : Int32? = nil
+    @[JSON::Field(key: "alwaysLoad")]
+    property always_load : Bool? = nil
+    property tools : Array(MCPServerToolPolicy)? = nil
+
+    def always_load? : Bool?
+      @always_load
+    end
+
     def initialize(
       @command : String? = nil,
       @args : Array(String)? = nil,
@@ -383,22 +521,65 @@ module ClaudeAgent
       @type : String? = nil,
       @url : String? = nil,
       @headers : Hash(String, String)? = nil,
+      @timeout : Int32? = nil,
+      @always_load : Bool? = nil,
+      @tools : Array(MCPServerToolPolicy)? = nil,
     )
     end
 
     # Factory for stdio servers (local processes)
-    def self.stdio(command : String, args : Array(String)? = nil, env : Hash(String, String)? = nil)
-      new(command: command, args: args, env: env)
+    def self.stdio(
+      command : String,
+      args : Array(String)? = nil,
+      env : Hash(String, String)? = nil,
+      timeout : Int32? = nil,
+      always_load : Bool? = nil,
+      tools : Array(MCPServerToolPolicy)? = nil,
+    )
+      new(
+        command: command,
+        args: args,
+        env: env,
+        timeout: timeout,
+        always_load: always_load,
+        tools: tools,
+      )
     end
 
     # Factory for HTTP servers (remote)
-    def self.http(url : String, headers : Hash(String, String)? = nil)
-      new(type: "http", url: url, headers: headers)
+    def self.http(
+      url : String,
+      headers : Hash(String, String)? = nil,
+      timeout : Int32? = nil,
+      always_load : Bool? = nil,
+      tools : Array(MCPServerToolPolicy)? = nil,
+    )
+      new(
+        type: "http",
+        url: url,
+        headers: headers,
+        timeout: timeout,
+        always_load: always_load,
+        tools: tools,
+      )
     end
 
     # Factory for SSE servers (remote streaming)
-    def self.sse(url : String, headers : Hash(String, String)? = nil)
-      new(type: "sse", url: url, headers: headers)
+    def self.sse(
+      url : String,
+      headers : Hash(String, String)? = nil,
+      timeout : Int32? = nil,
+      always_load : Bool? = nil,
+      tools : Array(MCPServerToolPolicy)? = nil,
+    )
+      new(
+        type: "sse",
+        url: url,
+        headers: headers,
+        timeout: timeout,
+        always_load: always_load,
+        tools: tools,
+      )
     end
   end
 
@@ -414,6 +595,10 @@ module ClaudeAgent
     getter url : String?
     getter elicitation_id : String?
     getter requested_schema : Hash(String, JSON::Any)?
+    getter property_order : Array(String)?
+    getter title : String?
+    getter display_name : String?
+    getter description : String?
 
     def initialize(
       @server_name : String,
@@ -422,6 +607,10 @@ module ClaudeAgent
       @url : String? = nil,
       @elicitation_id : String? = nil,
       @requested_schema : Hash(String, JSON::Any)? = nil,
+      @property_order : Array(String)? = nil,
+      @title : String? = nil,
+      @display_name : String? = nil,
+      @description : String? = nil,
     )
     end
   end
@@ -554,7 +743,11 @@ module ClaudeAgent
     # Per-tool config for built-in tools (e.g. AskUserQuestion preview format).
     # Forwarded via `CLAUDE_CODE_QUESTION_PREVIEW_FORMAT` (matches TS SDK).
     property tool_config : ToolConfig?
-    property permission_mode : PermissionMode = PermissionMode::Default
+    # Permission mode for the session. When `nil` (default), `--permission-mode`
+    # is omitted so Claude Code resolves the starting mode from settings or its
+    # provider default. Pass `PermissionMode::Default` explicitly to force
+    # manual prompting (`"default"`).
+    property permission_mode : PermissionMode? = nil
     property? allow_dangerously_skip_permissions : Bool = false # Required for bypassPermissions
 
     # Budget and limits
@@ -608,8 +801,10 @@ module ClaudeAgent
 
     # Streaming options
     property? include_partial_messages : Bool = false
-    # Emit all hook lifecycle events (`hook_started`, `hook_progress`,
-    # `hook_response`) into the output stream. Maps to `--include-hook-events`.
+    # Emit hook lifecycle events (`hook_started`, `hook_progress`,
+    # `hook_response`) for all hook event types into the output stream.
+    # `SessionStart` and `Setup` hook events are emitted regardless of this
+    # flag. Maps to `--include-hook-events`.
     property? include_hook_events : Bool = false
     property? replay_user_messages : Bool = false # Re-emit user messages for acknowledgment
     # Stream subagent text/thinking blocks as assistant/user messages with
@@ -631,9 +826,18 @@ module ClaudeAgent
     # Implicitly enables debug mode. Matches the TS SDK's `debugFile` (0.2.30+).
     property debug_file : String?
 
-    # Setting sources
+    # Setting sources: when `nil`, all filesystem settings sources
+    # (`"user"`, `"project"`, `"local"`) are loaded (matching CLI defaults).
+    # Pass `[] of String` to disable filesystem settings (SDK isolation mode,
+    # recommended when `cwd` is untrusted since project settings can run
+    # hooks). Must include `"project"` to load `CLAUDE.md` files.
     property setting_sources : Array(String)?
-    property settings_path : String? # Path to settings file
+    # Path to a settings JSON file or an inline JSON settings string.
+    # Passed as-is to `--settings` when neither `sandbox` nor
+    # `workflow_size_guideline` is set; when either is set, loaded (relative
+    # paths resolved against `cwd`, UTF-8 BOM stripped) and merged fail-closed
+    # (raising `ConnectionError` on load/parse failure).
+    property settings_path : String?
     # Advisory Dynamic workflow size guideline ("small" | "medium" | "large" |
     # "unrestricted"). Emitted into the settings JSON passed via `--settings`
     # as `workflowSizeGuideline` (TS SDK 0.3.219 / Claude Code v2.1.219).
@@ -711,6 +915,20 @@ module ClaudeAgent
     # Buffer size for CLI output
     property max_buffer_size : Int32?
 
+    # When true, stamp `"client_composed": true` on every outgoing user message
+    # so Claude Code (`>= 2.1.248`) delivers prompt text verbatim without
+    # `@path` expansion or slash-command dispatch.
+    property? verbatim_prompts : Bool = false
+
+    # App/library identifier forwarded in `CLAUDE_AGENT_SDK_CLIENT_APP`
+    # (e.g. `"my-app/1.0.0"`). Pass `""` to opt out and clear any inherited
+    # `CLAUDE_AGENT_SDK_CLIENT_APP`. Characters must be `<= U+00FF`.
+    property client_app : String? = nil
+
+    # Trusted checkout root from which project settings/skills/hooks/MCPs load
+    # when `cwd` is a worktree (`--project-config-root=...`).
+    property project_config_root : String? = nil
+
     def initialize(
       @system_prompt : SystemPromptOption? = nil,
       @append_system_prompt : String? = nil,
@@ -720,7 +938,7 @@ module ClaudeAgent
       @disallowed_tools : Array(String)? = nil,
       @tools : ToolsOption? = nil,
       @tool_config : ToolConfig? = nil,
-      @permission_mode : PermissionMode = PermissionMode::Default,
+      @permission_mode : PermissionMode? = nil,
       @allow_dangerously_skip_permissions : Bool = false,
       @max_budget_usd : Float64? = nil,
       @max_turns : Int32? = nil,
@@ -774,6 +992,9 @@ module ClaudeAgent
       @user : String? = nil,
       @stderr : StderrCallback? = nil,
       @max_buffer_size : Int32? = nil,
+      @verbatim_prompts : Bool = false,
+      @client_app : String? = nil,
+      @project_config_root : String? = nil,
     )
     end
 
@@ -844,13 +1065,19 @@ module ClaudeAgent
 
     # True when a one-shot `ClaudeAgent.query` must run over `AgentClient`
     # (bidirectional control protocol) instead of the lightweight
-    # one-shot `CLIClient` path: a `can_use_tool` callback, or
-    # in-process SDK MCP servers whose tool calls route back as
-    # `mcp_message` control requests — neither can be answered without
-    # the control protocol. Mirrors Python 0.2.140 (`can_use_tool`
-    # support for `query()` and string prompts).
+    # one-shot `CLIClient` path: a `can_use_tool` callback, hooks,
+    # elicitation, initialize-only system prompt options (`exclude_dynamic_sections`
+    # or `snapshot`), or in-process SDK MCP servers whose tool calls route
+    # back as `mcp_message` control requests.
     def needs_control_protocol? : Bool
-      return true if can_use_tool
+      return true if can_use_tool || hooks || on_elicitation
+
+      case sp = system_prompt
+      when SystemPromptPreset
+        return true if sp.exclude_dynamic_sections? || !sp.snapshot.nil?
+      when SystemPromptCustom
+        return true unless sp.snapshot.nil?
+      end
 
       servers = mcp_servers
       return false unless servers

@@ -1,4 +1,5 @@
 require "json"
+require "../errors"
 
 module ClaudeAgent
   # JSON-RPC 2.0 message for MCP protocol
@@ -71,6 +72,58 @@ module ClaudeAgent
 
   # --- Control Request Subtypes ---
 
+  # Provenance metadata identifying which MCP server exposed a tool.
+  struct MCPServerProvenance
+    include JSON::Serializable
+
+    getter name : String
+    getter source : String
+
+    def initialize(@name : String, @source : String)
+    end
+  end
+
+  # Permission rule in "ask" mode that triggered a `can_use_tool` prompt.
+  # Accepts both snake_case wire keys (`tool_name`, `rule_content`) and
+  # camelCase keys (`toolName`, `ruleContent`), and serializes as snake_case.
+  struct MatchedAskRule
+    include JSON::Serializable
+
+    getter source : String
+    @[JSON::Field(key: "tool_name")]
+    getter tool_name : String
+    @[JSON::Field(key: "rule_content")]
+    getter rule_content : String? = nil
+
+    def initialize(
+      @source : String,
+      @tool_name : String,
+      @rule_content : String? = nil,
+    )
+    end
+
+    def self.new(pull : JSON::PullParser) : self
+      location = pull.location
+      raw = JSON.parse(pull.read_raw)
+      parsed = from_any(raw)
+      raise JSON::ParseException.new("Invalid MatchedAskRule payload", *location) unless parsed
+
+      parsed
+    end
+
+    def self.from_any(value : JSON::Any) : self?
+      data = value.as_h?
+      return unless data
+
+      source = data["source"]?.try(&.as_s?)
+      tool_name = data["tool_name"]?.try(&.as_s?) || data["toolName"]?.try(&.as_s?)
+      return unless source && tool_name
+
+      rule_content = data["rule_content"]?.try(&.as_s?) || data["ruleContent"]?.try(&.as_s?)
+      new(source: source, tool_name: tool_name, rule_content: rule_content)
+    end
+  end
+
   # Initialize request (handshake)
   struct ControlInitializeRequest
     include JSON::Serializable
@@ -79,12 +132,24 @@ module ClaudeAgent
     getter hooks : Hash(String, JSON::Any)?
     @[JSON::Field(key: "sdkMcpServers")]
     getter sdk_mcp_servers : Array(String)?
+    @[JSON::Field(key: "sdkMcpServerConfigs")]
+    getter sdk_mcp_server_configs : Hash(String, JSON::Any)?
+    @[JSON::Field(key: "sdkMcpServerManifests")]
+    getter sdk_mcp_server_manifests : Hash(String, JSON::Any)?
     @[JSON::Field(key: "jsonSchema")]
     getter json_schema : Hash(String, JSON::Any)?
     @[JSON::Field(key: "systemPrompt")]
     getter system_prompt : String?
     @[JSON::Field(key: "appendSystemPrompt")]
     getter append_system_prompt : String?
+    @[JSON::Field(key: "systemPromptSnapshot")]
+    getter system_prompt_snapshot : Bool?
+    @[JSON::Field(key: "excludeDynamicSections")]
+    getter exclude_dynamic_sections : Bool?
+    @[JSON::Field(key: "forwardSubagentText")]
+    getter forward_subagent_text : Bool?
+    getter title : String?
+    getter skills : Array(String)?
     getter agents : Hash(String, JSON::Any)?
     @[JSON::Field(key: "promptSuggestions")]
     getter prompt_suggestions : Bool?
@@ -120,10 +185,50 @@ module ClaudeAgent
     getter blocked_path : String?
     @[JSON::Field(key: "decision_reason")]
     getter decision_reason : String?
+    @[JSON::Field(key: "decision_reason_type")]
+    getter decision_reason_type : String?
+    @[JSON::Field(key: "decision_reason_code")]
+    getter decision_reason_code : String?
+    @[JSON::Field(key: "mcp_server")]
+    getter mcp_server : MCPServerProvenance?
+    @[JSON::Field(key: "server_policy_ask_only")]
+    getter server_policy_ask_only : Bool?
+    @[JSON::Field(key: "classifier_approvable")]
+    getter classifier_approvable : Bool?
+    @[JSON::Field(key: "suppress_always_allow_rule")]
+    getter suppress_always_allow_rule : Bool?
+    @[JSON::Field(key: "default_to_no")]
+    getter default_to_no : Bool?
+    @[JSON::Field(key: "matched_ask_rule")]
+    getter matched_ask_rule : MatchedAskRule?
+    @[JSON::Field(key: "requires_user_interaction")]
+    getter requires_user_interaction : Bool?
+    @[JSON::Field(key: "server_prompt")]
+    getter server_prompt : String?
     getter title : String?
     @[JSON::Field(key: "display_name")]
     getter display_name : String?
     getter description : String?
+
+    def server_policy_ask_only? : Bool?
+      @server_policy_ask_only
+    end
+
+    def classifier_approvable? : Bool?
+      @classifier_approvable
+    end
+
+    def suppress_always_allow_rule? : Bool?
+      @suppress_always_allow_rule
+    end
+
+    def default_to_no? : Bool?
+      @default_to_no
+    end
+
+    def requires_user_interaction? : Bool?
+      @requires_user_interaction
+    end
   end
 
   # Interrupt request.
@@ -226,6 +331,8 @@ module ClaudeAgent
     getter subtype : String = "set_max_thinking_tokens"
     @[JSON::Field(key: "max_thinking_tokens")]
     getter max_thinking_tokens : Int32?
+    @[JSON::Field(key: "thinking_display")]
+    getter thinking_display : String?
   end
 
   struct ControlGetSettingsRequest
@@ -238,12 +345,19 @@ module ClaudeAgent
     include JSON::Serializable
 
     getter subtype : String = "get_context_usage"
+    getter detail : String?
   end
 
   struct ControlReloadPluginsRequest
     include JSON::Serializable
 
     getter subtype : String = "reload_plugins"
+    @[JSON::Field(key: "hold_on_cache_impact")]
+    getter? hold_on_cache_impact : Bool?
+    @[JSON::Field(key: "add_plugins")]
+    getter add_plugins : Array(JSON::Any)?
+    @[JSON::Field(key: "refuse_if_busy")]
+    getter? refuse_if_busy : Bool?
   end
 
   struct ControlPromptSuggestionRequest
@@ -256,8 +370,11 @@ module ClaudeAgent
     include JSON::Serializable
 
     getter subtype : String = "mcp_set_servers"
-    @[JSON::Field(key: "mcpServers")]
-    getter mcp_servers : Hash(String, JSON::Any)
+    getter servers : Hash(String, JSON::Any)
+
+    def mcp_servers : Hash(String, JSON::Any)
+      servers
+    end
   end
 
   struct ControlMcpEnableChannelRequest
@@ -323,6 +440,8 @@ module ClaudeAgent
     include JSON::Serializable
 
     getter subtype : String = "mcp_status"
+    @[JSON::Field(key: "liveReply")]
+    getter? live_reply : Bool?
   end
 
   # Reconnect an MCP server request
@@ -378,6 +497,26 @@ module ClaudeAgent
     getter elicitation_id : String?
     @[JSON::Field(key: "requested_schema")]
     getter requested_schema : Hash(String, JSON::Any)?
+    @[JSON::Field(key: "property_order")]
+    getter property_order : Array(String)?
+    getter title : String?
+    @[JSON::Field(key: "display_name")]
+    getter display_name : String?
+    getter description : String?
+  end
+
+  # Rename the active session transcript via the control protocol.
+  struct ControlRenameSessionRequest
+    include JSON::Serializable
+
+    getter subtype : String = "rename_session"
+    getter title : String
+    getter source : String = "host"
+    @[JSON::Field(key: "session_id")]
+    getter session_id : String? = nil
+
+    def initialize(@title : String, @source : String = "host", @session_id : String? = nil)
+    end
   end
 
   # Rewind files request
@@ -433,6 +572,7 @@ module ClaudeAgent
                               ControlMCPToggleRequest |
                               ControlStopTaskRequest |
                               ControlElicitationRequest |
+                              ControlRenameSessionRequest |
                               ControlHookCallbackRequest |
                               ControlRewindFilesRequest |
                               ControlRewindConversationRequest |
@@ -465,6 +605,7 @@ module ClaudeAgent
       "mcp_toggle"              => ->(json : String) { ControlMCPToggleRequest.from_json(json).as(ControlRequestInner) },
       "stop_task"               => ->(json : String) { ControlStopTaskRequest.from_json(json).as(ControlRequestInner) },
       "elicitation"             => ->(json : String) { ControlElicitationRequest.from_json(json).as(ControlRequestInner) },
+      "rename_session"          => ->(json : String) { ControlRenameSessionRequest.from_json(json).as(ControlRequestInner) },
       "hook_callback"           => ->(json : String) { ControlHookCallbackRequest.from_json(json).as(ControlRequestInner) },
       "rewind_files"            => ->(json : String) { ControlRewindFilesRequest.from_json(json).as(ControlRequestInner) },
       "rewind_conversation"     => ->(json : String) { ControlRewindConversationRequest.from_json(json).as(ControlRequestInner) },
@@ -510,6 +651,17 @@ module ClaudeAgent
     end
   end
 
+  # Raised when a control request receives an error response carrying an
+  # upstream `error_code` (e.g. `"reload_plugins_busy"`). Subclasses `Error`
+  # so existing `rescue ClaudeAgent::Error` handlers keep working.
+  class ControlError < Error
+    getter error_code : String?
+
+    def initialize(message : String, @error_code : String? = nil)
+      super(message)
+    end
+  end
+
   # Error response payload
   struct ControlResponseError
     include JSON::Serializable
@@ -518,8 +670,9 @@ module ClaudeAgent
     @[JSON::Field(key: "request_id")]
     property request_id : String
     property error : String
+    property error_code : String? = nil
 
-    def initialize(@request_id : String, @error : String)
+    def initialize(@request_id : String, @error : String, @error_code : String? = nil)
     end
   end
 
@@ -596,6 +749,8 @@ module ClaudeAgent
     getter name : String
     getter description : String?
     getter annotations : MCPToolAnnotations?
+    @[JSON::Field(key: "_meta")]
+    getter meta : Hash(String, JSON::Any)?
   end
 
   struct MCPServerInfo
@@ -615,6 +770,7 @@ module ClaudeAgent
     getter error : String?
     getter config : Hash(String, JSON::Any)?
     getter scope : String?
+    getter source : String?
     getter tools : Array(MCPToolInfo)?
     getter capabilities : Hash(String, JSON::Any)?
   end
@@ -633,6 +789,8 @@ module ClaudeAgent
   struct ContextUsageCategory
     include JSON::Serializable
 
+    getter id : String?
+    getter kind : String?
     getter name : String
     getter tokens : Int64
     getter color : String?
@@ -660,6 +818,8 @@ module ClaudeAgent
     getter memory_files : Array(JSON::Any)
     @[JSON::Field(key: "mcpTools")]
     getter mcp_tools : Array(JSON::Any)
+    @[JSON::Field(key: "mcpInstructions")]
+    getter mcp_instructions : Array(JSON::Any)?
     getter agents : Array(JSON::Any)
     @[JSON::Field(key: "gridRows")]
     getter grid_rows : Array(JSON::Any)?

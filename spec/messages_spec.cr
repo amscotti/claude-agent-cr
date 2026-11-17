@@ -1927,3 +1927,516 @@ describe "new result/model/task/stream fields (TS 0.3.243-0.3.260 parity)" do
     end
   end
 end
+
+describe "v0.11.0 message parity" do
+  it "parses SessionStateChangedMessage and sdk_host_only_frame?" do
+    host_only_json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "session_state_changed",
+        "session_id": "s-1",
+        "uuid": "st-1",
+        "state": "idle",
+        "sdk_host_only": true
+      }
+      JSON
+    host_only = ClaudeAgent::Message.parse(host_only_json)
+    host_only.should be_a(ClaudeAgent::SessionStateChangedMessage)
+    host_only.sdk_host_only_frame?.should be_true
+    if msg = host_only.as?(ClaudeAgent::SessionStateChangedMessage)
+      msg.state.should eq("idle")
+      msg.sdk_host_only?.should be_true
+      msg.uuid.should eq("st-1")
+    end
+
+    visible_json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "session_state_changed",
+        "session_id": "s-1",
+        "state": "requires_action"
+      }
+      JSON
+    visible = ClaudeAgent::Message.parse(visible_json)
+    visible.should be_a(ClaudeAgent::SessionStateChangedMessage)
+    visible.sdk_host_only_frame?.should be_false
+    if msg = visible.as?(ClaudeAgent::SessionStateChangedMessage)
+      msg.state.should eq("requires_action")
+      msg.sdk_host_only?.should be_false
+      msg.uuid.should be_nil
+    end
+
+    incomplete = ClaudeAgent::Message.parse(
+      %({"type":"system","subtype":"session_state_changed","session_id":"s-1"})
+    )
+    incomplete.should be_a(ClaudeAgent::GenericSystemMessage)
+    incomplete.sdk_host_only_frame?.should be_false
+  end
+
+  it "parses SessionWritesLostMessage and falls back when incomplete" do
+    json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "session_writes_lost",
+        "session_id": "s-1",
+        "uuid": "swl-1",
+        "error_code": "ENOSPC",
+        "lost": ["transcript", "global_config"],
+        "transcript_session_ids": ["s-1", "s-2"]
+      }
+      JSON
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::SessionWritesLostMessage)
+    if msg = message.as?(ClaudeAgent::SessionWritesLostMessage)
+      msg.uuid.should eq("swl-1")
+      msg.error_code.should eq("ENOSPC")
+      msg.lost.should eq(["transcript", "global_config"])
+      msg.transcript_session_ids.should eq(["s-1", "s-2"])
+    end
+
+    minimal = ClaudeAgent::Message.parse(
+      {
+        "type"       => "system",
+        "subtype"    => "session_writes_lost",
+        "session_id" => "s-1",
+        "error_code" => "EDQUOT",
+        "lost"       => ["global_config"],
+      }.to_json
+    )
+    minimal.should be_a(ClaudeAgent::SessionWritesLostMessage)
+    if msg = minimal.as?(ClaudeAgent::SessionWritesLostMessage)
+      msg.uuid.should be_nil
+      msg.transcript_session_ids.should be_nil
+    end
+
+    incomplete = ClaudeAgent::Message.parse(
+      %({"type":"system","subtype":"session_writes_lost","session_id":"s-1","error_code":"ENOSPC"})
+    )
+    incomplete.should be_a(ClaudeAgent::GenericSystemMessage)
+  end
+
+  it "parses InformationalMessage with optional fields and falls back when incomplete" do
+    json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "informational",
+        "session_id": "s-1",
+        "uuid": "info-1",
+        "content": "Hook timed out",
+        "level": "warning",
+        "tool_use_id": "toolu-1",
+        "prevent_continuation": false,
+        "tag": "hook_no_verdict"
+      }
+      JSON
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::InformationalMessage)
+    if msg = message.as?(ClaudeAgent::InformationalMessage)
+      msg.uuid.should eq("info-1")
+      msg.content.should eq("Hook timed out")
+      msg.level.should eq("warning")
+      msg.tool_use_id.should eq("toolu-1")
+      msg.prevent_continuation.should be_false
+      msg.tag.should eq("hook_no_verdict")
+    end
+
+    incomplete = ClaudeAgent::Message.parse(
+      %({"type":"system","subtype":"informational","session_id":"s-1","content":"only content"})
+    )
+    incomplete.should be_a(ClaudeAgent::GenericSystemMessage)
+  end
+
+  it "forwards all new ServerInfo fields on InitMessage" do
+    json = <<-JSON
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "s-1",
+        "uuid": "init-1",
+        "apiKeySource": "ANTHROPIC_API_KEY",
+        "betas": ["beta-a"],
+        "capabilities": ["interrupt_receipt_v1"],
+        "viewMode": "focus",
+        "startup_timing": {"spawn_ms": 15},
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "terminal_slash_commands": ["/exit"],
+        "effort": "high",
+        "mcp_servers": [{"name": "srv", "status": "connected", "source": "sdk"}],
+        "plugins": [{"name": "p1", "version": "1.0.0"}],
+        "plugin_errors": [{"plugin": "p2", "type": "path-not-found", "message": "Missing"}]
+      }
+      JSON
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::InitMessage)
+    if init = message.as?(ClaudeAgent::InitMessage)
+      init.uuid.should eq("init-1")
+      init.api_key_source.should eq("ANTHROPIC_API_KEY")
+      init.betas.should eq(["beta-a"])
+      init.capabilities.should eq(["interrupt_receipt_v1"])
+      init.view_mode.should eq("focus")
+      init.startup_timing.try(&.["spawn_ms"].as_i64).should eq(15_i64)
+      init.fast_mode_disabled_reason.should eq("sdk_opt_in_required")
+      init.terminal_slash_commands.should eq(["/exit"])
+      init.effort.try(&.as_s).should eq("high")
+      init.mcp_server_infos.size.should eq(1)
+      init.mcp_server_infos.first.source.should eq("sdk")
+      init.plugin_infos.size.should eq(1)
+      init.plugin_infos.first.version.should eq("1.0.0")
+      init.plugin_errors.size.should eq(1)
+      init.plugin_errors.first.plugin.should eq("p2")
+    end
+  end
+
+  it "parses ResultMessage startup failure, InvalidConfigFile, and timing fields" do
+    ClaudeAgent::STARTUP_FAILURE_REASONS.size.should eq(23)
+    ClaudeAgent::STARTUP_FAILURE_REASONS.should contain("config_file_invalid")
+    ClaudeAgent::STARTUP_FAILURE_REASONS.should contain("org_pin_api_key_conflict")
+    ClaudeAgent::STARTUP_FAILURE_REASONS.should contain("managed_settings_not_delivered")
+
+    json = <<-JSON
+      {
+        "type": "result",
+        "uuid": "res-1",
+        "session_id": "s-1",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "resume_reason": "interrupted_turn",
+        "local_command": "/compact",
+        "result_index": 0,
+        "credential_expires_at": "2026-12-01T00:00:00Z",
+        "startup_failure_reason": "config_file_invalid",
+        "invalid_config_file": {
+          "path": "/home/user/.claude.json",
+          "is_global": true,
+          "backup_searched": true,
+          "backup_path": "/home/user/.claude.json.bak"
+        },
+        "first_stream_post_queue_wait_ms": 12,
+        "first_stream_post_queued_behind": "turn-0",
+        "first_text_post_ms": 100,
+        "first_text_post_queue_wait_ms": 5,
+        "first_text_post_queued_behind": "turn-0",
+        "first_text_post_wall_ms": 1700000000500,
+        "time_to_request_from_spawn_ms": 250,
+        "warm_spare_claimed": true,
+        "time_origin_ms": 1700000000000
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    message.should be_a(ClaudeAgent::ResultMessage)
+    if res = message.as?(ClaudeAgent::ResultMessage)
+      res.resume_reason.should eq("interrupted_turn")
+      res.local_command.should eq("/compact")
+      res.result_index.should eq(0)
+      res.credential_expires_at.should eq("2026-12-01T00:00:00Z")
+      res.startup_failure_reason.should eq("config_file_invalid")
+      icf = res.invalid_config_file
+      icf.should_not be_nil
+      if icf
+        icf.path.should eq("/home/user/.claude.json")
+        icf.is_global?.should be_true
+        icf.backup_searched?.should be_true
+        icf.backup_searched.should be_true
+        icf.backup_path.should eq("/home/user/.claude.json.bak")
+      end
+      res.first_stream_post_queue_wait_ms.should eq(12)
+      res.first_stream_post_queued_behind.should eq("turn-0")
+      res.first_text_post_ms.should eq(100)
+      res.first_text_post_queue_wait_ms.should eq(5)
+      res.first_text_post_queued_behind.should eq("turn-0")
+      res.first_text_post_wall_ms.should eq(1_700_000_000_500_i64)
+      res.time_to_request_from_spawn_ms.should eq(250)
+      res.warm_spare_claimed.should be_true
+      res.time_origin_ms.should eq(1_700_000_000_000_i64)
+    end
+  end
+
+  it "parses ModelUsage 5m and 1h ephemeral cache creation tokens" do
+    json = <<-JSON
+      {
+        "type": "result",
+        "uuid": "res-mu",
+        "session_id": "s-1",
+        "subtype": "success",
+        "modelUsage": {
+          "claude-opus-5-5": {
+            "inputTokens": 100,
+            "outputTokens": 50,
+            "cacheCreationInputTokens": 300,
+            "cacheCreationEphemeral5mInputTokens": 200,
+            "cacheCreationEphemeral1hInputTokens": 100,
+            "costUSD": 0.05
+          }
+        }
+      }
+      JSON
+
+    message = ClaudeAgent::Message.parse(json)
+    if res = message.as?(ClaudeAgent::ResultMessage)
+      mu = res.model_usage.try(&.["claude-opus-5-5"])
+      mu.should_not be_nil
+      if mu
+        mu.cache_creation_ephemeral_5m_input_tokens.should eq(200)
+        mu.cache_creation_ephemeral_1h_input_tokens.should eq(100)
+      end
+    else
+      fail("expected ResultMessage")
+    end
+  end
+
+  it "parses RateLimitInfo overage and limit_scope fields from camel and snake keys" do
+    camel_json = <<-JSON
+      {
+        "type": "rate_limit_event",
+        "uuid": "rl-1",
+        "session_id": "s-1",
+        "rate_limit_info": {
+          "status": "allowed_warning",
+          "overageEnabled": true,
+          "overageInUse": false,
+          "isUsingOverage": false,
+          "surpassedThreshold": 0.75,
+          "limitScope": "group_pool"
+        }
+      }
+      JSON
+    camel = ClaudeAgent::Message.parse(camel_json).as(ClaudeAgent::RateLimitEvent)
+    camel.rate_limit_info.overage_enabled.should be_true
+    camel.rate_limit_info.overage_in_use.should be_false
+    camel.rate_limit_info.is_using_overage.should be_false
+    camel.rate_limit_info.surpassed_threshold.should eq(0.75)
+    camel.rate_limit_info.limit_scope.should eq("group_pool")
+
+    snake_json = <<-JSON
+      {
+        "type": "rate_limit_event",
+        "uuid": "rl-2",
+        "session_id": "s-1",
+        "rate_limit_info": {
+          "status": "allowed",
+          "overage_enabled": false,
+          "overage_in_use": true,
+          "is_using_overage": true,
+          "surpassed_threshold": 1,
+          "limit_scope": "service"
+        }
+      }
+      JSON
+    snake = ClaudeAgent::Message.parse(snake_json).as(ClaudeAgent::RateLimitEvent)
+    snake.rate_limit_info.overage_enabled.should be_false
+    snake.rate_limit_info.overage_in_use.should be_true
+    snake.rate_limit_info.is_using_overage.should be_true
+    snake.rate_limit_info.surpassed_threshold.should eq(1.0)
+    snake.rate_limit_info.limit_scope.should eq("service")
+  end
+
+  it "parses new AssistantMessage, StreamEvent, ConversationResetMessage, and UserMessage fields" do
+    asst_json = <<-JSON
+      {
+        "type": "assistant",
+        "uuid": "a-1",
+        "session_id": "s-1",
+        "user_message_uuid": "u-2",
+        "user_message_uuids": ["u-1", "u-2"],
+        "resume_reason": "interrupted_turn",
+        "supersedes": "a-0",
+        "agent_id": "agent-42",
+        "usage_report": {"total": 123},
+        "error": {"type": "verification_required", "message": "Verify account"},
+        "message": {"content": [{"type": "text", "text": "hello"}]}
+      }
+      JSON
+    asst = ClaudeAgent::Message.parse(asst_json).as(ClaudeAgent::AssistantMessage)
+    asst.user_message_uuids.should eq(["u-1", "u-2"])
+    asst.resume_reason.should eq("interrupted_turn")
+    asst.supersedes.should eq("a-0")
+    asst.agent_id.should eq("agent-42")
+    asst.usage_report.try(&.["total"].as_i).should eq(123)
+    asst.error.try(&.type).should eq("verification_required")
+
+    stream_json = <<-JSON
+      {
+        "type": "stream_event",
+        "uuid": "se-1",
+        "session_id": "s-1",
+        "user_message_uuid": "u-2",
+        "user_message_uuids": ["u-1", "u-2"],
+        "resume_reason": "interrupted_turn",
+        "ttft_ms": 145,
+        "event": {"type": "message_start"}
+      }
+      JSON
+    stream = ClaudeAgent::Message.parse(stream_json).as(ClaudeAgent::StreamEvent)
+    stream.user_message_uuids.should eq(["u-1", "u-2"])
+    stream.resume_reason.should eq("interrupted_turn")
+    stream.ttft_ms.should eq(145)
+
+    reset_json = <<-JSON
+      {
+        "type": "conversation_reset",
+        "new_conversation_id": "conv-2",
+        "uuid": "cr-1",
+        "session_id": "s-1",
+        "trigger": "clear",
+        "user_message_uuid": "u-9",
+        "timestamp": "2026-11-16T00:00:00Z"
+      }
+      JSON
+    reset = ClaudeAgent::Message.parse(reset_json).as(ClaudeAgent::ConversationResetMessage)
+    reset.trigger.should eq("clear")
+    reset.user_message_uuid.should eq("u-9")
+    reset.timestamp.should eq("2026-11-16T00:00:00Z")
+
+    user_json = <<-JSON
+      {
+        "type": "user",
+        "uuid": "u-sub",
+        "session_id": "s-1",
+        "agent_id": "agent-7",
+        "subagent_type": "Explore",
+        "task_description": "Find routes",
+        "pasted_content": {"1": {"type": "text", "content": "snippet"}},
+        "inline_pastes": ["snippet"],
+        "message": {"role": "user", "content": "go"}
+      }
+      JSON
+    user = ClaudeAgent::Message.parse(user_json).as(ClaudeAgent::UserMessage)
+    user.agent_id.should eq("agent-7")
+    user.subagent_type.should eq("Explore")
+    user.task_description.should eq("Find routes")
+    user.pasted_content.try(&.["1"]["type"].as_s).should eq("text")
+    user.inline_pastes.should eq(["snippet"])
+  end
+
+  it "parses task, background entry, origin, command lifecycle, and compact metadata extensions" do
+    started = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "task_started",
+        "session_id": "s-1",
+        "uuid": "ts-1",
+        "task_id": "t-1",
+        "description": "work",
+        "run_id": "run-1",
+        "parent_task_id": "t-0",
+        "subagent_type": "Plan"
+      }
+      JSON
+    ).as(ClaudeAgent::TaskStartedMessage)
+    started.run_id.should eq("run-1")
+    started.parent_task_id.should eq("t-0")
+    started.subagent_type.should eq("Plan")
+
+    progress = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "task_progress",
+        "session_id": "s-1",
+        "uuid": "tp-1",
+        "task_id": "t-1",
+        "description": "working",
+        "usage": {"total_tokens": 10, "tool_uses": 1, "duration_ms": 50},
+        "run_id": "run-1",
+        "subagent_type": "Plan"
+      }
+      JSON
+    ).as(ClaudeAgent::TaskProgressMessage)
+    progress.run_id.should eq("run-1")
+    progress.subagent_type.should eq("Plan")
+
+    updated = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "task_updated",
+        "session_id": "s-1",
+        "task_id": "t-1",
+        "run_id": "run-1",
+        "patch": {"status": "running"}
+      }
+      JSON
+    ).as(ClaudeAgent::TaskUpdatedMessage)
+    updated.run_id.should eq("run-1")
+
+    notified = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": "s-1",
+        "uuid": "tn-1",
+        "task_id": "t-1",
+        "status": "stopped",
+        "run_id": "run-1",
+        "reason": "worker_restart"
+      }
+      JSON
+    ).as(ClaudeAgent::TaskNotificationMessage)
+    notified.run_id.should eq("run-1")
+    notified.reason.should eq("worker_restart")
+
+    btc = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "background_tasks_changed",
+        "session_id": "s-1",
+        "tasks": [
+          {"task_id": "t-1", "run_id": "run-1", "subagent_type": "Explore", "parent_task_id": "t-0"}
+        ]
+      }
+      JSON
+    ).as(ClaudeAgent::BackgroundTasksChangedMessage)
+    btc.tasks.first.run_id.should eq("run-1")
+    btc.tasks.first.subagent_type.should eq("Explore")
+    btc.tasks.first.parent_task_id.should eq("t-0")
+
+    origin_res = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "result",
+        "uuid": "res-orig",
+        "session_id": "s-1",
+        "subtype": "success",
+        "origin": {"kind": "task-notification", "fireReason": "cron", "runId": "run-9"}
+      }
+      JSON
+    ).as(ClaudeAgent::ResultMessage)
+    origin_res.origin.try(&.fire_reason).should eq("cron")
+    origin_res.origin.try(&.run_id).should eq("run-9")
+
+    lifecycle = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "command_lifecycle",
+        "session_id": "s-1",
+        "uuid": "cl-1",
+        "state": "started",
+        "wakeup_source": "cron",
+        "scheduled_for": "2026-11-16T18:00:00Z"
+      }
+      JSON
+    ).as(ClaudeAgent::CommandLifecycleMessage)
+    lifecycle.wakeup_source.should eq("cron")
+    lifecycle.scheduled_for.should eq("2026-11-16T18:00:00Z")
+
+    compact = ClaudeAgent::Message.parse(<<-JSON
+      {
+        "type": "system",
+        "subtype": "compact_boundary",
+        "session_id": "s-1",
+        "uuid": "cb-1",
+        "compact_metadata": {
+          "trigger": "auto",
+          "pre_tokens": 8000,
+          "post_tokens": 1200,
+          "duration_ms": 340,
+          "preservedSegment": {"head": "u-1"},
+          "preservedMessages": ["u-1", "a-1"]
+        }
+      }
+      JSON
+    ).as(ClaudeAgent::CompactBoundaryMessage)
+    compact.compact_metadata.post_tokens.should eq(1200)
+    compact.compact_metadata.duration_ms.should eq(340)
+    compact.compact_metadata.preserved_segment.try(&.["head"].as_s).should eq("u-1")
+    compact.compact_metadata.preserved_messages.try(&.as_a.size).should eq(2)
+  end
+end

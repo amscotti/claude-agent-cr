@@ -29,6 +29,10 @@ module ClaudeAgent
     getter background_task_id : String?
     @[JSON::Field(key: "backgroundedByUser")]
     getter backgrounded_by_user : Bool?
+    @[JSON::Field(key: "backgroundEndsWithFinalResponse")]
+    getter background_ends_with_final_response : Bool?
+    @[JSON::Field(key: "backgroundWakesOwner")]
+    getter background_wakes_owner : Bool?
 
     def initialize(
       @stdout : String? = nil,
@@ -37,6 +41,8 @@ module ClaudeAgent
       @timed_out_after_ms : Int64? = nil,
       @background_task_id : String? = nil,
       @backgrounded_by_user : Bool? = nil,
+      @background_ends_with_final_response : Bool? = nil,
+      @background_wakes_owner : Bool? = nil,
     )
     end
 
@@ -73,6 +79,15 @@ module ClaudeAgent
     getter total_duration_ms : Int64?
     @[JSON::Field(key: "totalToolUseCount")]
     getter total_tool_use_count : Int64?
+    @[JSON::Field(key: "toolsUsed")]
+    getter tools_used : Array(String)?
+    getter usage : JSON::Any?
+    @[JSON::Field(key: "toolStats")]
+    getter tool_stats : JSON::Any?
+    @[JSON::Field(key: "worktreePath")]
+    getter worktree_path : String?
+    @[JSON::Field(key: "worktreeBranch")]
+    getter worktree_branch : String?
 
     def initialize(
       @status : String? = nil,
@@ -84,6 +99,11 @@ module ClaudeAgent
       @total_tokens : Int64? = nil,
       @total_duration_ms : Int64? = nil,
       @total_tool_use_count : Int64? = nil,
+      @tools_used : Array(String)? = nil,
+      @usage : JSON::Any? = nil,
+      @tool_stats : JSON::Any? = nil,
+      @worktree_path : String? = nil,
+      @worktree_branch : String? = nil,
     )
     end
 
@@ -107,6 +127,11 @@ module ClaudeAgent
             total_tokens: parsed.total_tokens,
             total_duration_ms: parsed.total_duration_ms,
             total_tool_use_count: parsed.total_tool_use_count,
+            tools_used: parsed.tools_used,
+            usage: parsed.usage,
+            tool_stats: parsed.tool_stats,
+            worktree_path: parsed.worktree_path,
+            worktree_branch: parsed.worktree_branch,
           )
         else
           parsed
@@ -240,6 +265,8 @@ module ClaudeAgent
 
   # WebSearch / WebFetch style server-tool payload fragments when present as
   # structured tool_use_result (best-effort; wire shape varies by CLI version).
+  # Note: `results[]` entries may include `snippet` in `PostToolUse` hooks
+  # (omitted in `tool_use_result`).
   struct WebSearchToolOutput
     include JSON::Serializable
 
@@ -264,24 +291,161 @@ module ClaudeAgent
     end
   end
 
+  # OfferChromeSetup tool structured result (`outcome`: `"connected"`,
+  # `"not_now"`, or `"no_attempt_yet"`).
+  struct OfferChromeSetupOutput
+    include JSON::Serializable
+
+    getter outcome : String?
+
+    def initialize(@outcome : String? = nil)
+    end
+
+    def self.parse(value : JSON::Any | String?) : OfferChromeSetupOutput?
+      ToolOutputParser.parse(value) { |json| from_json(json) }
+    end
+  end
+
   # Built-in tool name constants for allow/disallow lists and matchers.
+  # Includes all 54 canonical built-in tool names plus legacy constants
+  # (`TASK`, `READ_MCP_RESOURCE`, `READ_MCP_RESOURCE_DIR`) kept for backward
+  # compatibility.
   module BuiltinTools
-    BASH                  = "Bash"
-    READ                  = "Read"
-    WRITE                 = "Write"
-    EDIT                  = "Edit"
-    GLOB                  = "Glob"
-    GREP                  = "Grep"
-    AGENT                 = "Agent"
+    AGENT                       = "Agent"
+    ARTIFACT                    = "Artifact"
+    ASK_USER_QUESTION           = "AskUserQuestion"
+    BASH                        = "Bash"
+    CLAUDE_DESIGN               = "ClaudeDesign"
+    CRON_CREATE                 = "CronCreate"
+    CRON_DELETE                 = "CronDelete"
+    CRON_LIST                   = "CronList"
+    EDIT                        = "Edit"
+    END_CONVERSATION            = "EndConversation"
+    ENTER_PLAN_MODE             = "EnterPlanMode"
+    ENTER_WORKTREE              = "EnterWorktree"
+    EXIT_PLAN_MODE              = "ExitPlanMode"
+    EXIT_WORKTREE               = "ExitWorktree"
+    GLOB                        = "Glob"
+    GREP                        = "Grep"
+    LIST_AGENTS                 = "ListAgents"
+    LIST_MCP_RESOURCES_TOOL     = "ListMcpResourcesTool"
+    LSP                         = "LSP"
+    MONITOR                     = "Monitor"
+    NOTEBOOK_EDIT               = "NotebookEdit"
+    OFFER_CHROME_SETUP          = "OfferChromeSetup"
+    POWER_SHELL                 = "PowerShell"
+    PROJECTS                    = "Projects"
+    PROPOSE_SKILLS              = "propose_skills"
+    PROPOSE_GOAL                = "ProposeGoal"
+    PUSH_NOTIFICATION           = "PushNotification"
+    READ                        = "Read"
+    READ_MCP_RESOURCE_DIR_TOOL  = "ReadMcpResourceDirTool"
+    READ_MCP_RESOURCE_TOOL      = "ReadMcpResourceTool"
+    READ_NOTIFICATIONS          = "ReadNotifications"
+    REMOTE_TRIGGER              = "RemoteTrigger"
+    REPORT_FINDINGS             = "ReportFindings"
+    SCHEDULE_WAKEUP             = "ScheduleWakeup"
+    SEND_FEEDBACK               = "SendFeedback"
+    SEND_MESSAGE                = "SendMessage"
+    SEND_USER_FILE              = "SendUserFile"
+    SEND_USER_MESSAGE           = "SendUserMessage"
+    SHARE_ONBOARDING_GUIDE      = "ShareOnboardingGuide"
+    SHOW_ONBOARDING_ROLE_PICKER = "ShowOnboardingRolePicker"
+    SKILL                       = "Skill"
+    SUBAGENT_HANDBACK           = "SubagentHandback"
+    TASK_CREATE                 = "TaskCreate"
+    TASK_GET                    = "TaskGet"
+    TASK_LIST                   = "TaskList"
+    TASK_STOP                   = "TaskStop"
+    TASK_UPDATE                 = "TaskUpdate"
+    TODO_WRITE                  = "TodoWrite"
+    TOOL_SEARCH                 = "ToolSearch"
+    WAIT_FOR_MCP_SERVERS        = "WaitForMcpServers"
+    WEB_FETCH                   = "WebFetch"
+    WEB_SEARCH                  = "WebSearch"
+    WORKFLOW                    = "Workflow"
+    WRITE                       = "Write"
+
+    # Legacy tool-name constants preserved for backward compatibility.
+    # See `LEGACY_TOOL_NAME_ALIASES` for canonical replacements.
     TASK                  = "Task"
-    SKILL                 = "Skill"
-    NOTEBOOK_EDIT         = "NotebookEdit"
-    WEB_SEARCH            = "WebSearch"
-    WEB_FETCH             = "WebFetch"
-    ASK_USER_QUESTION     = "AskUserQuestion"
     READ_MCP_RESOURCE     = "ReadMcpResource"
     READ_MCP_RESOURCE_DIR = "ReadMcpResourceDir"
+
+    BUILTIN_TOOL_NAMES = Set{
+      AGENT,
+      ARTIFACT,
+      ASK_USER_QUESTION,
+      BASH,
+      CLAUDE_DESIGN,
+      CRON_CREATE,
+      CRON_DELETE,
+      CRON_LIST,
+      EDIT,
+      END_CONVERSATION,
+      ENTER_PLAN_MODE,
+      ENTER_WORKTREE,
+      EXIT_PLAN_MODE,
+      EXIT_WORKTREE,
+      GLOB,
+      GREP,
+      LIST_AGENTS,
+      LIST_MCP_RESOURCES_TOOL,
+      LSP,
+      MONITOR,
+      NOTEBOOK_EDIT,
+      OFFER_CHROME_SETUP,
+      POWER_SHELL,
+      PROJECTS,
+      PROPOSE_SKILLS,
+      PROPOSE_GOAL,
+      PUSH_NOTIFICATION,
+      READ,
+      READ_MCP_RESOURCE_DIR_TOOL,
+      READ_MCP_RESOURCE_TOOL,
+      READ_NOTIFICATIONS,
+      REMOTE_TRIGGER,
+      REPORT_FINDINGS,
+      SCHEDULE_WAKEUP,
+      SEND_FEEDBACK,
+      SEND_MESSAGE,
+      SEND_USER_FILE,
+      SEND_USER_MESSAGE,
+      SHARE_ONBOARDING_GUIDE,
+      SHOW_ONBOARDING_ROLE_PICKER,
+      SKILL,
+      SUBAGENT_HANDBACK,
+      TASK_CREATE,
+      TASK_GET,
+      TASK_LIST,
+      TASK_STOP,
+      TASK_UPDATE,
+      TODO_WRITE,
+      TOOL_SEARCH,
+      WAIT_FOR_MCP_SERVERS,
+      WEB_FETCH,
+      WEB_SEARCH,
+      WORKFLOW,
+      WRITE,
+    }
+
+    LEGACY_TOOL_NAME_ALIASES = {
+      TASK                  => AGENT,
+      "KillShell"           => TASK_STOP,
+      "KillBash"            => TASK_STOP,
+      "ListPeers"           => LIST_AGENTS,
+      "Brief"               => SEND_USER_MESSAGE,
+      "ListMcpResources"    => LIST_MCP_RESOURCES_TOOL,
+      READ_MCP_RESOURCE     => READ_MCP_RESOURCE_TOOL,
+      READ_MCP_RESOURCE_DIR => READ_MCP_RESOURCE_DIR_TOOL,
+    }
   end
+
+  # All 54 canonical built-in tool names exported by the Claude Agent SDK.
+  BUILTIN_TOOL_NAMES = BuiltinTools::BUILTIN_TOOL_NAMES
+
+  # Map of legacy built-in tool names to their canonical `BuiltinTools` names.
+  LEGACY_TOOL_NAME_ALIASES = BuiltinTools::LEGACY_TOOL_NAME_ALIASES
 
   # Shared parse plumbing for tool output helpers.
   module ToolOutputParser
