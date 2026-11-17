@@ -1,4 +1,5 @@
 require "json"
+require "./types/control_messages"
 
 module ClaudeAgent
   # Hook event types mirroring Claude Code CLI hook names.
@@ -27,6 +28,20 @@ module ClaudeAgent
     # Fired when a new working directory is registered mid-session
     # (TS SDK 0.3.219 / control protocol DirectoryAdded lifecycle).
     DirectoryAdded
+    PostToolBatch       # After a batch of tool executions completes
+    UserPromptExpansion # When a user prompt is expanded (commands/@mentions)
+    StopFailure         # When agent stops due to API/runtime failure
+    PostCompact         # After conversation compaction completes
+    PreModelSwitch      # Before switching active model mid-session
+    PostModelSwitch     # After switching active model mid-session
+    PermissionDenied    # When a tool call is denied by permission rules/classifier
+    Setup               # Session setup / environment initialization
+    TaskCreated         # When a background task is created
+    WorktreeCreate      # When creating a git worktree for a task/session
+    WorktreeRemove      # When removing a git worktree
+    InstructionsLoaded  # When CLAUDE.md / instructions files are loaded
+    CwdChanged          # When the session working directory changes
+    FileChanged         # When a watched file changes on disk
   end
 
   # Forward declaration for types used in callback
@@ -43,12 +58,14 @@ module ClaudeAgent
     property matcher : String? # Regex pattern for tool names
     property hooks : Array(HookCallback)
     property timeout : Float64?
+    property on_failure : String? # "continue" | "block"
     @compiled_matcher : Regex?
 
     def initialize(
       @matcher : String? = nil,
       @hooks : Array(HookCallback) = [] of HookCallback,
       @timeout : Float64? = nil,
+      @on_failure : String? = nil,
     )
       @compiled_matcher = @matcher.try { |pattern| Regex.new(pattern) }
     end
@@ -62,49 +79,139 @@ module ClaudeAgent
     end
   end
 
+  alias HookEntryList = Array(HookMatcher) | Array(HookCallback)
+
   struct HookConfig
     property pre_tool_use : Array(HookMatcher)?
     property post_tool_use : Array(HookMatcher)?
     property post_tool_use_failure : Array(HookMatcher)?
     property permission_request : Array(HookMatcher)?
-    property elicitation : Array(HookCallback)?
-    property elicitation_result : Array(HookCallback)?
-    property user_prompt_submit : Array(HookCallback)?
-    property stop : Array(HookCallback)?
-    property subagent_start : Array(HookCallback)?
-    property subagent_stop : Array(HookCallback)?
-    property pre_compact : Array(HookCallback)?
-    property session_start : Array(HookCallback)?
-    property session_end : Array(HookCallback)?
-    property notification : Array(HookCallback)?
-    property teammate_idle : Array(HookCallback)?
-    property task_completed : Array(HookCallback)?
-    property config_change : Array(HookCallback)?
+    property elicitation : HookEntryList?
+    property elicitation_result : HookEntryList?
+    property user_prompt_submit : HookEntryList?
+    property stop : HookEntryList?
+    property subagent_start : HookEntryList?
+    property subagent_stop : HookEntryList?
+    property pre_compact : HookEntryList?
+    property session_start : HookEntryList?
+    property session_end : HookEntryList?
+    property notification : HookEntryList?
+    property teammate_idle : HookEntryList?
+    property task_completed : HookEntryList?
+    property config_change : HookEntryList?
     # MessageDisplay: transform/hide assistant text as it is displayed.
-    property message_display : Array(HookCallback)?
+    property message_display : HookEntryList?
     # DirectoryAdded: a new working directory was registered mid-session.
-    property directory_added : Array(HookCallback)?
+    property directory_added : HookEntryList?
+    property post_tool_batch : HookEntryList?
+    property user_prompt_expansion : HookEntryList?
+    property stop_failure : HookEntryList?
+    property post_compact : HookEntryList?
+    property pre_model_switch : HookEntryList?
+    property post_model_switch : HookEntryList?
+    property permission_denied : HookEntryList?
+    property setup : HookEntryList?
+    property task_created : HookEntryList?
+    property worktree_create : HookEntryList?
+    property worktree_remove : HookEntryList?
+    property instructions_loaded : HookEntryList?
+    property cwd_changed : HookEntryList?
+    property file_changed : HookEntryList?
 
     def initialize(
       @pre_tool_use : Array(HookMatcher)? = nil,
       @post_tool_use : Array(HookMatcher)? = nil,
       @post_tool_use_failure : Array(HookMatcher)? = nil,
       @permission_request : Array(HookMatcher)? = nil,
-      @elicitation : Array(HookCallback)? = nil,
-      @elicitation_result : Array(HookCallback)? = nil,
-      @user_prompt_submit : Array(HookCallback)? = nil,
-      @stop : Array(HookCallback)? = nil,
-      @subagent_start : Array(HookCallback)? = nil,
-      @subagent_stop : Array(HookCallback)? = nil,
-      @pre_compact : Array(HookCallback)? = nil,
-      @session_start : Array(HookCallback)? = nil,
-      @session_end : Array(HookCallback)? = nil,
-      @notification : Array(HookCallback)? = nil,
-      @teammate_idle : Array(HookCallback)? = nil,
-      @task_completed : Array(HookCallback)? = nil,
-      @config_change : Array(HookCallback)? = nil,
-      @message_display : Array(HookCallback)? = nil,
-      @directory_added : Array(HookCallback)? = nil,
+      @elicitation : HookEntryList? = nil,
+      @elicitation_result : HookEntryList? = nil,
+      @user_prompt_submit : HookEntryList? = nil,
+      @stop : HookEntryList? = nil,
+      @subagent_start : HookEntryList? = nil,
+      @subagent_stop : HookEntryList? = nil,
+      @pre_compact : HookEntryList? = nil,
+      @session_start : HookEntryList? = nil,
+      @session_end : HookEntryList? = nil,
+      @notification : HookEntryList? = nil,
+      @teammate_idle : HookEntryList? = nil,
+      @task_completed : HookEntryList? = nil,
+      @config_change : HookEntryList? = nil,
+      @message_display : HookEntryList? = nil,
+      @directory_added : HookEntryList? = nil,
+      @post_tool_batch : HookEntryList? = nil,
+      @user_prompt_expansion : HookEntryList? = nil,
+      @stop_failure : HookEntryList? = nil,
+      @post_compact : HookEntryList? = nil,
+      @pre_model_switch : HookEntryList? = nil,
+      @post_model_switch : HookEntryList? = nil,
+      @permission_denied : HookEntryList? = nil,
+      @setup : HookEntryList? = nil,
+      @task_created : HookEntryList? = nil,
+      @worktree_create : HookEntryList? = nil,
+      @worktree_remove : HookEntryList? = nil,
+      @instructions_loaded : HookEntryList? = nil,
+      @cwd_changed : HookEntryList? = nil,
+      @file_changed : HookEntryList? = nil,
+    )
+    end
+  end
+
+  # Reasoning effort level active when a hook fires.
+  struct HookEffort
+    include JSON::Serializable
+
+    property level : String
+
+    def initialize(@level : String)
+    end
+  end
+
+  # Summary of an in-flight background task reported on Stop / SubagentStop inputs.
+  struct BackgroundTaskSummary
+    include JSON::Serializable
+
+    property id : String
+    property type : String
+    property status : String
+    property description : String
+    property command : String? = nil
+    property agent_type : String? = nil
+    property server : String? = nil
+    property tool : String? = nil
+    property name : String? = nil
+
+    def initialize(
+      @id : String,
+      @type : String,
+      @status : String,
+      @description : String,
+      @command : String? = nil,
+      @agent_type : String? = nil,
+      @server : String? = nil,
+      @tool : String? = nil,
+      @name : String? = nil,
+    )
+    end
+  end
+
+  # Summary of a session-scoped scheduled wakeup reported on Stop / SubagentStop inputs.
+  struct SessionCronSummary
+    include JSON::Serializable
+
+    property id : String
+    property schedule : String
+    property? recurring : Bool
+    property prompt : String
+
+    def recurring : Bool
+      @recurring
+    end
+
+    def initialize(
+      @id : String,
+      @schedule : String,
+      @recurring : Bool,
+      @prompt : String,
     )
     end
   end
@@ -176,6 +283,19 @@ module ClaudeAgent
     # can correlate their events with OpenTelemetry prompt-level spans.
     # Matches the TS SDK's `prompt_id` (0.3.196). Absent on older CLIs.
     property prompt_id : String?
+    # Provenance of the MCP server exposing the tool (PreToolUse, PostToolUse,
+    # PostToolUseFailure, PermissionRequest, PermissionDenied).
+    property mcp_server : MCPServerProvenance?
+    # Active reasoning effort level when the hook fired.
+    property effort : HookEffort?
+    # Tool execution duration in milliseconds (PostToolUse, PostToolUseFailure).
+    property duration_ms : Int64?
+    # Text content of the last assistant message before stopping (Stop, SubagentStop).
+    property last_assistant_message : String?
+    # In-flight background work reported on Stop / SubagentStop.
+    property background_tasks : Array(BackgroundTaskSummary)?
+    # Session-scoped scheduled wakeups reported on Stop / SubagentStop.
+    property session_crons : Array(SessionCronSummary)?
 
     def initialize(
       @session_id : String? = nil,
@@ -219,6 +339,12 @@ module ClaudeAgent
       @message_content : String? = nil,
       @directory_path : String? = nil,
       @prompt_id : String? = nil,
+      @mcp_server : MCPServerProvenance? = nil,
+      @effort : HookEffort? = nil,
+      @duration_ms : Int64? = nil,
+      @last_assistant_message : String? = nil,
+      @background_tasks : Array(BackgroundTaskSummary)? = nil,
+      @session_crons : Array(SessionCronSummary)? = nil,
     )
     end
   end
@@ -257,6 +383,23 @@ module ClaudeAgent
     # Matches TS SDK 0.3.238+.
     @[JSON::Field(key: "suppressOriginalPrompt")]
     property suppress_original_prompt : Bool?
+    # SessionStart / UserPromptSubmit: sets the session title.
+    @[JSON::Field(key: "sessionTitle")]
+    property session_title : String?
+    # SessionStart: initial user message for the session.
+    @[JSON::Field(key: "initialUserMessage")]
+    property initial_user_message : String?
+    # SessionStart / CwdChanged / FileChanged: paths to watch for FileChanged events.
+    @[JSON::Field(key: "watchPaths")]
+    property watch_paths : Array(String)?
+    # SessionStart: re-scan skill and command directories after hooks complete.
+    @[JSON::Field(key: "reloadSkills")]
+    property reload_skills : Bool?
+    # PermissionDenied: tells the model it may retry the denied tool call.
+    property retry : Bool?
+    # WorktreeCreate: absolute path to the created worktree directory.
+    @[JSON::Field(key: "worktreePath")]
+    property worktree_path : String?
 
     def initialize(
       @hook_event_name : String,
@@ -272,6 +415,12 @@ module ClaudeAgent
       @display_content : String? = nil,
       @classifier_context : String? = nil,
       @suppress_original_prompt : Bool? = nil,
+      @session_title : String? = nil,
+      @initial_user_message : String? = nil,
+      @watch_paths : Array(String)? = nil,
+      @reload_skills : Bool? = nil,
+      @retry : Bool? = nil,
+      @worktree_path : String? = nil,
     )
     end
   end

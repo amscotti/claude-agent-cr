@@ -5,8 +5,27 @@ require "./hooks"
 require "./types/control_messages"
 
 module ClaudeAgent
+  # Sentinel distinguishing an omitted optional parameter from an explicit `nil`
+  # (e.g. `AgentClient#set_max_thinking_tokens`).
+  struct Omitted
+  end
+
+  OMITTED = Omitted.new
+
   class AgentClient
+    {% if compare_versions(Crystal::VERSION, "1.12.0") >= 0 %}
+      private alias MonotonicTimestamp = Time::Instant
+    {% else %}
+      private alias MonotonicTimestamp = Time::Span
+    {% end %}
+
     private alias ControlRequestResult = Hash(String, JSON::Any) | Exception
+    private INITIALIZE_TIMEOUT             = 90.seconds
+    private MAX_INITIALIZE_STARTUP_TIMEOUT = 10.minutes
+    private DEFAULT_RUN_END_CEILING_MS     =       600_000_i64
+    private MAX_RUN_END_CEILING_MS         = 2_147_483_647_i64
+    private RUN_END_CEILING_ENV            = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"
+
     private HOOK_NAME_ALIASES = {
       "PreToolUse"            => "pre_tool_use",
       "pre_tool_use"          => "pre_tool_use",
@@ -46,6 +65,34 @@ module ClaudeAgent
       "message_display"       => "message_display",
       "DirectoryAdded"        => "directory_added",
       "directory_added"       => "directory_added",
+      "PostToolBatch"         => "post_tool_batch",
+      "post_tool_batch"       => "post_tool_batch",
+      "UserPromptExpansion"   => "user_prompt_expansion",
+      "user_prompt_expansion" => "user_prompt_expansion",
+      "StopFailure"           => "stop_failure",
+      "stop_failure"          => "stop_failure",
+      "PostCompact"           => "post_compact",
+      "post_compact"          => "post_compact",
+      "PreModelSwitch"        => "pre_model_switch",
+      "pre_model_switch"      => "pre_model_switch",
+      "PostModelSwitch"       => "post_model_switch",
+      "post_model_switch"     => "post_model_switch",
+      "PermissionDenied"      => "permission_denied",
+      "permission_denied"     => "permission_denied",
+      "Setup"                 => "setup",
+      "setup"                 => "setup",
+      "TaskCreated"           => "task_created",
+      "task_created"          => "task_created",
+      "WorktreeCreate"        => "worktree_create",
+      "worktree_create"       => "worktree_create",
+      "WorktreeRemove"        => "worktree_remove",
+      "worktree_remove"       => "worktree_remove",
+      "InstructionsLoaded"    => "instructions_loaded",
+      "instructions_loaded"   => "instructions_loaded",
+      "CwdChanged"            => "cwd_changed",
+      "cwd_changed"           => "cwd_changed",
+      "FileChanged"           => "file_changed",
+      "file_changed"          => "file_changed",
     }
 
     # Task types whose completion can wake a follow-up turn. Matches the
@@ -102,6 +149,11 @@ module ClaudeAgent
     # read only on the response-reader fiber. Mirrors Python's
     # `Query._last_error_result` (0.2.140).
     @last_error_result : ResultMessage? = nil
+    @session_state : String? = nil
+    @result_received : Bool = false
+    @turn_in_progress : Bool = false
+    @ceiling_deadline : MonotonicTimestamp? = nil
+    @init_keepalive_channel : Channel(Nil)? = nil
 
     def initialize(@options : AgentOptions? = nil, cli_client : CLIClient? = nil)
       @cli_client = cli_client || CLIClient.new(@options)
@@ -127,6 +179,7 @@ module ClaudeAgent
       # Same mutual-exclusion rule as the one-shot path (mirrors Python
       # `_configure_can_use_tool`, which both entry points share).
       @options.try(&.validate_can_use_tool!)
+      validate_mcp_server_names!
       @cli_client.start
       setup_transcript_mirror
       @state_mutex.synchronize do
@@ -138,6 +191,7 @@ module ClaudeAgent
         send_sdk_initialization
       rescue ex
         @state_mutex.synchronize { @started = false }
+        fail_pending_control_requests(ex)
         teardown_session_store
         @cli_client.stop
         @message_channel.close unless @message_channel.closed?
@@ -149,12 +203,22 @@ module ClaudeAgent
     # Send SDK MCP server initialization to CLI
     private def send_sdk_initialization
       return if @sdk_init_sent
+
+      manifests = capture_sdk_server_manifests
       # Register hooks under the same mutex as reinitialize / hook lookups
       # so the response-reader fiber cannot race registry mutations.
-      request = @control_request_mutex.synchronize { build_initialize_request }
-      response = send_control_request(request, 90.seconds)
+      request, blocks_on_failure = @control_request_mutex.synchronize do
+        build_initialize_request(manifests)
+      end
+      response = send_control_request(
+        request,
+        initialize_timeout,
+        max_total_timeout: max_initialize_timeout,
+      )
+      validate_initialize_on_failure!(response, blocks_on_failure, check_hooks_applied: true)
       @server_info = response.empty? ? nil : ServerInfo.from_data(response)
       @sdk_init_sent = true
+      replay_pending_requests(response)
     end
 
     # Re-send the initialize control request after a transport gap.
@@ -170,45 +234,225 @@ module ClaudeAgent
     def reinitialize : Hash(String, JSON::Any)
       raise ConnectionError.new("Not connected. Call start() first.") unless started?
 
-      request = @control_request_mutex.synchronize do
+      manifests = capture_sdk_server_manifests
+      request, blocks_on_failure = @control_request_mutex.synchronize do
         @registered_hook_callbacks.clear
         @registered_control_hook_events.clear
         @hook_callback_counter = 0
-        build_initialize_request
+        build_initialize_request(manifests)
       end
 
-      response = send_control_request(request, 90.seconds)
+      response = send_control_request(
+        request,
+        initialize_timeout,
+        max_total_timeout: max_initialize_timeout,
+      )
+      validate_initialize_on_failure!(response, blocks_on_failure, check_hooks_applied: false)
       @server_info = response.empty? ? nil : ServerInfo.from_data(response)
       @sdk_init_sent = true
+      replay_pending_requests(response)
       response
     end
 
-    private def build_initialize_request : Hash(String, JSON::Any)
+    protected def initialize_timeout : Time::Span
+      INITIALIZE_TIMEOUT
+    end
+
+    protected def max_initialize_timeout : Time::Span
+      MAX_INITIALIZE_STARTUP_TIMEOUT
+    end
+
+    private def build_initialize_request(
+      manifests : Hash(String, JSON::Any)? = nil,
+    ) : {Hash(String, JSON::Any), Bool}
       request = {} of String => JSON::Any
       request["subtype"] = JSON::Any.new("initialize")
 
-      populate_initialize_mcp(request)
-      populate_initialize_hooks(request)
+      populate_initialize_mcp(request, manifests)
+      blocks_on_failure = populate_initialize_hooks(request)
       populate_initialize_agents(request)
       populate_initialize_flags(request)
       populate_initialize_skills(request)
       populate_initialize_system_prompt(request)
 
-      request
+      {request, blocks_on_failure}
     end
 
-    private def populate_initialize_mcp(request : Hash(String, JSON::Any))
+    private def validate_mcp_server_names! : Nil
+      @options.try(&.mcp_servers).try(&.each_key { |name| ClaudeAgent.validate_mcp_server_name!(name) })
+      @cli_client.sdk_server_names.each do |name|
+        ClaudeAgent.validate_mcp_server_name!(name)
+        @cli_client.get_sdk_server(name).try { |server| ClaudeAgent.validate_mcp_server_name!(server.name) }
+      end
+    end
+
+    private def populate_initialize_mcp(
+      request : Hash(String, JSON::Any),
+      manifests : Hash(String, JSON::Any)? = nil,
+    )
+      validate_mcp_server_names!
       return unless @cli_client.has_sdk_servers?
 
+      server_names = @cli_client.sdk_server_names
       request["sdkMcpServers"] = JSON::Any.new(
-        @cli_client.sdk_server_names.map { |name| JSON::Any.new(name) }
+        server_names.map { |name| JSON::Any.new(name) }
       )
+
+      configs = {} of String => JSON::Any
+      server_names.each do |name|
+        server = @cli_client.get_sdk_server(name)
+        next unless server
+
+        if cfg = build_sdk_server_config(server)
+          configs[name] = JSON::Any.new(cfg)
+        end
+      end
+      request["sdkMcpServerConfigs"] = JSON::Any.new(configs) unless configs.empty?
+
+      resolved_manifests = manifests || capture_sdk_server_manifests
+      request["sdkMcpServerManifests"] = JSON::Any.new(resolved_manifests) unless resolved_manifests.empty?
     end
 
-    private def populate_initialize_hooks(request : Hash(String, JSON::Any))
-      if hooks_payload = build_hook_initialize_payload
+    private def build_sdk_server_config(server : SDKMCPServer) : Hash(String, JSON::Any)?
+      cfg = {} of String => JSON::Any
+      server.timeout.try { |timeout| cfg["timeout"] = JSON::Any.new(timeout.to_i64) }
+      server.tool_policies.try do |policies|
+        cfg["tools"] = JSON::Any.new(build_tool_policies_json(policies))
+      end
+      cfg.empty? ? nil : cfg
+    end
+
+    private def build_tool_policies_json(policies : Array(MCPServerToolPolicy)) : Array(JSON::Any)
+      policies.map do |policy|
+        obj = {"name" => JSON::Any.new(policy.name)}
+        policy.permission_policy.try { |perm| obj["permission_policy"] = JSON::Any.new(perm) }
+        policy.org_max_permission.try { |org| obj["org_max_permission"] = JSON::Any.new(org) }
+        JSON::Any.new(obj)
+      end
+    end
+
+    private def capture_sdk_server_manifests : Hash(String, JSON::Any)
+      manifests = {} of String => JSON::Any
+      return manifests unless @cli_client.has_sdk_servers?
+
+      @cli_client.sdk_server_names.each do |name|
+        server = @cli_client.get_sdk_server(name)
+        next unless server
+
+        manifest = capture_sdk_server_manifest(server)
+        manifests[name] = JSON::Any.new(manifest) unless manifest.empty?
+      end
+      manifests
+    end
+
+    private def capture_sdk_server_manifest(server : SDKMCPServer) : Hash(String, JSON::Any)
+      done = Channel(Hash(String, JSON::Any)?).new(1)
+      logger = ->(msg : String) { log_stderr("[claude-agent-cr] #{msg}\n") }
+
+      spawn do
+        result = server.build_manifest(logger)
+        begin
+          done.send(result) unless done.closed?
+        rescue Channel::ClosedError
+        end
+      rescue ex
+        log_stderr("[claude-agent-cr] SDK MCP manifest capture failed for #{server.name.inspect}: #{ex.message}\n")
+        begin
+          done.send(nil) unless done.closed?
+        rescue Channel::ClosedError
+        end
+      end
+
+      select
+      when manifest = done.receive
+        manifest || {} of String => JSON::Any
+      when timeout(250.milliseconds)
+        done.close
+        log_stderr("[claude-agent-cr] SDK MCP manifest capture timed out for #{server.name.inspect}\n")
+        {} of String => JSON::Any
+      end
+    end
+
+    private def validate_initialize_on_failure!(
+      response : Hash(String, JSON::Any),
+      blocks_on_failure : Bool,
+      *,
+      check_hooks_applied : Bool,
+    ) : Nil
+      return unless blocks_on_failure
+
+      unless response["hook_on_failure_supported"]?.try(&.as_bool?) == true
+        raise ConnectionError.new(
+          "The process answering initialize does not honor on_failure on hook matchers, " \
+          "so a hook that fails would not block. Update Claude Code or remove on_failure=\"block\".",
+        )
+      end
+
+      if check_hooks_applied && response["hooks_applied"]?.try(&.as_bool?) == false
+        raise ConnectionError.new(
+          "This session was already running and did not register your hooks, so a hook set to " \
+          "on_failure=\"block\" would never run. Start a new session or remove on_failure=\"block\".",
+        )
+      end
+    end
+
+    private def replay_pending_requests(response : Hash(String, JSON::Any)) : Nil
+      replay_pending_permission_requests(response["pending_permission_requests"]?.try(&.as_a?))
+      replay_pending_elicitation_requests(response["pending_elicitation_requests"]?.try(&.as_a?))
+    end
+
+    private def replay_pending_permission_requests(entries : Array(JSON::Any)?) : Nil
+      return unless entries
+
+      entries.each do |entry|
+        item = entry.as_h?
+        next unless item
+
+        req_id = item["request_id"]?.try(&.as_s?)
+        next unless req_id
+
+        inner = (item["request"]?.try(&.as_h?) || item).dup
+        inner.delete("server_policy_ask_only")
+        inner.delete("serverPolicyAskOnly")
+        inner["subtype"] ||= JSON::Any.new("can_use_tool")
+
+        begin
+          perm_req = ControlPermissionRequest.from_json(inner.to_json)
+          handle_control_permission_request(req_id, perm_req)
+        rescue ex
+          send_control_error(req_id, ex.message || "Failed to replay permission request")
+        end
+      end
+    end
+
+    private def replay_pending_elicitation_requests(entries : Array(JSON::Any)?) : Nil
+      return unless entries
+
+      entries.each do |entry|
+        item = entry.as_h?
+        next unless item
+
+        req_id = item["request_id"]?.try(&.as_s?)
+        next unless req_id
+
+        inner = (item["request"]?.try(&.as_h?) || item).dup
+        inner["subtype"] ||= JSON::Any.new("elicitation")
+
+        begin
+          elicit_req = ControlElicitationRequest.from_json(inner.to_json)
+          handle_control_elicitation_request(req_id, elicit_req)
+        rescue ex
+          send_control_error(req_id, ex.message || "Failed to replay elicitation request")
+        end
+      end
+    end
+
+    private def populate_initialize_hooks(request : Hash(String, JSON::Any)) : Bool
+      hooks_payload, blocks_on_failure = build_hook_initialize_payload
+      if hooks_payload
         request["hooks"] = JSON::Any.new(hooks_payload)
       end
+      blocks_on_failure
     end
 
     private def populate_initialize_agents(request : Hash(String, JSON::Any))
@@ -243,15 +487,25 @@ module ClaudeAgent
       end
     end
 
-    # `exclude_dynamic_sections` on a `SystemPromptPreset` flows through
-    # the initialize request as `excludeDynamicSections`, not a CLI flag.
+    # `exclude_dynamic_sections` and `snapshot` on `SystemPromptPreset` /
+    # `SystemPromptCustom` flow through the initialize request as
+    # `excludeDynamicSections` and `systemPromptSnapshot`, not CLI flags.
     # `title` is also forwarded here so the CLI can apply it to the
     # session transcript without us waiting for `session_id` first.
     # Older CLIs silently ignore unknown initialize fields.
     private def populate_initialize_system_prompt(request : Hash(String, JSON::Any))
-      preset = @options.try(&.system_prompt).as?(SystemPromptPreset)
-      if preset && preset.exclude_dynamic_sections?
-        request["excludeDynamicSections"] = JSON::Any.new(true)
+      case system_prompt = @options.try(&.system_prompt)
+      when SystemPromptPreset
+        if system_prompt.exclude_dynamic_sections?
+          request["excludeDynamicSections"] = JSON::Any.new(true)
+        end
+        unless (snapshot = system_prompt.snapshot).nil?
+          request["systemPromptSnapshot"] = JSON::Any.new(snapshot)
+        end
+      when SystemPromptCustom
+        unless (snapshot = system_prompt.snapshot).nil?
+          request["systemPromptSnapshot"] = JSON::Any.new(snapshot)
+        end
       end
 
       @options.try(&.title).try do |title|
@@ -276,6 +530,7 @@ module ClaudeAgent
 
     # Send a query and get responses
     def query(prompt : String, *, uuid : String? = nil, should_query : Bool = true)
+      reset_turn_state_for_prompt
       trigger_hook(:user_prompt_submit, prompt) if should_query
       @cli_client.send_prompt(prompt, uuid: uuid, should_query: should_query)
     end
@@ -344,11 +599,34 @@ module ClaudeAgent
       send_control_request(request)
     end
 
-    # ameba:disable Naming/AccessorMethodName
-    def get_mcp_status : MCPStatusResponse
-      response = send_control_request({
+    # Update the thinking token budget and/or thinking display mode mid-session.
+    # Omitting `max_thinking_tokens` (leaving `OMITTED`) leaves the budget
+    # unchanged; passing explicit `nil` sends `"max_thinking_tokens": null` to
+    # reset to the session default. `thinking_display` accepts `"summarized"`,
+    # `"omitted"`, or `"highlights"`.
+    def set_max_thinking_tokens(
+      max_thinking_tokens : Int32? | Omitted = OMITTED,
+      *,
+      thinking_display : String? = nil,
+    ) : Hash(String, JSON::Any)
+      request = {
+        "subtype" => JSON::Any.new("set_max_thinking_tokens"),
+      }
+      unless max_thinking_tokens.is_a?(Omitted)
+        request["max_thinking_tokens"] = max_thinking_tokens ? JSON::Any.new(max_thinking_tokens.to_i64) : JSON::Any.new(nil)
+      end
+      thinking_display.try { |display| request["thinking_display"] = JSON::Any.new(display) }
+      send_control_request(request)
+    end
+
+    def get_mcp_status(*, live_reply : Bool? = nil) : MCPStatusResponse
+      request = {
         "subtype" => JSON::Any.new("mcp_status"),
-      })
+      }
+      unless live_reply.nil?
+        request["liveReply"] = JSON::Any.new(live_reply)
+      end
+      response = send_control_request(request)
 
       response = response.dup
       response["mcpServers"] ||= JSON::Any.new([] of JSON::Any)
@@ -356,21 +634,55 @@ module ClaudeAgent
     end
 
     # Retrieve a breakdown of context window usage by category.
-    # ameba:disable Naming/AccessorMethodName
-    def get_context_usage : ContextUsageResponse
-      response = send_control_request({
+    def get_context_usage(*, detail : String? = nil) : ContextUsageResponse
+      request = {
         "subtype" => JSON::Any.new("get_context_usage"),
-      })
+      }
+      detail.try { |value| request["detail"] = JSON::Any.new(value) }
+      response = send_control_request(request)
 
       ContextUsageResponse.from_json(response.to_json)
     end
 
     # Reload plugins and receive refreshed commands, agents, and MCP servers.
     # Returns the raw response payload (shape mirrors system/init).
-    def reload_plugins : Hash(String, JSON::Any)
-      send_control_request({
+    def reload_plugins(
+      *,
+      hold_on_cache_impact : Bool? = nil,
+      add_plugins : (Array(PluginEntry) | Array(String) | Array(PluginConfig))? = nil,
+      refuse_if_busy : Bool? = nil,
+    ) : Hash(String, JSON::Any)
+      request = {
         "subtype" => JSON::Any.new("reload_plugins"),
-      })
+      }
+      unless hold_on_cache_impact.nil?
+        request["hold_on_cache_impact"] = JSON::Any.new(hold_on_cache_impact)
+      end
+      if plugins = add_plugins
+        request["add_plugins"] = JSON::Any.new(serialize_reload_plugins(plugins))
+      end
+      unless refuse_if_busy.nil?
+        request["refuse_if_busy"] = JSON::Any.new(refuse_if_busy)
+      end
+      send_control_request(request)
+    end
+
+    private def serialize_reload_plugins(
+      plugins : Array(PluginEntry) | Array(String) | Array(PluginConfig),
+    ) : Array(JSON::Any)
+      plugins.map do |entry|
+        case entry
+        when String
+          JSON::Any.new({
+            "type" => JSON::Any.new("local"),
+            "path" => JSON::Any.new(entry),
+          })
+        when PluginConfig
+          JSON.parse(entry.to_json)
+        else
+          JSON::Any.new(nil)
+        end
+      end
     end
 
     # Request a prompt suggestion based on the current conversation context.
@@ -393,11 +705,134 @@ module ClaudeAgent
       *,
       request_timeouts : Hash(String, Int32)? = nil,
     )
+      mcp_servers.each_key { |name| ClaudeAgent.validate_mcp_server_name!(name) }
       servers = merge_mcp_request_timeouts(mcp_servers, request_timeouts)
       send_control_request({
-        "subtype"    => JSON::Any.new("mcp_set_servers"),
-        "mcpServers" => JSON::Any.new(servers),
+        "subtype" => JSON::Any.new("mcp_set_servers"),
+        "servers" => JSON::Any.new(servers),
       })
+    end
+
+    # Replace the active MCP server configuration using typed `MCPServerConfig`
+    # entries, updating the in-process SDK MCP server registry cleanly.
+    def set_mcp_servers(
+      servers : Hash(String, MCPServerConfig),
+      *,
+      request_timeouts : Hash(String, Int32)? = nil,
+    )
+      raise ConnectionError.new("Not connected. Call start() first.") unless started?
+
+      sdk_servers, wire_servers = prepare_typed_mcp_servers(servers, request_timeouts)
+      previous_servers = snapshot_sdk_servers
+
+      @cli_client.replace_sdk_servers(sdk_servers)
+      begin
+        send_control_request({
+          "subtype" => JSON::Any.new("mcp_set_servers"),
+          "servers" => JSON::Any.new(wire_servers),
+        })
+      rescue ex
+        @cli_client.replace_sdk_servers(previous_servers)
+        raise ex
+      end
+    end
+
+    def set_mcp_servers(
+      servers : Hash(String, SDKMCPServer),
+      *,
+      request_timeouts : Hash(String, Int32)? = nil,
+    )
+      set_mcp_servers(
+        servers.transform_values(&.as(MCPServerConfig)),
+        request_timeouts: request_timeouts,
+      )
+    end
+
+    def set_mcp_servers(
+      servers : Hash(String, ExternalMCPServerConfig),
+      *,
+      request_timeouts : Hash(String, Int32)? = nil,
+    )
+      set_mcp_servers(
+        servers.transform_values(&.as(MCPServerConfig)),
+        request_timeouts: request_timeouts,
+      )
+    end
+
+    private def snapshot_sdk_servers : Hash(String, SDKMCPServer)
+      previous = {} of String => SDKMCPServer
+      @cli_client.sdk_server_names.each do |name|
+        if existing = @cli_client.get_sdk_server(name)
+          previous[name] = existing
+        end
+      end
+      previous
+    end
+
+    private def prepare_typed_mcp_servers(
+      servers : Hash(String, MCPServerConfig),
+      request_timeouts : Hash(String, Int32)?,
+    ) : {Hash(String, SDKMCPServer), Hash(String, JSON::Any)}
+      sdk_servers = {} of String => SDKMCPServer
+      wire_servers = {} of String => JSON::Any
+
+      servers.each do |name, config|
+        ClaudeAgent.validate_mcp_server_name!(name)
+        timeout_override = request_timeouts.try(&.[name]?)
+
+        case config
+        when SDKMCPServer
+          ClaudeAgent.validate_mcp_server_name!(config.name)
+          sdk_servers[name] = config
+          wire_servers[name] = JSON::Any.new(sdk_server_wire_config(config, timeout_override))
+        when ExternalMCPServerConfig
+          wire_servers[name] = JSON::Any.new(external_server_wire_config(config, timeout_override))
+        end
+      end
+
+      {sdk_servers, wire_servers}
+    end
+
+    private def sdk_server_wire_config(
+      config : SDKMCPServer,
+      timeout_override : Int32?,
+    ) : Hash(String, JSON::Any)
+      wire = {
+        "type"    => JSON::Any.new("sdk"),
+        "name"    => JSON::Any.new(config.name),
+        "version" => JSON::Any.new(config.version),
+      } of String => JSON::Any
+
+      effective_timeout = timeout_override || config.timeout
+      effective_timeout.try { |timeout| wire["timeout"] = JSON::Any.new(timeout.to_i64) }
+      config.tool_policies.try do |policies|
+        wire["tools"] = JSON::Any.new(build_tool_policies_json(policies))
+      end
+      wire
+    end
+
+    private def external_server_wire_config(
+      config : ExternalMCPServerConfig,
+      timeout_override : Int32?,
+    ) : Hash(String, JSON::Any)
+      wire = {} of String => JSON::Any
+      config.type.try { |v| wire["type"] = JSON::Any.new(v) }
+      config.command.try { |v| wire["command"] = JSON::Any.new(v) }
+      config.args.try { |v| wire["args"] = JSON::Any.new(v.map { |arg| JSON::Any.new(arg) }) }
+      config.url.try { |v| wire["url"] = JSON::Any.new(v) }
+
+      if env = config.env
+        wire["env"] = JSON::Any.new(env.transform_values { |v| JSON::Any.new(v) })
+      end
+      if headers = config.headers
+        wire["headers"] = JSON::Any.new(headers.transform_values { |v| JSON::Any.new(v) })
+      end
+
+      effective_timeout = timeout_override || config.timeout
+      effective_timeout.try { |timeout| wire["timeout"] = JSON::Any.new(timeout.to_i64) }
+      config.always_load.try { |val| wire["alwaysLoad"] = JSON::Any.new(val) }
+      config.tools.try { |policies| wire["tools"] = JSON::Any.new(build_tool_policies_json(policies)) }
+      wire
     end
 
     private def merge_mcp_request_timeouts(
@@ -511,6 +946,22 @@ module ClaudeAgent
       response["title"]?.try(&.as_s?)
     end
 
+    # Rename the live session transcript via the control protocol.
+    def rename_session(
+      title : String,
+      *,
+      source : String = "host",
+      session_id : String? = nil,
+    ) : Hash(String, JSON::Any)
+      request = {
+        "subtype" => JSON::Any.new("rename_session"),
+        "title"   => JSON::Any.new(title),
+        "source"  => JSON::Any.new(source),
+      }
+      session_id.try { |id| request["session_id"] = JSON::Any.new(id) }
+      send_control_request(request)
+    end
+
     # ameba:enable Naming/AccessorMethodName
 
     # Rewind files to a checkpoint.
@@ -549,36 +1000,37 @@ module ClaudeAgent
     # Iterate over incoming messages.
     #
     # A `ResultMessage` ends one turn, not necessarily the run: delegated
-    # background tasks (`local_agent` / `local_workflow`) can keep running
-    # past it and still emit messages or need control responses (Py 0.2.127 /
-    # #1088). This loop keeps reading while such tasks are in flight, and
-    # only stops once a result has been seen with an empty in-flight set.
-    # When `prompt_suggestions` is enabled, a short post-idle wait still
-    # collects a trailing `prompt_suggestion` message.
+    # background tasks (`local_agent` / `local_workflow`) and CLI
+    # `session_state_changed` transitions (`"running"` / `"requires_action"`)
+    # can keep the run alive past it so follow-up turns still receive hook,
+    # permission, and SDK-MCP responses. When `@session_state` is nil (older
+    # CLIs), falls back to exiting after `ResultMessage` with empty
+    # `@inflight_tasks`. Internal `sdk_host_only: true` frames are dropped
+    # before reaching the caller.
     def each_response(&block : Message ->)
-      result_received = false
+      reset_response_loop_state
       awaiting_prompt_suggestion = false
 
       loop do
-        message = if awaiting_prompt_suggestion
-                    receive_post_result_message
-                  else
-                    @message_channel.receive?
-                  end
+        timed_out, message = next_response_message(awaiting_prompt_suggestion)
+        if timed_out
+          if has_inflight_tasks?
+            clear_run_end_ceiling
+            next
+          end
+          break
+        end
         break unless message
         next if handle_internal_message(message)
 
-        track_task_lifecycle(message)
-        run_message_hooks(message)
-        block.call(message)
+        process_stream_message(message)
 
-        if message.is_a?(ResultMessage)
-          result_received = true
+        unless message.sdk_host_only_frame?
+          run_message_hooks(message)
+          block.call(message)
         end
 
-        # Stop only when a result has been seen and no tracked background
-        # tasks remain. Then optionally wait once for a prompt suggestion.
-        if result_received && !has_inflight_tasks?
+        if should_end_run?
           if @options.try(&.prompt_suggestions?) && !awaiting_prompt_suggestion
             awaiting_prompt_suggestion = true
             next
@@ -591,6 +1043,7 @@ module ClaudeAgent
     # Send a follow-up message. Pass `should_query: false` to append the
     # message to the transcript without triggering an assistant turn.
     def send_user_message(content : String, *, uuid : String? = nil, should_query : Bool = true)
+      reset_turn_state_for_prompt
       trigger_hook(:user_prompt_submit, content) if should_query
       @cli_client.send_user_message(content, uuid: uuid, should_query: should_query)
     end
@@ -653,28 +1106,9 @@ module ClaudeAgent
       @response_fiber = spawn do
         @cli_client.each_message do |message|
           next if @message_channel.closed?
+          next if handle_reader_control_message(message)
 
-          if message.is_a?(ControlResponseMessage)
-            handle_control_response(message)
-            next
-          end
-
-          # SessionStore path: peel transcript_mirror frames off the stream
-          # (do not yield to consumers). Matches Python Query._read_messages.
-          if message.is_a?(UnknownMessage) && message.type == "transcript_mirror"
-            handle_transcript_mirror(message)
-            next
-          end
-
-          # Flush pending mirror entries before consumers see the result so
-          # the store is up to date for this turn.
-          if message.is_a?(ResultMessage)
-            @mirror_batcher.try(&.flush)
-            @last_error_result = message.is_error == true ? message : nil
-          else
-            @last_error_result = nil
-          end
-
+          record_reader_message_state(message)
           @message_channel.send(message)
         end
       rescue Channel::ClosedError
@@ -685,6 +1119,51 @@ module ClaudeAgent
         fail_pending_control_requests(connection_closed_error)
         @message_channel.close unless @message_channel.closed?
       end
+    end
+
+    private def handle_reader_control_message(message : Message) : Bool
+      case message
+      when ControlResponseMessage
+        handle_control_response(message)
+        true
+      when UnknownMessage
+        case message.type
+        when "keep_alive"
+          handle_keep_alive(message)
+          true
+        when "transcript_mirror"
+          handle_transcript_mirror(message)
+          true
+        else
+          false
+        end
+      else
+        false
+      end
+    end
+
+    private def record_reader_message_state(message : Message) : Nil
+      if message.is_a?(ResultMessage)
+        @mirror_batcher.try(&.flush)
+        @last_error_result = message.is_error == true ? message : nil
+      elsif !message.is_a?(SessionStateChangedMessage)
+        @last_error_result = nil
+      end
+    end
+
+    private def handle_keep_alive(message : UnknownMessage) : Nil
+      mark = message.data["startup_mark"]? || message.data["startupMark"]?
+      return unless mark
+      return if mark.raw.nil? || mark.raw == false
+
+      channel = @control_request_mutex.synchronize { @init_keepalive_channel }
+      return unless channel
+
+      select
+      when channel.send(nil)
+      else
+      end
+    rescue Channel::ClosedError
     end
 
     # Validate session_store options and materialize resume/continue from the
@@ -829,6 +1308,152 @@ module ClaudeAgent
       mode == "manual" ? "default" : mode
     end
 
+    private def monotonic_now : MonotonicTimestamp
+      {% if compare_versions(Crystal::VERSION, "1.12.0") >= 0 %}
+        Time.instant
+      {% else %}
+        Time.monotonic
+      {% end %}
+    end
+
+    private def reset_response_loop_state : Nil
+      @state_mutex.synchronize do
+        @result_received = false
+        @turn_in_progress = false
+        @ceiling_deadline = nil
+      end
+    end
+
+    private def reset_turn_state_for_prompt : Nil
+      @state_mutex.synchronize do
+        @result_received = false
+        @ceiling_deadline = nil
+      end
+    end
+
+    private def next_response_message(awaiting_prompt_suggestion : Bool) : {Bool, Message?}
+      return {false, receive_post_result_message} if awaiting_prompt_suggestion
+
+      loop do
+        deadline = @state_mutex.synchronize { @ceiling_deadline }
+        return {false, @message_channel.receive?} unless deadline
+
+        remaining = deadline - monotonic_now
+        if remaining <= Time::Span::ZERO
+          still_armed = @state_mutex.synchronize { !@ceiling_deadline.nil? && @result_received }
+          return {true, nil} if still_armed
+          next
+        end
+
+        select
+        when msg = @message_channel.receive?
+          return {false, msg}
+        when timeout(remaining)
+          still_armed = @state_mutex.synchronize { !@ceiling_deadline.nil? && @result_received }
+          return {true, nil} if still_armed
+        end
+      end
+    end
+
+    private def process_stream_message(message : Message) : Nil
+      had_tasks = has_inflight_tasks?
+      track_task_lifecycle(message)
+      rearm_run_end_ceiling_between_turns if had_tasks && !has_inflight_tasks?
+
+      case message
+      when SessionStateChangedMessage
+        on_session_state(message.state)
+      when ResultMessage
+        @state_mutex.synchronize do
+          @result_received = true
+          @turn_in_progress = false
+        end
+        if !should_end_run? && @session_state != "requires_action"
+          arm_run_end_ceiling
+        end
+      else
+        if top_level_turn_activity?(message)
+          @state_mutex.synchronize { @turn_in_progress = true }
+          clear_run_end_ceiling
+        end
+      end
+    end
+
+    private def on_session_state(state : String) : Nil
+      @session_state = state
+      if state == "idle" || state == "requires_action"
+        clear_run_end_ceiling
+      else
+        rearm_run_end_ceiling_between_turns
+      end
+    end
+
+    private def should_end_run? : Bool
+      return false unless @state_mutex.synchronize { @result_received }
+      return false if has_inflight_tasks?
+
+      state = @session_state
+      state.nil? || state == "idle"
+    end
+
+    private def top_level_turn_activity?(message : Message) : Bool
+      case message
+      when AssistantMessage
+        message.parent_tool_use_id.nil?
+      when StreamEvent
+        message.parent_tool_use_id.nil?
+      else
+        false
+      end
+    end
+
+    private def run_end_ceiling_ms : Int64
+      opts_env = @options.try(&.env)
+      raw = if opts_env && opts_env.has_key?(RUN_END_CEILING_ENV)
+              opts_env[RUN_END_CEILING_ENV]
+            else
+              ENV[RUN_END_CEILING_ENV]?
+            end
+      return DEFAULT_RUN_END_CEILING_MS unless raw
+
+      stripped = raw.strip
+      return DEFAULT_RUN_END_CEILING_MS unless stripped.matches?(/\A[+-]?\d+\z/)
+
+      value = stripped.to_i64?
+      return DEFAULT_RUN_END_CEILING_MS unless value && value >= 0
+
+      value
+    end
+
+    private def arm_run_end_ceiling : Nil
+      ceiling_ms = run_end_ceiling_ms
+      if ceiling_ms <= 0
+        clear_run_end_ceiling
+        return
+      end
+
+      clamped = Math.min(ceiling_ms, MAX_RUN_END_CEILING_MS)
+      @state_mutex.synchronize do
+        return if @turn_in_progress
+
+        @ceiling_deadline = monotonic_now + clamped.milliseconds
+      end
+    end
+
+    private def rearm_run_end_ceiling_between_turns : Nil
+      result_seen = @state_mutex.synchronize { @result_received && !@turn_in_progress }
+      return unless result_seen
+
+      state = @session_state
+      return if state.nil? || state == "idle" || state == "requires_action"
+
+      arm_run_end_ceiling
+    end
+
+    private def clear_run_end_ceiling : Nil
+      @state_mutex.synchronize { @ceiling_deadline = nil }
+    end
+
     private def receive_post_result_message : Message?
       select
       when message = @message_channel.receive?
@@ -866,6 +1491,8 @@ module ClaudeAgent
         true
       when ControlResponseMessage
         true
+      when UnknownMessage
+        message.type == "keep_alive"
       when PermissionRequest
         handle_permission_request(message)
         @options.try(&.can_use_tool) || has_permission_hooks? ? true : false
@@ -895,11 +1522,15 @@ module ClaudeAgent
     private def send_control_request(
       request : Hash(String, JSON::Any),
       timeout : Time::Span = 60.seconds,
+      *,
+      max_total_timeout : Time::Span? = nil,
     ) : Hash(String, JSON::Any)
       raise ConnectionError.new("Not connected. Call start() first.") unless started?
 
       response_channel = Channel(ControlRequestResult).new(1)
       request_id = register_pending_control_request(response_channel)
+      subtype = request["subtype"]?.try(&.as_s?) || "unknown"
+      keepalive_channel = setup_init_keepalive(subtype)
 
       control_request = {
         "type"       => JSON::Any.new("control_request"),
@@ -909,20 +1540,94 @@ module ClaudeAgent
 
       @cli_client.send_message(control_request)
 
-      select
-      when result = response_channel.receive
-        case result
-        when Exception
-          raise result
-        when Hash(String, JSON::Any)
-          parse_control_response(result, request)
-        else
-          {} of String => JSON::Any
+      begin
+        await_control_response(
+          response_channel,
+          request_id,
+          request,
+          subtype,
+          timeout,
+          max_total_timeout,
+          keepalive_channel,
+        )
+      ensure
+        clear_init_keepalive(keepalive_channel) if keepalive_channel
+      end
+    end
+
+    private def setup_init_keepalive(subtype : String) : Channel(Nil)?
+      return unless subtype == "initialize"
+
+      channel = Channel(Nil).new(16)
+      @control_request_mutex.synchronize { @init_keepalive_channel = channel }
+      channel
+    end
+
+    private def clear_init_keepalive(channel : Channel(Nil)) : Nil
+      @control_request_mutex.synchronize do
+        @init_keepalive_channel = nil if @init_keepalive_channel == channel
+      end
+      channel.close unless channel.closed?
+    end
+
+    private def await_control_response(
+      response_channel : Channel(ControlRequestResult),
+      request_id : String,
+      request : Hash(String, JSON::Any),
+      subtype : String,
+      timeout : Time::Span,
+      max_total_timeout : Time::Span?,
+      keepalive_channel : Channel(Nil)?,
+    ) : Hash(String, JSON::Any)
+      unless keepalive_channel
+        select
+        when result = response_channel.receive
+          return unwrap_control_result(result, request)
+        when timeout(timeout)
+          unregister_pending_control_request(request_id)
+          raise TimeoutError.new("Control request timeout: #{subtype}")
         end
-      when timeout(timeout)
-        unregister_pending_control_request(request_id)
-        subtype = request["subtype"]?.try(&.as_s?) || "unknown"
-        raise TimeoutError.new("Control request timeout: #{subtype}")
+      end
+
+      started_at = monotonic_now
+      max_deadline = max_total_timeout ? (started_at + max_total_timeout) : nil
+      deadline = started_at + timeout
+
+      loop do
+        remaining = deadline - monotonic_now
+        if remaining <= Time::Span::ZERO
+          unregister_pending_control_request(request_id)
+          raise TimeoutError.new("Control request timeout: #{subtype}")
+        end
+
+        select
+        when result = response_channel.receive
+          return unwrap_control_result(result, request)
+        when keepalive_channel.receive?
+          next_deadline = monotonic_now + timeout
+          deadline = if max_dl = max_deadline
+                       next_deadline < max_dl ? next_deadline : max_dl
+                     else
+                       next_deadline
+                     end
+        when timeout(remaining)
+          unregister_pending_control_request(request_id)
+          raise TimeoutError.new("Control request timeout: #{subtype}")
+        end
+      end
+    end
+
+    private def unwrap_control_result(
+      result : ControlRequestResult,
+      request : Hash(String, JSON::Any),
+    ) : Hash(String, JSON::Any)
+      case result
+      when Exception
+        raise result
+      when Hash(String, JSON::Any)
+        parse_control_response(result, request)
+      else
+        {} of String => JSON::Any
       end
     end
 
@@ -963,6 +1668,9 @@ module ClaudeAgent
       case response["subtype"]?.try(&.as_s?)
       when "error"
         message = response["error"]?.try(&.as_s?) || "Control request failed"
+        if error_code = response["error_code"]?.try(&.as_s?)
+          raise ControlError.new(message, error_code)
+        end
         raise Error.new(message)
       else
         response["response"]?.try(&.as_h?) || {} of String => JSON::Any
@@ -992,39 +1700,87 @@ module ClaudeAgent
     rescue Channel::ClosedError
     end
 
-    private def build_hook_initialize_payload : Hash(String, JSON::Any)?
+    private def build_hook_initialize_payload : {Hash(String, JSON::Any)?, Bool}
       hooks = @options.try(&.hooks)
-      return unless hooks
+      return {nil, false} unless hooks
 
       payload = {} of String => JSON::Any
+      blocks_on_failure = false
 
-      add_matcher_hook_payload(payload, "PreToolUse", hooks.pre_tool_use)
-      add_matcher_hook_payload(payload, "PostToolUse", hooks.post_tool_use)
-      add_matcher_hook_payload(payload, "PostToolUseFailure", hooks.post_tool_use_failure)
-      add_matcher_hook_payload(payload, "PermissionRequest", hooks.permission_request)
-      add_simple_hook_payload(payload, "Elicitation", hooks.elicitation)
-      add_simple_hook_payload(payload, "ElicitationResult", hooks.elicitation_result)
-      add_simple_hook_payload(payload, "PreCompact", hooks.pre_compact)
-      add_simple_hook_payload(payload, "Notification", hooks.notification)
-      add_simple_hook_payload(payload, "SubagentStart", hooks.subagent_start)
-      add_simple_hook_payload(payload, "SubagentStop", hooks.subagent_stop)
-      add_simple_hook_payload(payload, "Stop", hooks.stop)
-      add_simple_hook_payload(payload, "TeammateIdle", hooks.teammate_idle)
-      add_simple_hook_payload(payload, "TaskCompleted", hooks.task_completed)
-      add_simple_hook_payload(payload, "ConfigChange", hooks.config_change)
-      add_simple_hook_payload(payload, "MessageDisplay", hooks.message_display)
-      add_simple_hook_payload(payload, "DirectoryAdded", hooks.directory_added)
+      each_hook_entry(hooks) do |hook_name, entries|
+        blocks = add_hook_entries_payload(payload, hook_name, entries)
+        blocks_on_failure ||= blocks
+      end
 
-      payload.empty? ? nil : payload
+      {payload.empty? ? nil : payload, blocks_on_failure}
+    end
+
+    private def each_hook_entry(hooks : HookConfig, & : String, HookEntryList? ->) : Nil
+      yield "PreToolUse", hooks.pre_tool_use
+      yield "PostToolUse", hooks.post_tool_use
+      yield "PostToolUseFailure", hooks.post_tool_use_failure
+      yield "PermissionRequest", hooks.permission_request
+      yield "Elicitation", hooks.elicitation
+      yield "ElicitationResult", hooks.elicitation_result
+      yield "UserPromptSubmit", hooks.user_prompt_submit
+      yield "Stop", hooks.stop
+      yield "SubagentStart", hooks.subagent_start
+      yield "SubagentStop", hooks.subagent_stop
+      yield "PreCompact", hooks.pre_compact
+      yield "SessionStart", hooks.session_start
+      yield "SessionEnd", hooks.session_end
+      yield "Notification", hooks.notification
+      yield "TeammateIdle", hooks.teammate_idle
+      yield "TaskCompleted", hooks.task_completed
+      yield "ConfigChange", hooks.config_change
+      yield "MessageDisplay", hooks.message_display
+      yield "DirectoryAdded", hooks.directory_added
+      each_extended_hook_entry(hooks) { |name, entries| yield name, entries }
+    end
+
+    private def each_extended_hook_entry(hooks : HookConfig, & : String, HookEntryList? ->) : Nil
+      yield "PostToolBatch", hooks.post_tool_batch
+      yield "UserPromptExpansion", hooks.user_prompt_expansion
+      yield "StopFailure", hooks.stop_failure
+      yield "PostCompact", hooks.post_compact
+      yield "PreModelSwitch", hooks.pre_model_switch
+      yield "PostModelSwitch", hooks.post_model_switch
+      yield "PermissionDenied", hooks.permission_denied
+      yield "Setup", hooks.setup
+      yield "TaskCreated", hooks.task_created
+      yield "WorktreeCreate", hooks.worktree_create
+      yield "WorktreeRemove", hooks.worktree_remove
+      yield "InstructionsLoaded", hooks.instructions_loaded
+      yield "CwdChanged", hooks.cwd_changed
+      yield "FileChanged", hooks.file_changed
+    end
+
+    private def add_hook_entries_payload(
+      payload : Hash(String, JSON::Any),
+      hook_name : String,
+      entries : HookEntryList?,
+    ) : Bool
+      return false unless entries
+
+      case entries
+      when Array(HookMatcher)
+        add_matcher_hook_payload(payload, hook_name, entries)
+      when Array(HookCallback)
+        add_simple_hook_payload(payload, hook_name, entries)
+        false
+      else
+        false
+      end
     end
 
     private def add_matcher_hook_payload(
       payload : Hash(String, JSON::Any),
       hook_name : String,
       matchers : Array(HookMatcher)?,
-    )
-      return unless matchers
+    ) : Bool
+      return false unless matchers
 
+      blocks_on_failure = false
       entries = matchers.compact_map do |matcher|
         callback_ids = register_hook_callbacks(hook_name, matcher.hooks)
         next if callback_ids.empty?
@@ -1034,17 +1790,22 @@ module ClaudeAgent
           entry["matcher"] = JSON::Any.new(matcher_value)
         end
         matcher.timeout.try { |timeout| entry["timeout"] = JSON::Any.new(timeout) }
+        if on_failure = matcher.on_failure
+          entry["onFailure"] = JSON::Any.new(on_failure)
+          blocks_on_failure ||= on_failure != "continue"
+        end
         entry["hookCallbackIds"] = JSON::Any.new(callback_ids.map { |id| JSON::Any.new(id) })
         JSON::Any.new(entry)
       end
 
-      return if entries.empty?
+      return false if entries.empty?
 
       payload[hook_name] = JSON::Any.new(entries)
       # Caller (build_initialize_request via reinitialize/start) owns locking
       # for registry mutations; start path is also single-writer until the
       # initialize response is processed.
       @registered_control_hook_events.add(hook_name)
+      blocks_on_failure
     end
 
     private def add_simple_hook_payload(
@@ -1063,6 +1824,19 @@ module ClaudeAgent
 
       payload[hook_name] = JSON::Any.new([JSON::Any.new(entry)])
       @registered_control_hook_events.add(hook_name)
+    end
+
+    private def extract_callbacks(entries : HookEntryList?) : Array(HookCallback)
+      return [] of HookCallback unless entries
+
+      case entries
+      when Array(HookCallback)
+        entries
+      when Array(HookMatcher)
+        entries.flat_map(&.hooks)
+      else
+        [] of HookCallback
+      end
     end
 
     # Must be called while holding `@control_request_mutex` during reinitialize
@@ -1114,14 +1888,16 @@ module ClaudeAgent
                    when :user_prompt_submit then "UserPromptSubmit"
                    else                          return
                    end
+      return if control_hook_registered?(event_name)
 
-      callbacks = case event
-                  when :session_start      then hooks.session_start
-                  when :session_end        then hooks.session_end
-                  when :user_prompt_submit then hooks.user_prompt_submit
-                  end
+      entries = case event
+                when :session_start      then hooks.session_start
+                when :session_end        then hooks.session_end
+                when :user_prompt_submit then hooks.user_prompt_submit
+                end
 
-      return unless callbacks
+      callbacks = extract_callbacks(entries)
+      return if callbacks.empty?
 
       common = hook_common_fields(event_name)
       input = HookInput.new(
@@ -1138,6 +1914,14 @@ module ClaudeAgent
       end
     end
 
+    private def log_stderr(message : String) : Nil
+      if stderr_cb = @options.try(&.stderr)
+        stderr_cb.call(message)
+      else
+        STDERR.puts(message)
+      end
+    end
+
     # Invoke a user-provided hook callback without letting it take down
     # the response-reader fiber. A callback that raises writes a one-line
     # diagnostic to STDERR (or the configured stderr callback) and the
@@ -1147,13 +1931,7 @@ module ClaudeAgent
     private def safe_hook_call(event_name : String, &)
       yield
     rescue ex
-      stderr_cb = @options.try(&.stderr)
-      message = "[hook error] #{event_name}: #{ex.class}: #{ex.message}\n"
-      if stderr_cb
-        stderr_cb.call(message)
-      else
-        STDERR.puts(message)
-      end
+      log_stderr("[hook error] #{event_name}: #{ex.class}: #{ex.message}\n")
     end
 
     private def handle_permission_request(request : PermissionRequest)
@@ -1349,8 +2127,8 @@ module ClaudeAgent
     private def handle_subagent_start(hooks : HookConfig, block : ToolUseBlock)
       return unless block.name == "Task"
       return if control_hook_registered?("SubagentStart")
-      callbacks = hooks.subagent_start
-      return unless callbacks
+      callbacks = extract_callbacks(hooks.subagent_start)
+      return if callbacks.empty?
 
       common = hook_common_fields("SubagentStart")
       input = HookInput.new(
@@ -1371,8 +2149,8 @@ module ClaudeAgent
       tool_name = find_tool_name_for_result(message, block.tool_use_id)
       return unless tool_name == "Task"
       return if control_hook_registered?("SubagentStop")
-      callbacks = hooks.subagent_stop
-      return unless callbacks
+      callbacks = extract_callbacks(hooks.subagent_stop)
+      return if callbacks.empty?
 
       result_content = case content = block.content
                        when String then content
@@ -1400,8 +2178,8 @@ module ClaudeAgent
       return unless hooks
       return if control_hook_registered?("Stop")
 
-      callbacks = hooks.stop
-      return unless callbacks
+      callbacks = extract_callbacks(hooks.stop)
+      return if callbacks.empty?
 
       common = hook_common_fields("Stop")
       input = HookInput.new(
@@ -1508,6 +2286,16 @@ module ClaudeAgent
                           display_name: req.display_name,
                           description: req.description,
                           request_id: request_id,
+                          mcp_server: req.mcp_server,
+                          decision_reason_type: req.decision_reason_type,
+                          decision_reason_code: req.decision_reason_code,
+                          server_policy_ask_only: req.server_policy_ask_only,
+                          classifier_approvable: req.classifier_approvable,
+                          suppress_always_allow_rule: req.suppress_always_allow_rule,
+                          default_to_no: req.default_to_no,
+                          matched_ask_rule: req.matched_ask_rule,
+                          requires_user_interaction: req.requires_user_interaction,
+                          server_prompt: req.server_prompt,
                         )
                         result = callback.call(context)
                         # Returning suppress (TS canUseTool → null) means the
@@ -1543,6 +2331,10 @@ module ClaudeAgent
                               url: req.url,
                               elicitation_id: req.elicitation_id,
                               requested_schema: req.requested_schema,
+                              property_order: req.property_order,
+                              title: req.title,
+                              display_name: req.display_name,
+                              description: req.description,
                             )
                           )
                         )
@@ -1597,6 +2389,10 @@ module ClaudeAgent
       extract_any(input, *keys).try(&.as_bool?)
     end
 
+    private def extract_int64(input : Hash(String, JSON::Any)?, *keys : String) : Int64?
+      extract_any(input, *keys).try(&.as_i64?)
+    end
+
     private def extract_array(input : Hash(String, JSON::Any)?, *keys : String) : Array(JSON::Any)?
       extract_any(input, *keys).try(&.as_a?)
     end
@@ -1619,47 +2415,153 @@ module ClaudeAgent
         cwd: extract_string(input_data, "cwd") || common[:cwd],
         permission_mode: extract_string(input_data, "permission_mode", "permissionMode") || common[:permission_mode],
         hook_event_name: extract_string(input_data, "hook_event_name", "hookEventName") || common[:hook_event_name],
+        prompt_id: extract_string(input_data, "prompt_id", "promptId"),
+        effort: extract_hook_effort(input_data),
       )
     end
 
+    private def extract_hook_effort(input_data : Hash(String, JSON::Any)?) : HookEffort?
+      effort_hash = extract_hash(input_data, "effort")
+      return unless effort_hash
+
+      level = effort_hash["level"]?.try(&.as_s?)
+      return unless level
+
+      HookEffort.new(level)
+    end
+
+    private def extract_mcp_server_provenance(input_data : Hash(String, JSON::Any)?) : MCPServerProvenance?
+      server_hash = extract_hash(input_data, "mcp_server", "mcpServer")
+      return unless server_hash
+
+      name = server_hash["name"]?.try(&.as_s?)
+      source = server_hash["source"]?.try(&.as_s?)
+      return unless name && source
+
+      MCPServerProvenance.new(name, source)
+    end
+
+    private def extract_background_tasks(input_data : Hash(String, JSON::Any)?) : Array(BackgroundTaskSummary)?
+      entries = extract_array(input_data, "background_tasks", "backgroundTasks")
+      return unless entries
+
+      entries.compact_map do |item|
+        hash = item.as_h?
+        next unless hash
+
+        id = hash["id"]?.try(&.as_s?)
+        type = hash["type"]?.try(&.as_s?)
+        status = hash["status"]?.try(&.as_s?)
+        description = hash["description"]?.try(&.as_s?)
+        next unless id && type && status && description
+
+        BackgroundTaskSummary.new(
+          id: id,
+          type: type,
+          status: status,
+          description: description,
+          command: hash["command"]?.try(&.as_s?),
+          agent_type: hash["agent_type"]?.try(&.as_s?) || hash["agentType"]?.try(&.as_s?),
+          server: hash["server"]?.try(&.as_s?),
+          tool: hash["tool"]?.try(&.as_s?),
+          name: hash["name"]?.try(&.as_s?),
+        )
+      end
+    end
+
+    private def extract_session_crons(input_data : Hash(String, JSON::Any)?) : Array(SessionCronSummary)?
+      entries = extract_array(input_data, "session_crons", "sessionCrons")
+      return unless entries
+
+      entries.compact_map do |item|
+        hash = item.as_h?
+        next unless hash
+
+        id = hash["id"]?.try(&.as_s?)
+        schedule = hash["schedule"]?.try(&.as_s?)
+        recurring = hash["recurring"]?.try(&.as_bool?)
+        prompt = hash["prompt"]?.try(&.as_s?)
+        next if recurring.nil?
+        next unless id && schedule && prompt
+
+        SessionCronSummary.new(id: id, schedule: schedule, recurring: recurring, prompt: prompt)
+      end
+    end
+
     # Build HookInput with appropriate fields based on hook type
-    # ameba:disable Metrics/CyclomaticComplexity
     private def build_hook_input(input_data : Hash(String, JSON::Any)?, hook_name : String) : HookInput
       input = build_base_hook_input(input_data, hook_name)
-      normalized_hook_name = normalize_hook_name(input.hook_event_name || hook_name)
+      normalized = normalize_hook_name(input.hook_event_name || hook_name)
+      apply_primary_hook_fields(input, input_data, normalized)
+    end
 
-      case normalized_hook_name
-      when "notification"
-        input = apply_notification_fields(input, input_data)
-      when "pre_compact"
-        input = apply_pre_compact_fields(input, input_data)
+    private def apply_primary_hook_fields(
+      input : HookInput,
+      input_data : Hash(String, JSON::Any)?,
+      normalized : String,
+    ) : HookInput
+      case normalized
+      when "pre_tool_use", "post_tool_use", "post_tool_use_failure", "post_tool_batch"
+        apply_tool_fields(input, input_data)
+      when "permission_request"
+        apply_tool_fields(input, input_data)
+        input.permission_suggestions = extract_array(input_data, "permission_suggestions", "permissionSuggestions")
+        input
+      when "permission_denied"
+        apply_tool_fields(input, input_data)
+        input.error ||= extract_string(input_data, "reason")
+        input
       when "stop"
-        input.stop_hook_active = extract_bool(input_data, "stop_hook_active", "stopHookActive")
-      when "session_start"
-        input.source = extract_string(input_data, "source")
+        apply_stop_fields(input, input_data)
+      when "subagent_start"
+        apply_subagent_fields(input, input_data)
+      when "subagent_stop"
+        apply_subagent_fields(input, input_data)
+        apply_stop_fields(input, input_data)
+      when "user_prompt_submit", "user_prompt_expansion"
+        input.user_prompt = extract_string(input_data, "prompt", "user_prompt", "userPrompt")
+        input
+      else
+        apply_secondary_hook_fields(input, input_data, normalized)
+      end
+    end
+
+    private def apply_secondary_hook_fields(
+      input : HookInput,
+      input_data : Hash(String, JSON::Any)?,
+      normalized : String,
+    ) : HookInput
+      case normalized
+      when "notification"
+        apply_notification_fields(input, input_data)
+      when "pre_compact", "post_compact"
+        apply_pre_compact_fields(input, input_data)
+      when "session_start", "setup"
+        input.source = extract_string(input_data, "source", "trigger")
+        input
       when "session_end"
         input.session_end_reason = extract_string(input_data, "reason", "session_end_reason", "sessionEndReason")
-      when "subagent_start"
-        input = apply_subagent_fields(input, input_data)
-      when "subagent_stop"
-        input = apply_subagent_fields(input, input_data)
-        input.stop_hook_active = extract_bool(input_data, "stop_hook_active", "stopHookActive")
-      when "pre_tool_use", "post_tool_use", "post_tool_use_failure"
-        input = apply_tool_fields(input, input_data)
-      when "permission_request"
-        input = apply_tool_fields(input, input_data)
-        input.permission_suggestions = extract_array(input_data, "permission_suggestions", "permissionSuggestions")
+        input
       when "elicitation"
-        input = apply_elicitation_fields(input, input_data)
+        apply_elicitation_fields(input, input_data)
       when "elicitation_result"
-        input = apply_elicitation_fields(input, input_data)
+        apply_elicitation_fields(input, input_data)
         input.elicitation_action = extract_string(input_data, "action")
         input.elicitation_content = extract_hash(input_data, "content")
-      when "task_completed"
-        input.task_id = extract_string(input_data, "task_id", "taskId")
-        input.task_status = extract_string(input_data, "status")
-        input.task_summary = extract_string(input_data, "summary")
-        input.tool_use_id = extract_string(input_data, "tool_use_id", "toolUseId")
+        input
+      when "task_completed", "task_created"
+        apply_task_fields(input, input_data)
+      else
+        apply_misc_hook_fields(input, input_data, normalized)
+      end
+    end
+
+    private def apply_misc_hook_fields(
+      input : HookInput,
+      input_data : Hash(String, JSON::Any)?,
+      normalized : String,
+    ) : HookInput
+      case normalized
       when "teammate_idle"
         input.agent_id = extract_string(input_data, "agent_id", "agentId")
         input.agent_type = extract_string(input_data, "agent_type", "agentType")
@@ -1668,14 +2570,40 @@ module ClaudeAgent
         input.config_change_diff = extract_hash(input_data, "diff", "change")
       when "message_display"
         input.message_content = extract_string(input_data, "message_content", "messageContent", "content")
-      when "directory_added"
-        input.directory_path = extract_string(input_data, "path", "directory", "directory_path", "directoryPath")
+      when "directory_added", "cwd_changed", "file_changed", "worktree_create", "worktree_remove", "instructions_loaded"
+        input.directory_path = extract_string(
+          input_data,
+          "path",
+          "directory",
+          "directory_path",
+          "directoryPath",
+          "worktree_path",
+          "worktreePath",
+          "file_path",
+          "filePath",
+        )
+      when "stop_failure"
+        input.error = extract_string(input_data, "error", "error_details", "errorDetails")
+        input.last_assistant_message = extract_string(input_data, "last_assistant_message", "lastAssistantMessage")
       end
-
       input
     end
 
-    # ameba:enable Metrics/CyclomaticComplexity
+    private def apply_stop_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.stop_hook_active = extract_bool(input_data, "stop_hook_active", "stopHookActive")
+      input.last_assistant_message = extract_string(input_data, "last_assistant_message", "lastAssistantMessage")
+      input.background_tasks = extract_background_tasks(input_data)
+      input.session_crons = extract_session_crons(input_data)
+      input
+    end
+
+    private def apply_task_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
+      input.task_id = extract_string(input_data, "task_id", "taskId")
+      input.task_status = extract_string(input_data, "status")
+      input.task_summary = extract_string(input_data, "summary")
+      input.tool_use_id = extract_string(input_data, "tool_use_id", "toolUseId")
+      input
+    end
 
     private def apply_notification_fields(input : HookInput, input_data : Hash(String, JSON::Any)?) : HookInput
       input.notification_message = extract_string(input_data, "message")
@@ -1707,6 +2635,10 @@ module ClaudeAgent
                             extract_string(input_data, "tool_result", "toolResult")
       input.error = extract_string(input_data, "error")
       input.is_interrupt = extract_bool(input_data, "is_interrupt", "isInterrupt")
+      input.duration_ms = extract_int64(input_data, "duration_ms", "durationMs")
+      input.mcp_server = extract_mcp_server_provenance(input_data)
+      input.agent_id ||= extract_string(input_data, "agent_id", "agentId")
+      input.agent_type ||= extract_string(input_data, "agent_type", "agentType")
       input
     end
 
@@ -1956,28 +2888,26 @@ module ClaudeAgent
         "hookEventName" => JSON::Any.new(output.hook_event_name),
       }
 
-      output.permission_decision.try do |value|
-        response["permissionDecision"] = JSON::Any.new(value)
+      output.permission_decision.try { |v| response["permissionDecision"] = JSON::Any.new(v) }
+      output.permission_decision_reason.try { |v| response["permissionDecisionReason"] = JSON::Any.new(v) }
+      output.decision.try { |v| response["decision"] = JSON::Any.new(v) }
+      output.updated_input.try { |v| response["updatedInput"] = JSON::Any.new(v) }
+      output.additional_context.try { |v| response["additionalContext"] = JSON::Any.new(v) }
+      output.updated_tool_output.try { |v| response["updatedToolOutput"] = v }
+      output.updated_mcp_tool_output.try { |v| response["updatedMCPToolOutput"] = v }
+      output.action.try { |v| response["action"] = JSON::Any.new(v) }
+      output.content.try { |v| response["content"] = JSON::Any.new(v) }
+      output.display_content.try { |v| response["displayContent"] = JSON::Any.new(v) }
+      output.classifier_context.try { |v| response["classifierContext"] = JSON::Any.new(v) }
+      output.suppress_original_prompt.try { |v| response["suppressOriginalPrompt"] = JSON::Any.new(v) }
+      output.session_title.try { |v| response["sessionTitle"] = JSON::Any.new(v) }
+      output.initial_user_message.try { |v| response["initialUserMessage"] = JSON::Any.new(v) }
+      output.watch_paths.try do |paths|
+        response["watchPaths"] = JSON::Any.new(paths.map { |path| JSON::Any.new(path) })
       end
-      output.permission_decision_reason.try do |value|
-        response["permissionDecisionReason"] = JSON::Any.new(value)
-      end
-      output.decision.try { |value| response["decision"] = JSON::Any.new(value) }
-      output.updated_input.try { |value| response["updatedInput"] = JSON::Any.new(value) }
-      output.additional_context.try do |value|
-        response["additionalContext"] = JSON::Any.new(value)
-      end
-      output.updated_tool_output.try do |value|
-        response["updatedToolOutput"] = value
-      end
-      output.updated_mcp_tool_output.try do |value|
-        response["updatedMCPToolOutput"] = value
-      end
-      output.action.try { |value| response["action"] = JSON::Any.new(value) }
-      output.content.try { |value| response["content"] = JSON::Any.new(value) }
-      output.display_content.try do |value|
-        response["displayContent"] = JSON::Any.new(value)
-      end
+      output.reload_skills.try { |v| response["reloadSkills"] = JSON::Any.new(v) }
+      output.retry.try { |v| response["retry"] = JSON::Any.new(v) }
+      output.worktree_path.try { |v| response["worktreePath"] = JSON::Any.new(v) }
 
       response
     end

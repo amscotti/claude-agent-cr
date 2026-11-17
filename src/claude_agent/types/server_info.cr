@@ -9,10 +9,17 @@ module ClaudeAgent
   # Intentionally omits `claude-mythos-preview` (preview-only; not tracked here).
   module Models
     # Claude 5 family
-    SONNET_5 = "claude-sonnet-5"
-    OPUS_5   = "claude-opus-5"
-    FABLE_5  = "claude-fable-5"
-    MYTHOS_5 = "claude-mythos-5"
+    OPUS_5_5   = "claude-opus-5-5"
+    SONNET_5_5 = "claude-sonnet-5-5"
+    HAIKU_5_5  = "claude-haiku-5-5"
+    FABLE_5_2  = "claude-fable-5-2"
+    FABLE_5_1  = "claude-fable-5-1"
+    MYTHOS_5_2 = "claude-mythos-5-2"
+    MYTHOS_5_1 = "claude-mythos-5-1"
+    SONNET_5   = "claude-sonnet-5"
+    OPUS_5     = "claude-opus-5"
+    FABLE_5    = "claude-fable-5"
+    MYTHOS_5   = "claude-mythos-5"
 
     # Short aliases accepted by some CLI builds (when supported).
     FABLE  = "fable"
@@ -24,21 +31,53 @@ module ClaudeAgent
     OPUS_4_6   = "claude-opus-4-6"
     OPUS_4_5   = "claude-opus-4-5"
     SONNET_4_6 = "claude-sonnet-4-6"
+    # Deprecated upstream (EOL November 30, 2026); kept for compatibility.
     SONNET_4_5 = "claude-sonnet-4-5"
     HAIKU_4_5  = "claude-haiku-4-5"
 
     # Snapshot / dated IDs commonly used in API clients
-    OPUS_4_5_20251101   = "claude-opus-4-5-20251101"
+    OPUS_4_5_20251101 = "claude-opus-4-5-20251101"
+    # Deprecated upstream (EOL November 30, 2026); kept for compatibility.
     SONNET_4_5_20250929 = "claude-sonnet-4-5-20250929"
     HAIKU_4_5_20251001  = "claude-haiku-4-5-20251001"
   end
+
+  # Recognized fast-mode runtime states reported on `system`/`init`.
+  FAST_MODE_STATES = Set{"off", "cooldown", "on"}
+
+  # Known reasons why fast mode is disabled when `fast_mode_state` is off/unavailable.
+  # Open set for forward compatibility with newer CLI builds.
+  FAST_MODE_DISABLED_REASONS = Set{
+    "free",
+    "preference",
+    "extra_usage_disabled",
+    "network_error",
+    "unknown",
+    "not_first_party",
+    "disabled_by_env",
+    "model_not_allowed",
+    "sdk_opt_in_required",
+    "pending",
+  }
 
   struct ServerCommand
     getter name : String
     getter description : String?
     getter argument_hint : String?
+    getter aliases : Array(String)?
+    getter builtin : Bool?
 
-    def initialize(@name : String, @description : String? = nil, @argument_hint : String? = nil)
+    def initialize(
+      @name : String,
+      @description : String? = nil,
+      @argument_hint : String? = nil,
+      @aliases : Array(String)? = nil,
+      @builtin : Bool? = nil,
+    )
+    end
+
+    def builtin? : Bool
+      @builtin == true
     end
 
     def self.from_any(value : JSON::Any) : ServerCommand?
@@ -48,10 +87,14 @@ module ClaudeAgent
       name = data["name"]?.try(&.as_s?)
       return unless name
 
+      aliases = data["aliases"]?.try(&.as_a?).try(&.compact_map(&.as_s?))
+
       new(
         name,
         data["description"]?.try(&.as_s?),
         data["argumentHint"]?.try(&.as_s?),
+        aliases,
+        data["builtin"]?.try(&.as_bool?),
       )
     end
   end
@@ -87,6 +130,8 @@ module ClaudeAgent
     getter supported_effort_levels : Array(String)
     getter? supports_adaptive_thinking : Bool?
     getter? supports_fast_mode : Bool?
+    getter resolved_model : String?
+    getter? supports_auto_mode : Bool?
 
     def initialize(
       @value : String,
@@ -96,7 +141,13 @@ module ClaudeAgent
       @supported_effort_levels : Array(String) = [] of String,
       @supports_adaptive_thinking : Bool? = nil,
       @supports_fast_mode : Bool? = nil,
+      @resolved_model : String? = nil,
+      @supports_auto_mode : Bool? = nil,
     )
+    end
+
+    def supports_auto_mode : Bool?
+      @supports_auto_mode
     end
 
     def self.from_any(value : JSON::Any) : ServerModelInfo?
@@ -106,6 +157,9 @@ module ClaudeAgent
       model_value = data["value"]?.try(&.as_s?)
       return unless model_value
 
+      supports_auto_mode = data["supportsAutoMode"]?.try(&.as_bool?)
+      supports_auto_mode = data["supports_auto_mode"]?.try(&.as_bool?) if supports_auto_mode.nil?
+
       new(
         model_value,
         data["displayName"]?.try(&.as_s?),
@@ -114,6 +168,8 @@ module ClaudeAgent
         string_array(data["supportedEffortLevels"]?),
         data["supportsAdaptiveThinking"]?.try(&.as_bool?),
         data["supportsFastMode"]?.try(&.as_bool?),
+        data["resolvedModel"]?.try(&.as_s?) || data["resolved_model"]?.try(&.as_s?),
+        supports_auto_mode,
       )
     end
 
@@ -149,6 +205,74 @@ module ClaudeAgent
         data["version"]?.try(&.as_s?),
         data["path"]?.try(&.as_s?),
         data["source"]?.try(&.as_s?),
+      )
+    end
+  end
+
+  # Plugin load failure descriptor reported in `system`/`init` `plugin_errors`.
+  struct ServerPluginError
+    getter plugin : String
+    getter type : String
+    getter message : String
+    getter path : String?
+    getter install_command : String?
+    getter managed_lock : Hash(String, JSON::Any)?
+
+    def initialize(
+      @plugin : String,
+      @type : String,
+      @message : String,
+      @path : String? = nil,
+      @install_command : String? = nil,
+      @managed_lock : Hash(String, JSON::Any)? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : ServerPluginError?
+      data = value.as_h?
+      return unless data
+
+      plugin = data["plugin"]?.try(&.as_s?)
+      type = data["type"]?.try(&.as_s?)
+      message = data["message"]?.try(&.as_s?)
+      return unless plugin && type && message
+
+      new(
+        plugin: plugin,
+        type: type,
+        message: message,
+        path: data["path"]?.try(&.as_s?),
+        install_command: data["install_command"]?.try(&.as_s?) || data["installCommand"]?.try(&.as_s?),
+        managed_lock: data["managed_lock"]?.try(&.as_h?) || data["managedLock"]?.try(&.as_h?),
+      )
+    end
+  end
+
+  # Typed MCP server summary entry from `system`/`init` `mcp_servers`.
+  struct ServerMcpServerInfo
+    getter name : String
+    getter status : String
+    getter source : String?
+
+    def initialize(
+      @name : String,
+      @status : String,
+      @source : String? = nil,
+    )
+    end
+
+    def self.from_any(value : JSON::Any) : ServerMcpServerInfo?
+      data = value.as_h?
+      return unless data
+
+      name = data["name"]?.try(&.as_s?)
+      status = data["status"]?.try(&.as_s?)
+      return unless name && status
+
+      new(
+        name: name,
+        status: status,
+        source: data["source"]?.try(&.as_s?),
       )
     end
   end
@@ -225,6 +349,22 @@ module ClaudeAgent
     # Full init payload, including any forward-compat fields this struct
     # doesn't type directly.
     getter raw_data : Hash(String, JSON::Any)
+    # Protocol capabilities advertised by this CLI (e.g. `"interrupt_receipt_v1"`).
+    getter capabilities : Array(String)
+    # Typed plugin load failure entries from `plugin_errors`.
+    getter plugin_errors : Array(ServerPluginError)
+    # Typed view of `mcp_servers` (`name`, `status`, `source`).
+    getter mcp_server_infos : Array(ServerMcpServerInfo)
+    # API key source reported on `system`/`init` (`apiKeySource`).
+    getter api_key_source : String?
+    # Active API beta flags reported on `system`/`init`.
+    getter betas : Array(String)
+    # Envelope UUID of the init message when present.
+    getter uuid : String?
+    # View mode reported by the CLI (`"focus"`, `"default"`, etc.).
+    getter view_mode : String?
+    # Startup timing breakdown (present when `CLAUDE_CODE_EMIT_STARTUP_TIMING=1`).
+    getter startup_timing : Hash(String, JSON::Any)?
 
     def initialize(
       @commands : Array(ServerCommand) = [] of ServerCommand,
@@ -247,6 +387,14 @@ module ClaudeAgent
       @terminal_slash_commands : Array(String)? = nil,
       @claude_code_version : String? = nil,
       @raw_data : Hash(String, JSON::Any) = {} of String => JSON::Any,
+      @capabilities : Array(String) = [] of String,
+      @plugin_errors : Array(ServerPluginError) = [] of ServerPluginError,
+      @mcp_server_infos : Array(ServerMcpServerInfo) = [] of ServerMcpServerInfo,
+      @api_key_source : String? = nil,
+      @betas : Array(String) = [] of String,
+      @uuid : String? = nil,
+      @view_mode : String? = nil,
+      @startup_timing : Hash(String, JSON::Any)? = nil,
     )
     end
 
@@ -281,6 +429,14 @@ module ClaudeAgent
                                  data["terminalSlashCommands"]?.try(&.as_a?).try(&.compact_map(&.as_s?)),
         claude_code_version: data["claude_code_version"]?.try(&.as_s?),
         raw_data: data,
+        capabilities: string_array(data["capabilities"]?),
+        plugin_errors: typed_array(data["plugin_errors"]? || data["pluginErrors"]?, ServerPluginError),
+        mcp_server_infos: typed_array(data["mcp_servers"]?, ServerMcpServerInfo),
+        api_key_source: data["apiKeySource"]?.try(&.as_s?) || data["api_key_source"]?.try(&.as_s?),
+        betas: string_array(data["betas"]?),
+        uuid: data["uuid"]?.try(&.as_s?),
+        view_mode: data["viewMode"]?.try(&.as_s?) || data["view_mode"]?.try(&.as_s?),
+        startup_timing: data["startup_timing"]?.try(&.as_h?) || data["startupTiming"]?.try(&.as_h?),
       )
     end
 
@@ -318,20 +474,16 @@ module ClaudeAgent
       plugin_infos.find { |plugin| plugin.name == name }
     end
 
+    def mcp_server_named?(name : String) : ServerMcpServerInfo?
+      mcp_server_infos.find { |server| server.name == name }
+    end
+
     private def self.string_array(value : JSON::Any?) : Array(String)
       value.try(&.as_a?).try(&.compact_map(&.as_s?)) || [] of String
     end
 
-    private def self.typed_array(value : JSON::Any?, type : ServerCommand.class) : Array(ServerCommand)
-      value.try(&.as_a?).try(&.compact_map { |item| type.from_any(item) }) || [] of ServerCommand
-    end
-
-    private def self.typed_array(value : JSON::Any?, type : ServerAgentInfo.class) : Array(ServerAgentInfo)
-      value.try(&.as_a?).try(&.compact_map { |item| type.from_any(item) }) || [] of ServerAgentInfo
-    end
-
-    private def self.typed_array(value : JSON::Any?, type : ServerModelInfo.class) : Array(ServerModelInfo)
-      value.try(&.as_a?).try(&.compact_map { |item| type.from_any(item) }) || [] of ServerModelInfo
+    private def self.typed_array(value : JSON::Any?, type : T.class) : Array(T) forall T
+      value.try(&.as_a?).try(&.compact_map { |item| type.from_any(item) }) || [] of T
     end
   end
 end

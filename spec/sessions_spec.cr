@@ -965,7 +965,7 @@ describe "ClaudeAgent session utilities" do
     end
   end
 
-  it "fork_session refuses a malformed up_to_message_id" do
+  it "fork_session rejects empty up_to_message_id and missing non-UUID up_to_message_id" do
     with_temp_claude_config do |config_dir|
       project_path = "/tmp/claude-agent-cr-fork-#{Random.rand(1_000_000)}"
       FileUtils.mkdir_p(project_path)
@@ -981,7 +981,15 @@ describe "ClaudeAgent session utilities" do
         ClaudeAgent.fork_session(
           session_id,
           directory: project_path,
-          up_to_message_id: "not-a-uuid",
+          up_to_message_id: "   ",
+        )
+      end
+
+      expect_raises(ArgumentError, /not found in session/) do
+        ClaudeAgent.fork_session(
+          session_id,
+          directory: project_path,
+          up_to_message_id: "missing-delivery-id",
         )
       end
 
@@ -1253,6 +1261,682 @@ describe "ClaudeAgent session utilities" do
       info.should_not be_nil
       info.try(&.custom_title).should eq("Via Store Title")
       info.try(&.tag).should eq("via-tag")
+      info.try(&.archived).should be_nil
+    end
+  end
+
+  describe "archive_session / unarchive_session & SDKSessionInfo#archived" do
+    it "writes archived.json sidecar with permissions and updates session info" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-arch-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        make_session_file(project_dir, session_id: session_id, first_prompt: "archive me")
+
+        # Without sidecar, archived is nil
+        ClaudeAgent.get_session_info(session_id, directory: project_path).try(&.archived).should be_nil
+
+        ClaudeAgent.archive_session(session_id, directory: project_path)
+
+        sidecar_dir = File.join(project_dir, session_id)
+        sidecar_path = File.join(sidecar_dir, "archived.json")
+        File.exists?(sidecar_path).should be_true
+        File.info(sidecar_dir).permissions.value.should eq(0o700)
+        File.info(sidecar_path).permissions.value.should eq(0o600)
+
+        sidecar = JSON.parse(File.read(sidecar_path)).as_h
+        sidecar["archived"].as_bool.should be_true
+        sidecar["by"].as_s.should eq("sdk")
+        sidecar["at"].as_s.should_not be_empty
+
+        ClaudeAgent.get_session_info(session_id, directory: project_path).try(&.archived).should be_true
+        ClaudeAgent.list_sessions(directory: project_path, include_worktrees: false).first.archived.should be_true
+
+        ClaudeAgent.unarchive_session(session_id, directory: project_path)
+        ClaudeAgent.get_session_info(session_id, directory: project_path).try(&.archived).should be_false
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+
+    it "validates session_id and raises File::NotFoundError when missing" do
+      with_temp_claude_config do
+        expect_raises(ArgumentError, /Invalid session_id/) do
+          ClaudeAgent.archive_session("bad-id")
+        end
+        expect_raises(ArgumentError, /Invalid session_id/) do
+          ClaudeAgent.unarchive_session("bad-id")
+        end
+        expect_raises(File::NotFoundError) do
+          ClaudeAgent.archive_session(UUID.random.to_s)
+        end
+        expect_raises(File::NotFoundError) do
+          ClaudeAgent.unarchive_session(UUID.random.to_s)
+        end
+      end
+    end
+
+    it "auto-unarchives when a newer non-tool_result user or queued_command prompt arrives" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-autounarch-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+        file_path = make_session_file(
+          project_dir,
+          session_id: session_id,
+          first_prompt: "initial",
+          timestamp: "2026-01-01T00:00:00.000Z",
+        )
+
+        ClaudeAgent.archive_session(session_id, directory: project_path)
+        sidecar_path = File.join(project_dir, session_id, "archived.json")
+        File.write(
+          sidecar_path,
+          %({"archived":true,"at":"2026-01-01T10:00:00.000Z","by":"sdk"}),
+        )
+
+        # Newer tool_result does not unarchive
+        File.open(file_path, "a") do |file|
+          file << make_transcript_entry(
+            "user",
+            UUID.random.to_s,
+            nil,
+            session_id,
+            content: [{"type" => "tool_result", "tool_use_id" => "t1", "content" => "ok"}],
+            timestamp: "2026-01-01T11:00:00.000Z",
+          ) << "\n"
+          # Newer non-human origin does not unarchive
+          file << make_transcript_entry(
+            "user",
+            UUID.random.to_s,
+            nil,
+            session_id,
+            content: "bg done",
+            timestamp: "2026-01-01T11:05:00.000Z",
+            origin: {"kind" => "task-notification"},
+          ) << "\n"
+        end
+        ClaudeAgent.get_session_info(session_id, directory: project_path).try(&.archived).should be_true
+
+        # Newer non-tool_result user prompt auto-unarchives
+        File.open(file_path, "a") do |file|
+          file << make_transcript_entry(
+            "user",
+            UUID.random.to_s,
+            nil,
+            session_id,
+            content: "follow up prompt",
+            timestamp: "2026-01-01T12:00:00.000Z",
+          ) << "\n"
+        end
+        ClaudeAgent.get_session_info(session_id, directory: project_path).try(&.archived).should be_false
+
+        # Also test queued_command auto-unarchive
+        session_two = UUID.random.to_s
+        file_two = make_session_file(
+          project_dir,
+          session_id: session_two,
+          first_prompt: "initial two",
+          timestamp: "2026-01-01T00:00:00.000Z",
+        )
+        ClaudeAgent.archive_session(session_two, directory: project_path)
+        File.write(
+          File.join(project_dir, session_two, "archived.json"),
+          %({"archived":true,"at":"2026-01-01T10:00:00.000Z","by":"sdk"}),
+        )
+        File.open(file_two, "a") do |file|
+          file << {
+            "type"       => JSON::Any.new("attachment"),
+            "uuid"       => JSON::Any.new(UUID.random.to_s),
+            "sessionId"  => JSON::Any.new(session_two),
+            "timestamp"  => JSON::Any.new("2026-01-01T10:30:00.000Z"),
+            "attachment" => json_any({"type" => "queued_command", "prompt" => "queued follow-up"}),
+          }.to_json << "\n"
+        end
+        ClaudeAgent.get_session_info(session_two, directory: project_path).try(&.archived).should be_false
+
+        # Oversized archived.json (> 4096 bytes) is ignored
+        File.write(File.join(project_dir, session_two, "archived.json"), " " * 5000)
+        ClaudeAgent.get_session_info(session_two, directory: project_path).try(&.archived).should be_nil
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+  end
+
+  describe "delete_session retry and error propagation" do
+    it "retries subagent directory removal on failure and succeeds when unlocked" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-delretry-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        make_session_file(project_dir, session_id: session_id)
+        session_dir = File.join(project_dir, session_id)
+        subagent_dir = File.join(session_dir, "subagents")
+        FileUtils.mkdir_p(subagent_dir)
+        File.write(File.join(subagent_dir, "agent-abc.jsonl"), "{}\n")
+
+        File.chmod(subagent_dir, 0o500)
+        File.chmod(session_dir, 0o500)
+
+        spawn do
+          sleep 20.milliseconds
+          File.chmod(session_dir, 0o700) if Dir.exists?(session_dir)
+          File.chmod(subagent_dir, 0o700) if Dir.exists?(subagent_dir)
+        end
+
+        begin
+          ClaudeAgent.delete_session(session_id, directory: project_path)
+          Dir.exists?(session_dir).should be_false
+        ensure
+          File.chmod(session_dir, 0o700) if Dir.exists?(session_dir)
+          File.chmod(subagent_dir, 0o700) if Dir.exists?(subagent_dir)
+          FileUtils.rm_rf(project_path)
+        end
+      end
+    end
+
+    it "propagates File::Error when subagent directory removal fails after 3 attempts" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-delfail-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        make_session_file(project_dir, session_id: session_id)
+        session_dir = File.join(project_dir, session_id)
+        subagent_dir = File.join(session_dir, "subagents")
+        FileUtils.mkdir_p(subagent_dir)
+        File.write(File.join(subagent_dir, "agent-abc.jsonl"), "{}\n")
+
+        File.chmod(subagent_dir, 0o500)
+        File.chmod(session_dir, 0o500)
+
+        begin
+          expect_raises(File::Error) do
+            ClaudeAgent.delete_session(session_id, directory: project_path)
+          end
+        ensure
+          File.chmod(session_dir, 0o700) if Dir.exists?(session_dir)
+          File.chmod(subagent_dir, 0o700) if Dir.exists?(subagent_dir)
+          FileUtils.rm_rf(project_path)
+        end
+      end
+    end
+  end
+
+  describe "parallel tool call/result recovery (Py #1422)" do
+    it "recovers off-chain parallel tool_use siblings and tool_results on disk and in store" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-parallel-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        u1 = UUID.random.to_s
+        a1 = UUID.random.to_s
+        a2 = UUID.random.to_s
+        tr1 = UUID.random.to_s
+        tr2 = UUID.random.to_s
+        tr_stray = UUID.random.to_s
+        a3 = UUID.random.to_s
+        u2 = UUID.random.to_s
+
+        entries = [
+          make_transcript_entry("user", u1, nil, session_id, content: "run 3 tools", timestamp: "2026-01-01T00:00:00Z"),
+          {
+            "type"       => JSON::Any.new("assistant"),
+            "uuid"       => JSON::Any.new(a1),
+            "parentUuid" => JSON::Any.new(u1),
+            "sessionId"  => JSON::Any.new(session_id),
+            "timestamp"  => JSON::Any.new("2026-01-01T00:00:01Z"),
+            "message"    => json_any({
+              "id"      => "msg_parallel_1",
+              "role"    => "assistant",
+              "content" => [{"type" => "tool_use", "id" => "call_1", "name" => "Read", "input" => {} of String => String}],
+            }),
+          }.to_json,
+          {
+            "type"       => JSON::Any.new("assistant"),
+            "uuid"       => JSON::Any.new(a2),
+            "parentUuid" => JSON::Any.new(a1),
+            "sessionId"  => JSON::Any.new(session_id),
+            "timestamp"  => JSON::Any.new("2026-01-01T00:00:02Z"),
+            "message"    => json_any({
+              "id"      => "msg_parallel_1",
+              "role"    => "assistant",
+              "content" => [
+                {"type" => "tool_use", "id" => "call_2", "name" => "Grep", "input" => {} of String => String},
+                {"type" => "tool_use", "id" => "call_3", "name" => "Glob", "input" => {} of String => String},
+              ],
+            }),
+          }.to_json,
+          # tr1 branches from a1 and leads to u2 (so a2 and tr2 are off the parentUuid chain!)
+          make_transcript_entry(
+            "user",
+            tr1,
+            a1,
+            session_id,
+            content: [{"type" => "tool_result", "tool_use_id" => "call_1", "content" => "r1"}],
+            timestamp: "2026-01-01T00:00:03Z",
+          ),
+          make_transcript_entry(
+            "user",
+            tr2,
+            a2,
+            session_id,
+            content: [{"type" => "tool_result", "tool_use_id" => "call_2", "content" => "r2"}],
+            timestamp: "2026-01-01T00:00:04Z",
+          ),
+          # Stray linked via sourceToolAssistantUUID / call_owner
+          make_transcript_entry(
+            "user",
+            tr_stray,
+            u1,
+            session_id,
+            content: [{"type" => "tool_result", "tool_use_id" => "call_3", "content" => "r3"}],
+            timestamp: "2026-01-01T00:00:05Z",
+            sourceToolAssistantUUID: a2,
+          ),
+          make_transcript_entry(
+            "user",
+            u2,
+            tr1,
+            session_id,
+            content: "next question",
+            timestamp: "2026-01-01T00:00:06Z",
+          ),
+          make_transcript_entry(
+            "assistant",
+            a3,
+            u2,
+            session_id,
+            content: "final answer",
+            timestamp: "2026-01-01T00:00:07Z",
+          ),
+        ]
+        write_transcript(project_dir, session_id, entries)
+
+        expected = [u1, a1, a2, tr2, tr_stray, tr1, u2, a3]
+        msgs = ClaudeAgent.get_session_messages(session_id, directory: project_path)
+        msgs.map(&.uuid).should eq(expected)
+
+        # Limit / offset apply after recovery
+        paged = ClaudeAgent.get_session_messages(session_id, directory: project_path, offset: 2, limit: 3)
+        paged.map(&.uuid).should eq([a2, tr2, tr_stray])
+
+        # Store path parity
+        store = ClaudeAgent::InMemorySessionStore.new
+        ClaudeAgent.import_session_to_store(session_id, store, directory: project_path)
+        store_msgs = ClaudeAgent.get_session_messages_from_store(store, session_id, directory: project_path)
+        store_msgs.map(&.uuid).should eq(expected)
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+  end
+
+  describe "queued prompts, active branch selection, and subagent isMeta" do
+    it "retains queued prompts and handles isMeta/local-command leaves" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-queued-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        cb = UUID.random.to_s
+        summary = UUID.random.to_s
+        a1 = UUID.random.to_s
+        q1 = UUID.random.to_s
+        q_source = UUID.random.to_s
+        meta_leaf = UUID.random.to_s
+
+        entries = [
+          make_transcript_entry("system", cb, nil, session_id, subtype: "compact_boundary"),
+          make_transcript_entry("user", summary, cb, session_id, content: "Summary", isCompactSummary: true),
+          make_transcript_entry("assistant", a1, summary, session_id, content: "Working..."),
+          make_transcript_entry("user", meta_leaf, a1, session_id, content: "caveat", isMeta: true),
+          # Trailing queued_command attachment after meta_leaf
+          {
+            "type"       => JSON::Any.new("attachment"),
+            "uuid"       => JSON::Any.new(q1),
+            "parentUuid" => JSON::Any.new(meta_leaf),
+            "sessionId"  => JSON::Any.new(session_id),
+            "timestamp"  => JSON::Any.new("2026-01-01T00:00:05Z"),
+            "attachment" => json_any({
+              "type"        => "queued_command",
+              "prompt"      => "queued follow-up",
+              "source_uuid" => q_source,
+            }),
+          }.to_json,
+        ]
+        write_transcript(project_dir, session_id, entries)
+
+        msgs = ClaudeAgent.get_session_messages(session_id, directory: project_path)
+        msgs.map(&.uuid).should eq([summary, a1, q_source])
+        msgs.last.type.should eq("user")
+        msgs.last.message["content"].as_s.should eq("queued follow-up")
+
+        # Also test direct user queued prompt after compaction summary without assistant reply
+        session_direct = UUID.random.to_s
+        cb2 = UUID.random.to_s
+        sum2 = UUID.random.to_s
+        queued_user = UUID.random.to_s
+        write_transcript(project_dir, session_direct, [
+          make_transcript_entry("system", cb2, nil, session_direct, subtype: "compact_boundary"),
+          make_transcript_entry("user", sum2, cb2, session_direct, content: "Summary 2", isCompactSummary: true),
+          make_transcript_entry("user", queued_user, sum2, session_direct, content: "direct queued prompt"),
+        ])
+        direct_msgs = ClaudeAgent.get_session_messages(session_direct, directory: project_path)
+        direct_msgs.map(&.uuid).should eq([sum2, queued_user])
+
+        # Mid-turn absorbed queued_command via queue-operation + visible peer isMeta message
+        session_absorbed = UUID.random.to_s
+        u_abs = UUID.random.to_s
+        a_abs = UUID.random.to_s
+        q_abs = UUID.random.to_s
+        q_abs_src = UUID.random.to_s
+        u_after = UUID.random.to_s
+        peer_meta = UUID.random.to_s
+        write_transcript(project_dir, session_absorbed, [
+          make_transcript_entry("user", u_abs, nil, session_absorbed, content: "start"),
+          make_transcript_entry("assistant", a_abs, u_abs, session_absorbed, content: "running"),
+          {
+            "type"       => JSON::Any.new("attachment"),
+            "uuid"       => JSON::Any.new(q_abs),
+            "parentUuid" => JSON::Any.new(a_abs),
+            "sessionId"  => JSON::Any.new(session_absorbed),
+            "timestamp"  => JSON::Any.new("2026-01-01T00:00:03Z"),
+            "attachment" => json_any({
+              "type"        => "queued_command",
+              "prompt"      => "absorbed mid turn",
+              "source_uuid" => q_abs_src,
+              "delivery_id" => "dlv-1",
+            }),
+          }.to_json,
+          {
+            "type"       => JSON::Any.new("queue-operation"),
+            "operation"  => JSON::Any.new("remove"),
+            "reason"     => JSON::Any.new("absorbed_mid_turn"),
+            "deliveryId" => JSON::Any.new("dlv-1"),
+          }.to_json,
+          make_transcript_entry("user", u_after, q_abs, session_absorbed, content: "next prompt"),
+          make_transcript_entry(
+            "user",
+            peer_meta,
+            u_after,
+            session_absorbed,
+            content: "peer msg",
+            isMeta: true,
+            origin: {"kind" => "peer"},
+          ),
+        ])
+        abs_msgs = ClaudeAgent.get_session_messages(session_absorbed, directory: project_path)
+        abs_msgs.map(&.uuid).should eq([u_abs, a_abs, q_abs_src, u_after, peer_meta])
+
+        # When newest branch ends at isMeta, still pick the newest active branch instead of rewound older branch
+        session_branch = UUID.random.to_s
+        root = UUID.random.to_s
+        old_reply = UUID.random.to_s
+        new_reply = UUID.random.to_s
+        new_meta = UUID.random.to_s
+        write_transcript(project_dir, session_branch, [
+          make_transcript_entry("user", root, nil, session_branch, content: "hi"),
+          make_transcript_entry("assistant", old_reply, root, session_branch, content: "old branch"),
+          make_transcript_entry("assistant", new_reply, root, session_branch, content: "active branch"),
+          make_transcript_entry("user", new_meta, new_reply, session_branch, content: "meta", isMeta: true),
+        ])
+        branch_msgs = ClaudeAgent.get_session_messages(session_branch, directory: project_path)
+        branch_msgs.map(&.uuid).should eq([root, new_reply])
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+
+    it "includes isMeta messages in get_subagent_messages and counts them in offset/limit" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-submeta-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+        agent_id = "meta-worker"
+
+        make_session_file(project_dir, session_id: session_id)
+        subagent_dir = File.join(project_dir, session_id, "subagents")
+        FileUtils.mkdir_p(subagent_dir)
+
+        u1 = UUID.random.to_s
+        m1 = UUID.random.to_s
+        a1 = UUID.random.to_s
+        File.write(
+          File.join(subagent_dir, "agent-#{agent_id}.jsonl"),
+          [
+            make_transcript_entry("user", u1, nil, session_id, content: "task"),
+            make_transcript_entry("user", m1, u1, session_id, content: "injected meta", isMeta: true),
+            make_transcript_entry("assistant", a1, m1, session_id, content: "done"),
+          ].join("\n") + "\n",
+        )
+
+        all_msgs = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path)
+        all_msgs.map(&.uuid).should eq([u1, m1, a1])
+
+        paged = ClaudeAgent.get_subagent_messages(session_id, agent_id, directory: project_path, offset: 1, limit: 1)
+        paged.map(&.uuid).should eq([m1])
+
+        store = ClaudeAgent::InMemorySessionStore.new
+        ClaudeAgent.import_session_to_store(session_id, store, directory: project_path)
+        store_msgs = ClaudeAgent.get_subagent_messages_from_store(
+          store, session_id, agent_id, directory: project_path, offset: 1, limit: 2
+        )
+        store_msgs.map(&.uuid).should eq([m1, a1])
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+  end
+
+  describe "fork_session non-UUID and compaction-aware slicing" do
+    it "forks using non-UUID delivery_id and uuid values" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-forkid-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        u1 = "custom-client-id-1"
+        a1 = UUID.random.to_s
+        u2 = UUID.random.to_s
+        a2 = UUID.random.to_s
+
+        write_transcript(project_dir, session_id, [
+          make_transcript_entry("user", u1, nil, session_id, content: "first", deliveryId: "deliv-1"),
+          make_transcript_entry("assistant", a1, u1, session_id, content: "reply 1"),
+          make_transcript_entry("user", u2, a1, session_id, content: "second", delivery_id: "deliv-2"),
+          make_transcript_entry("assistant", a2, u2, session_id, content: "reply 2"),
+        ])
+
+        fork_by_custom = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: u1)
+        msgs_custom = ClaudeAgent.get_session_messages(fork_by_custom.session_id, directory: project_path)
+        msgs_custom.size.should eq(1)
+        msgs_custom.first.message["content"].as_s.should eq("first")
+
+        fork_by_deliv = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: "deliv-2")
+        msgs_deliv = ClaudeAgent.get_session_messages(fork_by_deliv.session_id, directory: project_path)
+        msgs_deliv.size.should eq(3)
+        msgs_deliv.last.message["content"].as_s.should eq("second")
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+
+    it "slices cleanly at compact_boundary and isCompactSummary without dragging preserved messages" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-forkcompact-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        u1 = UUID.random.to_s
+        a1 = UUID.random.to_s
+        kept_a = UUID.random.to_s
+        cb = UUID.random.to_s
+        summary = UUID.random.to_s
+        u2 = UUID.random.to_s
+
+        write_transcript(project_dir, session_id, [
+          make_transcript_entry("user", u1, nil, session_id, content: "old prompt"),
+          make_transcript_entry("assistant", a1, u1, session_id, content: "old reply"),
+          make_transcript_entry("assistant", kept_a, a1, session_id, content: "kept reply"),
+          {
+            "type"              => JSON::Any.new("system"),
+            "subtype"           => JSON::Any.new("compact_boundary"),
+            "uuid"              => JSON::Any.new(cb),
+            "parentUuid"        => JSON::Any.new(nil),
+            "logicalParentUuid" => JSON::Any.new(kept_a),
+            "sessionId"         => JSON::Any.new(session_id),
+            "timestamp"         => JSON::Any.new("2026-01-01T00:00:03Z"),
+            "compactMetadata"   => json_any({
+              "trigger"           => "auto",
+              "preTokens"         => 1000,
+              "postTokens"        => 200,
+              "preservedMessages" => {
+                "anchorUuid" => summary,
+                "uuids"      => [kept_a],
+                "allUuids"   => [kept_a],
+              },
+            }),
+          }.to_json,
+          make_transcript_entry("user", summary, cb, session_id, content: "Compacted", isCompactSummary: true),
+          make_transcript_entry("user", u2, summary, session_id, content: "post compact"),
+        ])
+
+        # Forking at compact_boundary stops before the boundary
+        fork_at_cb = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: cb)
+        cb_msgs = ClaudeAgent.get_session_messages(fork_at_cb.session_id, directory: project_path)
+        cb_msgs.map { |msg| msg.message["content"]?.try(&.as_s?) }.should eq(["old prompt", "old reply", "kept reply"])
+
+        # Forking at isCompactSummary keeps summary, drops post-summary u2 and strips preservedMessages
+        fork_at_summary = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: summary)
+        sum_msgs = ClaudeAgent.get_session_messages(fork_at_summary.session_id, directory: project_path)
+        sum_msgs.map { |msg| msg.message["content"]?.try(&.as_s?) }.should eq(["Compacted"])
+
+        # Verify forked JSONL cleared preservedMessages/preservedSegment/postTokens on the boundary
+        forked_path = File.join(project_dir, "#{fork_at_summary.session_id}.jsonl")
+        forked_entries = File.read(forked_path).each_line.compact_map do |line|
+          stripped = line.strip
+          stripped.empty? ? nil : JSON.parse(stripped).as_h?
+        end.to_a
+        boundary_entry = forked_entries.find { |entry| entry["subtype"]?.try(&.as_s?) == "compact_boundary" }
+        boundary_entry.should_not be_nil
+        if b_entry = boundary_entry
+          cm = b_entry["compactMetadata"].as_h
+          cm.has_key?("preservedMessages").should be_false
+          cm.has_key?("preservedSegment").should be_false
+          cm.has_key?("postTokens").should be_false
+        end
+
+        # Full fork remaps preservedMessages UUIDs to the new forked UUIDs
+        full_fork = ClaudeAgent.fork_session(session_id, directory: project_path)
+        full_msgs = ClaudeAgent.get_session_messages(full_fork.session_id, directory: project_path)
+        full_msgs.map { |msg| msg.message["content"]?.try(&.as_s?) }.should eq(["Compacted", "kept reply", "post compact"])
+
+        FileUtils.rm_rf(project_path)
+      end
+    end
+
+    it "keeps rewind compact_boundary and scopes preservedSegment on fork" do
+      with_temp_claude_config do |config_dir|
+        project_path = "/tmp/claude-agent-cr-rewindfork-#{Random.rand(1_000_000)}"
+        FileUtils.mkdir_p(project_path)
+        project_dir = make_project_dir(config_dir, project_path)
+        session_id = UUID.random.to_s
+
+        u1 = UUID.random.to_s
+        a1 = UUID.random.to_s
+        rewind_cb = UUID.random.to_s
+        p1 = UUID.random.to_s
+        p2 = UUID.random.to_s
+        q_mid = UUID.random.to_s
+        cb2 = UUID.random.to_s
+        s2 = UUID.random.to_s
+
+        write_transcript(project_dir, session_id, [
+          make_transcript_entry("user", u1, nil, session_id, content: "start"),
+          make_transcript_entry("assistant", a1, u1, session_id, content: "first reply"),
+          {
+            "type"            => JSON::Any.new("system"),
+            "subtype"         => JSON::Any.new("compact_boundary"),
+            "uuid"            => JSON::Any.new(rewind_cb),
+            "parentUuid"      => JSON::Any.new(nil),
+            "sessionId"       => JSON::Any.new(session_id),
+            "timestamp"       => JSON::Any.new("2026-01-01T00:00:02Z"),
+            "compactMetadata" => json_any({
+              "trigger"          => "auto",
+              "durationMs"       => 0,
+              "preservedSegment" => {
+                "headUuid"   => p1,
+                "anchorUuid" => rewind_cb,
+                "tailUuid"   => p2,
+              },
+            }),
+          }.to_json,
+          make_transcript_entry("user", p1, rewind_cb, session_id, content: "kept 1"),
+          make_transcript_entry("assistant", p2, p1, session_id, content: "kept 2"),
+          {
+            "type"              => JSON::Any.new("system"),
+            "subtype"           => JSON::Any.new("compact_boundary"),
+            "uuid"              => JSON::Any.new(cb2),
+            "parentUuid"        => JSON::Any.new(nil),
+            "logicalParentUuid" => JSON::Any.new(p2),
+            "sessionId"         => JSON::Any.new(session_id),
+            "timestamp"         => JSON::Any.new("2026-01-01T00:00:05Z"),
+          }.to_json,
+          {
+            "type"       => JSON::Any.new("attachment"),
+            "uuid"       => JSON::Any.new(q_mid),
+            "parentUuid" => JSON::Any.new(cb2),
+            "sessionId"  => JSON::Any.new(session_id),
+            "timestamp"  => JSON::Any.new("2026-01-01T00:00:06Z"),
+            "attachment" => json_any({"type" => "queued_command", "prompt" => "between"}),
+          }.to_json,
+          make_transcript_entry("user", s2, cb2, session_id, content: "Summary 2", isCompactSummary: true),
+        ])
+
+        # Forking at a queued_command stored between cb2 and s2 ends before cb2
+        fork_mid = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: q_mid)
+        mid_msgs = ClaudeAgent.get_session_messages(fork_mid.session_id, directory: project_path)
+        mid_msgs.map { |msg| msg.message["content"]?.try(&.as_s?) }.should eq(["kept 1", "kept 2"])
+
+        # Forking at rewind_cb keeps rewind_cb (it is NOT trimmed by DNe)
+        fork_rewind = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: rewind_cb)
+        rewind_lines = File.read(File.join(project_dir, "#{fork_rewind.session_id}.jsonl")).each_line.to_a
+        rewind_lines.any?(&.includes?("compact_boundary")).should be_true
+
+        # Forking mid-preservedSegment at p1 scopes tailUuid to p1's remapped UUID
+        fork_p1 = ClaudeAgent.fork_session(session_id, directory: project_path, up_to_message_id: p1)
+        p1_entries = File.read(File.join(project_dir, "#{fork_p1.session_id}.jsonl")).each_line.compact_map do |line|
+          stripped = line.strip
+          stripped.empty? ? nil : JSON.parse(stripped).as_h?
+        end.to_a
+        p1_cb = p1_entries.find { |entry| entry["subtype"]?.try(&.as_s?) == "compact_boundary" }
+        p1_user = p1_entries.find { |entry| entry["message"]?.try(&.as_h?.try(&.["content"]?.try(&.as_s?))) == "kept 1" }
+        p1_cb.should_not be_nil
+        p1_user.should_not be_nil
+        if cb_entry = p1_cb
+          if u_entry = p1_user
+            seg = cb_entry["compactMetadata"]["preservedSegment"].as_h
+            seg["headUuid"].as_s.should eq(u_entry["uuid"].as_s)
+            seg["tailUuid"].as_s.should eq(u_entry["uuid"].as_s)
+          end
+        end
+
+        FileUtils.rm_rf(project_path)
+      end
     end
   end
 end

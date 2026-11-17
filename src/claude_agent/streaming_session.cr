@@ -29,8 +29,8 @@ module ClaudeAgent
     @running : Bool = false
     @session_id : String?
 
-    def initialize(@options : AgentOptions? = nil)
-      @cli_client = CLIClient.new(@options)
+    def initialize(@options : AgentOptions? = nil, cli_client : CLIClient? = nil)
+      @cli_client = cli_client || CLIClient.new(@options)
       @input_channel = Channel(PendingUserMessage).new(10)
       @output_channel = Channel(Message).new(100)
       @done_channel = Channel(Nil).new(2)
@@ -146,6 +146,10 @@ module ClaudeAgent
       spawn do
         @cli_client.each_message do |message|
           break unless @running
+          if message.sdk_host_only_frame? ||
+             (message.is_a?(UnknownMessage) && message.type == "keep_alive")
+            next
+          end
 
           # Capture session_id
           case message

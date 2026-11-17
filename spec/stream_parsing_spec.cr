@@ -31,9 +31,10 @@ describe "CLIClient stream parsing" do
   describe "line-oriented JSON" do
     it "parses a single well-formed stream-json line" do
       stream = {
-        "type"       => JSON::Any.new("system"),
-        "subtype"    => JSON::Any.new("init"),
-        "session_id" => JSON::Any.new("s-1"),
+        "type"                => JSON::Any.new("system"),
+        "subtype"             => JSON::Any.new("init"),
+        "session_id"          => JSON::Any.new("s-1"),
+        "claude_code_version" => JSON::Any.new("2.1.325"),
       }.to_json + "\n"
 
       messages, errors = collect_messages(stream)
@@ -43,7 +44,7 @@ describe "CLIClient stream parsing" do
     end
 
     it "parses multiple JSON objects separated by newlines" do
-      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1", "claude_code_version" => "2.1.325"}.to_json
       m2 = {
         "type"       => "assistant",
         "uuid"       => "u-1",
@@ -70,7 +71,7 @@ describe "CLIClient stream parsing" do
     end
 
     it "skips empty lines between JSON messages" do
-      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1", "claude_code_version" => "2.1.325"}.to_json
       m2 = {"type" => "system", "subtype" => "status", "status" => "requesting",
             "session_id" => "s-1", "uuid" => "u-2"}.to_json
 
@@ -84,7 +85,7 @@ describe "CLIClient stream parsing" do
     end
 
     it "handles the final line without a trailing newline" do
-      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+      m1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1", "claude_code_version" => "2.1.325"}.to_json
       stream = m1 # no trailing \n
 
       messages, errors = collect_messages(stream)
@@ -133,7 +134,12 @@ describe "CLIClient stream parsing" do
 
   describe "malformed input recovery" do
     it "logs malformed lines without stopping the stream" do
-      good1 = {"type" => "system", "subtype" => "init", "session_id" => "s-1"}.to_json
+      good1 = {
+        "type"                => "system",
+        "subtype"             => "init",
+        "session_id"          => "s-1",
+        "claude_code_version" => "2.1.325",
+      }.to_json
       bad = %({"type": "system", "subtype": "init", malformed)
       good2 = {"type" => "system", "subtype" => "status", "status" => "requesting",
                "session_id" => "s-1", "uuid" => "u-2"}.to_json

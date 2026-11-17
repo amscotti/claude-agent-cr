@@ -227,29 +227,39 @@ module ClaudeAgent
     # optional API
   end
 
+  OAUTH_CONFIG_FILES = {
+    ".claude-staging-oauth.json",
+    ".claude-local-oauth.json",
+    ".claude-custom-oauth.json",
+  }
+
   # Seed `tmp_base` with the caller's auth and user config:
-  # `.credentials.json` (refreshToken redacted), `.claude.json`, and user
-  # `settings.json` / `cowork_settings.json` (plugin declarations
-  # stripped). Mirrors Python's `_copy_auth_files` (0.2.137).
+  # `.credentials.json` (refreshToken redacted), `.claude.json` (or legacy
+  # `.config.json` when `.claude.json` is absent), OAuth-suffixed config
+  # files, and user `settings.json` / `cowork_settings.json` (plugin
+  # declarations stripped). Mirrors Python's `_copy_auth_files` (0.2.137)
+  # and TS SDK 0.3.271.
   private def self.copy_auth_files(tmp_base : String, opt_env : Hash(String, String)?) : Nil
     caller_config = opt_env.try(&.["CLAUDE_CONFIG_DIR"]?) || ENV["CLAUDE_CONFIG_DIR"]?
-    source_config = if caller_config
-                      caller_config
-                    else
-                      File.join(ENV["HOME"]? || ".", ".claude")
-                    end
+    home_dir = ENV["HOME"]? || "."
+    source_config = caller_config || File.join(home_dir, ".claude")
 
     creds_path = File.join(source_config, ".credentials.json")
     if File.file?(creds_path)
       write_redacted_credentials(File.read(creds_path), File.join(tmp_base, ".credentials.json"))
     end
 
-    claude_json_src = if caller_config
-                        File.join(caller_config, ".claude.json")
-                      else
-                        File.join(ENV["HOME"]? || ".", ".claude.json")
-                      end
+    claude_json_dir = caller_config || home_dir
+    claude_json_src = File.join(claude_json_dir, ".claude.json")
     copy_if_present(claude_json_src, File.join(tmp_base, ".claude.json"))
+
+    unless File.file?(claude_json_src)
+      copy_if_present(File.join(source_config, ".config.json"), File.join(tmp_base, ".config.json"))
+    end
+
+    OAUTH_CONFIG_FILES.each do |filename|
+      copy_if_present(File.join(claude_json_dir, filename), File.join(tmp_base, filename))
+    end
 
     # User settings carry `apiKeyHelper` (a fourth auth mechanism
     # alongside .credentials.json / Keychain / env) plus env/hooks/

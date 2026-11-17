@@ -30,6 +30,27 @@ describe ClaudeAgent::BashToolOutput do
     out.try(&.timed_out?).should be_false
   end
 
+  it "parses backgroundEndsWithFinalResponse and backgroundWakesOwner" do
+    json = {
+      "stdout"                          => "started",
+      "stderr"                          => "",
+      "interrupted"                     => false,
+      "backgroundEndsWithFinalResponse" => true,
+      "backgroundWakesOwner"            => false,
+    }.to_json
+
+    out = ClaudeAgent::BashToolOutput.parse(json)
+    out.should_not be_nil
+    if out
+      out.background_ends_with_final_response.should be_true
+      out.background_wakes_owner.should be_false
+    end
+
+    minimal = ClaudeAgent::BashToolOutput.parse(%({"stdout":"ok"}))
+    minimal.try(&.background_ends_with_final_response).should be_nil
+    minimal.try(&.background_wakes_owner).should be_nil
+  end
+
   it "returns nil for non-JSON content" do
     ClaudeAgent::BashToolOutput.parse("not json").should be_nil
     ClaudeAgent::BashToolOutput.parse(nil).should be_nil
@@ -37,7 +58,7 @@ describe ClaudeAgent::BashToolOutput do
 end
 
 describe ClaudeAgent::AgentToolCompletedOutput do
-  it "parses resolvedModel into model" do
+  it "parses resolvedModel into model while preserving metadata fields" do
     json = {
       "status"            => "completed",
       "agentId"           => "agent-1",
@@ -47,6 +68,11 @@ describe ClaudeAgent::AgentToolCompletedOutput do
       "totalDurationMs"   => 4200,
       "totalToolUseCount" => 3,
       "prompt"            => "explore repo",
+      "toolsUsed"         => ["Read", "Grep"],
+      "usage"             => {"input_tokens" => 100, "output_tokens" => 50, "fallback_credit" => true},
+      "toolStats"         => {"Read" => 2, "Grep" => 1},
+      "worktreePath"      => "/tmp/wt-1",
+      "worktreeBranch"    => "worktree-branch-1",
     }.to_json
 
     out = ClaudeAgent::AgentToolCompletedOutput.parse(json)
@@ -58,6 +84,11 @@ describe ClaudeAgent::AgentToolCompletedOutput do
       out.effective_model.should eq("claude-sonnet-4-6")
       out.agent_id.should eq("agent-1")
       out.total_tokens.should eq(1500)
+      out.tools_used.should eq(["Read", "Grep"])
+      out.usage.try(&.["fallback_credit"].as_bool).should be_true
+      out.tool_stats.try(&.["Read"].as_i).should eq(2)
+      out.worktree_path.should eq("/tmp/wt-1")
+      out.worktree_branch.should eq("worktree-branch-1")
     end
   end
 
@@ -127,9 +158,69 @@ describe ClaudeAgent::AgentToolQueuedOutput do
   end
 end
 
+describe ClaudeAgent::OfferChromeSetupOutput do
+  it "parses outcome from JSON string and JSON::Any" do
+    out = ClaudeAgent::OfferChromeSetupOutput.parse(%({"outcome":"connected"}))
+    out.should_not be_nil
+    out.try(&.outcome).should eq("connected")
+
+    any_out = ClaudeAgent::OfferChromeSetupOutput.parse(JSON.parse(%({"outcome":"not_now"})))
+    any_out.try(&.outcome).should eq("not_now")
+
+    ClaudeAgent::OfferChromeSetupOutput.parse("invalid").should be_nil
+    ClaudeAgent::OfferChromeSetupOutput.parse(nil).should be_nil
+  end
+end
+
 describe ClaudeAgent::BuiltinTools do
-  it "exposes ReadMcpResourceDir constant" do
+  it "preserves legacy constants and exposes all 54 canonical tool names and 8 aliases" do
+    ClaudeAgent::BuiltinTools::TASK.should eq("Task")
+    ClaudeAgent::BuiltinTools::READ_MCP_RESOURCE.should eq("ReadMcpResource")
     ClaudeAgent::BuiltinTools::READ_MCP_RESOURCE_DIR.should eq("ReadMcpResourceDir")
+
     ClaudeAgent::BuiltinTools::BASH.should eq("Bash")
+    ClaudeAgent::BuiltinTools::AGENT.should eq("Agent")
+    ClaudeAgent::BuiltinTools::ARTIFACT.should eq("Artifact")
+    ClaudeAgent::BuiltinTools::CLAUDE_DESIGN.should eq("ClaudeDesign")
+    ClaudeAgent::BuiltinTools::CRON_CREATE.should eq("CronCreate")
+    ClaudeAgent::BuiltinTools::END_CONVERSATION.should eq("EndConversation")
+    ClaudeAgent::BuiltinTools::LIST_MCP_RESOURCES_TOOL.should eq("ListMcpResourcesTool")
+    ClaudeAgent::BuiltinTools::LSP.should eq("LSP")
+    ClaudeAgent::BuiltinTools::MONITOR.should eq("Monitor")
+    ClaudeAgent::BuiltinTools::OFFER_CHROME_SETUP.should eq("OfferChromeSetup")
+    ClaudeAgent::BuiltinTools::POWER_SHELL.should eq("PowerShell")
+    ClaudeAgent::BuiltinTools::PROPOSE_SKILLS.should eq("propose_skills")
+    ClaudeAgent::BuiltinTools::READ_MCP_RESOURCE_TOOL.should eq("ReadMcpResourceTool")
+    ClaudeAgent::BuiltinTools::READ_MCP_RESOURCE_DIR_TOOL.should eq("ReadMcpResourceDirTool")
+    ClaudeAgent::BuiltinTools::SCHEDULE_WAKEUP.should eq("ScheduleWakeup")
+    ClaudeAgent::BuiltinTools::SEND_USER_MESSAGE.should eq("SendUserMessage")
+    ClaudeAgent::BuiltinTools::TASK_STOP.should eq("TaskStop")
+    ClaudeAgent::BuiltinTools::TOOL_SEARCH.should eq("ToolSearch")
+    ClaudeAgent::BuiltinTools::WAIT_FOR_MCP_SERVERS.should eq("WaitForMcpServers")
+    ClaudeAgent::BuiltinTools::WORKFLOW.should eq("Workflow")
+
+    ClaudeAgent::BUILTIN_TOOL_NAMES.size.should eq(54)
+    ClaudeAgent::BuiltinTools::BUILTIN_TOOL_NAMES.should eq(ClaudeAgent::BUILTIN_TOOL_NAMES)
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should contain("Agent")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should contain("propose_skills")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should contain("ReadMcpResourceTool")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should contain("ReadMcpResourceDirTool")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should_not contain("Task")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should_not contain("ReadMcpResource")
+    ClaudeAgent::BUILTIN_TOOL_NAMES.should_not contain("ReadMcpResourceDir")
+
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES.size.should eq(8)
+    ClaudeAgent::BuiltinTools::LEGACY_TOOL_NAME_ALIASES.should eq(ClaudeAgent::LEGACY_TOOL_NAME_ALIASES)
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["Task"].should eq("Agent")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["KillShell"].should eq("TaskStop")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["KillBash"].should eq("TaskStop")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["ListPeers"].should eq("ListAgents")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["Brief"].should eq("SendUserMessage")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["ListMcpResources"].should eq("ListMcpResourcesTool")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["ReadMcpResource"].should eq("ReadMcpResourceTool")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES["ReadMcpResourceDir"].should eq("ReadMcpResourceDirTool")
+    ClaudeAgent::LEGACY_TOOL_NAME_ALIASES.each_value do |canonical|
+      ClaudeAgent::BUILTIN_TOOL_NAMES.should contain(canonical)
+    end
   end
 end

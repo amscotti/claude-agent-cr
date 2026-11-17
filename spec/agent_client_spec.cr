@@ -6,22 +6,31 @@ require "./spec_helper"
 private class FakeCLIClient < ClaudeAgent::CLIClient
   getter sent_messages : Array(Hash(String, JSON::Any))
   getter sent_control_responses : Array(Hash(String, JSON::Any))
+  getter stopped_count : Int32 = 0
+  getter? started_flag : Bool = false
 
   def initialize(
     @control_responses : Hash(String, Hash(String, JSON::Any)) = {} of String => Hash(String, JSON::Any),
     @control_errors : Hash(String, String) = {} of String => String,
+    options : ClaudeAgent::AgentOptions? = nil,
+    @control_error_codes : Hash(String, String) = {} of String => String,
+    @suppress_auto_responses : Set(String) = Set(String).new,
   )
-    super(nil)
+    super(options)
     @sent_messages = [] of Hash(String, JSON::Any)
     @sent_control_responses = [] of Hash(String, JSON::Any)
-    @messages = Channel(ClaudeAgent::Message).new(20)
+    @messages = Channel(ClaudeAgent::Message).new(40)
+    @request_ids_channel = Channel(Tuple(String, String)).new(20)
   end
 
   def start
+    @started_flag = true
   end
 
   def stop
+    @stopped_count += 1
     @messages.close unless @messages.closed?
+    @request_ids_channel.close unless @request_ids_channel.closed?
   end
 
   def send_prompt(
@@ -78,6 +87,23 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
     @messages.close unless @messages.closed?
   end
 
+  def wait_for_control_request : Tuple(String, String)
+    @request_ids_channel.receive
+  end
+
+  def push_control_success(request_id : String, result : Hash(String, JSON::Any) = {} of String => JSON::Any)
+    response = {
+      "request_id" => JSON::Any.new(request_id),
+      "subtype"    => JSON::Any.new("success"),
+      "response"   => JSON::Any.new(result),
+    }
+    message = ClaudeAgent::ControlResponseMessage.from_json({
+      "type"     => JSON::Any.new("control_response"),
+      "response" => JSON::Any.new(response),
+    }.to_json)
+    @messages.send(message)
+  end
+
   def each_message(&)
     loop do
       message = @messages.receive?
@@ -92,6 +118,8 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
     request_id = payload["request_id"].as_s
     request = payload["request"].as_h
     subtype = request["subtype"].as_s
+    @request_ids_channel.send({request_id, subtype}) unless @request_ids_channel.closed?
+    return if @suppress_auto_responses.includes?(subtype)
 
     response = {} of String => JSON::Any
     response["request_id"] = JSON::Any.new(request_id)
@@ -99,6 +127,9 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
     if error = @control_errors[subtype]?
       response["subtype"] = JSON::Any.new("error")
       response["error"] = JSON::Any.new(error)
+      if code = @control_error_codes[subtype]?
+        response["error_code"] = JSON::Any.new(code)
+      end
     else
       response["subtype"] = JSON::Any.new("success")
       if result = @control_responses[subtype]?
@@ -112,6 +143,25 @@ private class FakeCLIClient < ClaudeAgent::CLIClient
     }.to_json)
 
     @messages.send(message)
+  end
+end
+
+private class ShortTimeoutAgentClient < ClaudeAgent::AgentClient
+  def initialize(
+    options : ClaudeAgent::AgentOptions? = nil,
+    cli_client : ClaudeAgent::CLIClient? = nil,
+    @init_timeout : Time::Span = 80.milliseconds,
+    @max_init_timeout : Time::Span = 220.milliseconds,
+  )
+    super(options, cli_client)
+  end
+
+  protected def initialize_timeout : Time::Span
+    @init_timeout
+  end
+
+  protected def max_initialize_timeout : Time::Span
+    @max_init_timeout
   end
 end
 
@@ -348,7 +398,7 @@ describe ClaudeAgent::AgentClient do
 
       request = fake_cli.sent_messages.last["request"].as_h
       request["subtype"].as_s.should eq("mcp_set_servers")
-      servers = request["mcpServers"].as_h
+      servers = request["servers"].as_h
       servers["filesystem"].as_h["request_timeout_ms"].as_i.should eq(5_000)
       servers["remote"].as_h.has_key?("request_timeout_ms").should be_false
     ensure
@@ -1875,6 +1925,910 @@ describe "AgentClient session store mirroring" do
         error = client.test_connection_closed_error
         error.should be_a(ClaudeAgent::ConnectionError)
         (error.message || "").should_not contain("stale failure")
+      ensure
+        client.stop
+      end
+    end
+  end
+end
+
+describe "v0.11.0 AgentClient parity" do
+  describe "initialize system prompt snapshot and SDK MCP configs/manifests" do
+    it "emits explicit false and true systemPromptSnapshot for SystemPromptPreset and SystemPromptCustom" do
+      preset_false = ClaudeAgent::SystemPromptPreset.claude_code(snapshot: false)
+      fake_cli1 = FakeCLIClient.new
+      client1 = ClaudeAgent::AgentClient.new(ClaudeAgent::AgentOptions.new(system_prompt: preset_false), fake_cli1)
+      begin
+        client1.start
+        req = fake_cli1.sent_messages.first["request"].as_h
+        req.has_key?("systemPromptSnapshot").should be_true
+        req["systemPromptSnapshot"].as_bool.should be_false
+      ensure
+        client1.stop
+      end
+
+      custom_true = ClaudeAgent::SystemPromptCustom.new("Be brief.", snapshot: true)
+      fake_cli2 = FakeCLIClient.new
+      client2 = ClaudeAgent::AgentClient.new(ClaudeAgent::AgentOptions.new(system_prompt: custom_true), fake_cli2)
+      begin
+        client2.start
+        req = fake_cli2.sent_messages.first["request"].as_h
+        req["systemPromptSnapshot"].as_bool.should be_true
+      ensure
+        client2.stop
+      end
+
+      custom_nil = ClaudeAgent::SystemPromptCustom.new("Be brief.")
+      fake_cli3 = FakeCLIClient.new
+      client3 = ClaudeAgent::AgentClient.new(ClaudeAgent::AgentOptions.new(system_prompt: custom_nil), fake_cli3)
+      begin
+        client3.start
+        req = fake_cli3.sent_messages.first["request"].as_h
+        req.has_key?("systemPromptSnapshot").should be_false
+      ensure
+        client3.stop
+      end
+    end
+
+    it "rejects reserved MCP server names on start" do
+      bad_server = ClaudeAgent::SDKMCPServer.new("ok-name")
+      options = ClaudeAgent::AgentOptions.new(
+        mcp_servers: {"__proto__" => bad_server} of String => ClaudeAgent::MCPServerConfig,
+      )
+      fake_cli = FakeCLIClient.new(options: options)
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      expect_raises(ClaudeAgent::ConfigurationError, /reserved/) do
+        client.start
+      end
+      fake_cli.started_flag?.should be_false
+    end
+
+    it "emits sdkMcpServerConfigs and sdkMcpServerManifests in initialize" do
+      greet_tool = ClaudeAgent.tool(
+        name: "greet",
+        description: "Greet user",
+        schema: {"type" => JSON::Any.new("object")},
+      ) { |_args| ClaudeAgent::ToolResult.text("hi") }
+
+      configured = ClaudeAgent::SDKMCPServer.new(
+        name: "configured",
+        version: "1.2.3",
+        tools: [greet_tool],
+        timeout: 4_500,
+        tool_policies: [
+          ClaudeAgent::MCPServerToolPolicy.new("greet", permission_policy: "always_ask"),
+        ],
+      )
+      plain = ClaudeAgent::SDKMCPServer.new(name: "plain", tools: [greet_tool])
+
+      options = ClaudeAgent::AgentOptions.new(
+        mcp_servers: {
+          "configured" => configured,
+          "plain"      => plain,
+        } of String => ClaudeAgent::MCPServerConfig,
+      )
+      fake_cli = FakeCLIClient.new(options: options)
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+        req = fake_cli.sent_messages.first["request"].as_h
+        req["sdkMcpServers"].as_a.map(&.as_s).to_set.should eq(Set{"configured", "plain"})
+
+        configs = req["sdkMcpServerConfigs"].as_h
+        configs.has_key?("plain").should be_false
+        cfg = configs["configured"].as_h
+        cfg["timeout"].as_i.should eq(4_500)
+        cfg["tools"].as_a.first["name"].as_s.should eq("greet")
+        cfg["tools"].as_a.first["permission_policy"].as_s.should eq("always_ask")
+
+        manifests = req["sdkMcpServerManifests"].as_h
+        manifests["configured"].as_h["initializeResult"].as_h["serverInfo"].as_h["version"].as_s.should eq("1.2.3")
+        manifests["plain"].as_h["toolsListResult"].as_h["tools"].as_a.first["name"].as_s.should eq("greet")
+      ensure
+        client.stop
+      end
+    end
+  end
+
+  describe "all 33 hooks, HookEntryList, and on_failure handshake validation" do
+    it "registers all 33 hook events including SessionStart/SessionEnd/UserPromptSubmit and skips local double-fire" do
+      local_fires = [] of String
+      make_cb = ->(label : String) do
+        ->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+          local_fires << label
+          ClaudeAgent::HookResult.allow
+        }
+      end
+
+      cb = make_cb.call("generic")
+      hooks = ClaudeAgent::HookConfig.new(
+        pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [cb])],
+        post_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [cb])],
+        post_tool_use_failure: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [cb])],
+        permission_request: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [cb])],
+        elicitation: [cb],
+        elicitation_result: [cb],
+        user_prompt_submit: [ClaudeAgent::HookMatcher.new(hooks: [make_cb.call("user_prompt")], on_failure: "continue")],
+        stop: [cb],
+        subagent_start: [cb],
+        subagent_stop: [cb],
+        pre_compact: [cb],
+        session_start: [make_cb.call("session_start")],
+        session_end: [make_cb.call("session_end")],
+        notification: [cb],
+        teammate_idle: [cb],
+        task_completed: [cb],
+        config_change: [cb],
+        message_display: [cb],
+        directory_added: [cb],
+        post_tool_batch: [cb],
+        user_prompt_expansion: [cb],
+        stop_failure: [cb],
+        post_compact: [cb],
+        pre_model_switch: [cb],
+        post_model_switch: [cb],
+        permission_denied: [ClaudeAgent::HookMatcher.new(hooks: [cb], on_failure: "continue")],
+        setup: [cb],
+        task_created: [cb],
+        worktree_create: [cb],
+        worktree_remove: [cb],
+        instructions_loaded: [cb],
+        cwd_changed: [cb],
+        file_changed: [cb],
+      )
+
+      options = ClaudeAgent::AgentOptions.new(hooks: hooks)
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+        client.query("hello")
+
+        init_hooks = fake_cli.sent_messages.first["request"].as_h["hooks"].as_h
+        init_hooks.size.should eq(33)
+        init_hooks["UserPromptSubmit"].as_a.first.as_h["onFailure"].as_s.should eq("continue")
+        init_hooks["PermissionDenied"].as_a.first.as_h["onFailure"].as_s.should eq("continue")
+        init_hooks.has_key?("SessionStart").should be_true
+        init_hooks.has_key?("SessionEnd").should be_true
+        init_hooks.has_key?("FileChanged").should be_true
+
+        # Registered control hooks must not double-fire locally on start/query/stop.
+        local_fires.should be_empty
+      ensure
+        client.stop
+      end
+      local_fires.should be_empty
+    end
+
+    it "fails closed on start when on_failure=block is unsupported or hooks_applied is false" do
+      cb = ->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+        ClaudeAgent::HookResult.allow
+      }
+      options = ClaudeAgent::AgentOptions.new(
+        hooks: ClaudeAgent::HookConfig.new(
+          pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash", hooks: [cb], on_failure: "block")],
+        ),
+      )
+
+      unsupported_cli = FakeCLIClient.new(control_responses: {"initialize" => {} of String => JSON::Any})
+      client1 = ClaudeAgent::AgentClient.new(options, unsupported_cli)
+      expect_raises(ClaudeAgent::ConnectionError, /hook_on_failure|on_failure/) do
+        client1.start
+      end
+      client1.started?.should be_false
+      unsupported_cli.stopped_count.should be >= 1
+
+      unapplied_cli = FakeCLIClient.new(
+        control_responses: {
+          "initialize" => {
+            "hook_on_failure_supported" => JSON::Any.new(true),
+            "hooks_applied"             => JSON::Any.new(false),
+          },
+        },
+      )
+      client2 = ClaudeAgent::AgentClient.new(options, unapplied_cli)
+      expect_raises(ClaudeAgent::ConnectionError, /already running|on_failure/) do
+        client2.start
+      end
+      client2.started?.should be_false
+      unapplied_cli.stopped_count.should be >= 1
+
+      ok_cli = FakeCLIClient.new(
+        control_responses: {
+          "initialize" => {
+            "hook_on_failure_supported" => JSON::Any.new(true),
+            "hooks_applied"             => JSON::Any.new(true),
+          },
+        },
+      )
+      client3 = ClaudeAgent::AgentClient.new(options, ok_cli)
+      begin
+        client3.start
+        client3.started?.should be_true
+      ensure
+        client3.stop
+      end
+    end
+
+    it "validates hook_on_failure_supported on reinitialize while allowing hooks_applied=false" do
+      cb = ->(_input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+        ClaudeAgent::HookResult.allow
+      }
+      options = ClaudeAgent::AgentOptions.new(
+        hooks: ClaudeAgent::HookConfig.new(
+          user_prompt_submit: [ClaudeAgent::HookMatcher.new(hooks: [cb], on_failure: "block")],
+        ),
+      )
+
+      responses = {
+        "initialize" => {
+          "hook_on_failure_supported" => JSON::Any.new(true),
+          "hooks_applied"             => JSON::Any.new(true),
+        },
+      }
+      fake_cli = FakeCLIClient.new(control_responses: responses)
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+
+        responses["initialize"] = {
+          "hook_on_failure_supported" => JSON::Any.new(true),
+          "hooks_applied"             => JSON::Any.new(false),
+        }
+        client.reinitialize["hook_on_failure_supported"].as_bool.should be_true
+
+        responses["initialize"] = {
+          "hook_on_failure_supported" => JSON::Any.new(false),
+        }
+        expect_raises(ClaudeAgent::ConnectionError, /on_failure/) do
+          client.reinitialize
+        end
+      ensure
+        client.stop
+      end
+    end
+  end
+
+  describe "pending request replay and keep_alive startup_mark handling" do
+    it "replays pending_permission_requests (clearing server_policy_ask_only) and pending_elicitation_requests" do
+      seen_perm_ctx = nil.as(ClaudeAgent::PermissionContext?)
+      seen_elicit_req = nil.as(ClaudeAgent::ElicitationRequest?)
+
+      options = ClaudeAgent::AgentOptions.new(
+        can_use_tool: ->(ctx : ClaudeAgent::PermissionContext) {
+          seen_perm_ctx = ctx
+          ClaudeAgent::PermissionResult.allow
+        },
+        on_elicitation: ->(req : ClaudeAgent::ElicitationRequest) {
+          seen_elicit_req = req
+          ClaudeAgent::ElicitationResponse.accept({"ok" => JSON::Any.new(true)})
+        },
+      )
+
+      fake_cli = FakeCLIClient.new(
+        control_responses: {
+          "initialize" => {
+            "pending_permission_requests" => JSON::Any.new([
+              JSON::Any.new({
+                "request_id" => JSON::Any.new("replay-perm-1"),
+                "request"    => JSON::Any.new({
+                  "subtype"                => JSON::Any.new("can_use_tool"),
+                  "tool_name"              => JSON::Any.new("Bash"),
+                  "input"                  => JSON::Any.new({"command" => JSON::Any.new("ls")}),
+                  "server_policy_ask_only" => JSON::Any.new(true),
+                  "server_prompt"          => JSON::Any.new("Allow Bash?"),
+                }),
+              }),
+            ]),
+            "pending_elicitation_requests" => JSON::Any.new([
+              JSON::Any.new({
+                "request_id" => JSON::Any.new("replay-elicit-1"),
+                "request"    => JSON::Any.new({
+                  "subtype"         => JSON::Any.new("elicitation"),
+                  "mcp_server_name" => JSON::Any.new("auth"),
+                  "message"         => JSON::Any.new("Sign in"),
+                  "property_order"  => JSON::Any.new([JSON::Any.new("ok")]),
+                  "title"           => JSON::Any.new("Auth Title"),
+                  "display_name"    => JSON::Any.new("Auth Display"),
+                  "description"     => JSON::Any.new("Auth Desc"),
+                }),
+              }),
+            ]),
+          },
+        },
+      )
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+
+        if perm_ctx = seen_perm_ctx
+          perm_ctx.request_id.should eq("replay-perm-1")
+          perm_ctx.server_policy_ask_only.should be_nil
+          perm_ctx.server_prompt.should eq("Allow Bash?")
+        else
+          fail("Expected pending permission request to be replayed")
+        end
+
+        if elicit_req = seen_elicit_req
+          elicit_req.property_order.should eq(["ok"])
+          elicit_req.title.should eq("Auth Title")
+          elicit_req.display_name.should eq("Auth Display")
+          elicit_req.description.should eq("Auth Desc")
+        else
+          fail("Expected pending elicitation request to be replayed")
+        end
+
+        replied_ids = fake_cli.sent_control_responses.map(&.["response"].as_h["request_id"].as_s)
+        replied_ids.should eq(["replay-perm-1", "replay-elicit-1"])
+      ensure
+        client.stop
+      end
+    end
+
+    it "extends initialize timeout on keep_alive startup_mark up to max cap and drops keep_alive frames" do
+      fake_cli = FakeCLIClient.new(suppress_auto_responses: Set{"initialize"})
+      client = ShortTimeoutAgentClient.new(
+        nil,
+        fake_cli,
+        init_timeout: 80.milliseconds,
+        max_init_timeout: 300.milliseconds,
+      )
+
+      spawn do
+        req_id, _subtype = fake_cli.wait_for_control_request
+        sleep 45.milliseconds
+        fake_cli.push_message(ClaudeAgent::UnknownMessage.new("keep_alive", {
+          "type"         => JSON::Any.new("keep_alive"),
+          "startup_mark" => JSON::Any.new("SessionStart"),
+        }))
+        sleep 60.milliseconds
+        fake_cli.push_control_success(req_id, {"output_style" => JSON::Any.new("default")})
+      end
+
+      begin
+        client.start
+        client.get_server_info.try(&.output_style).should eq("default")
+
+        fake_cli.push_message(ClaudeAgent::UnknownMessage.new("keep_alive", {
+          "type" => JSON::Any.new("keep_alive"),
+        }))
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json({
+          "type"       => "result",
+          "uuid"       => "r-ka-1",
+          "session_id" => "s-ka",
+          "subtype"    => "success",
+        }.to_json))
+
+        received = [] of ClaudeAgent::Message
+        client.each_response { |msg| received << msg }
+        received.size.should eq(1)
+        received.first.should be_a(ClaudeAgent::ResultMessage)
+      ensure
+        client.stop
+      end
+    end
+
+    it "caps keep_alive startup_mark extension at max_initialize_timeout" do
+      fake_cli = FakeCLIClient.new(suppress_auto_responses: Set{"initialize"})
+      client = ShortTimeoutAgentClient.new(
+        nil,
+        fake_cli,
+        init_timeout: 70.milliseconds,
+        max_init_timeout: 160.milliseconds,
+      )
+
+      keep_sending = true
+      spawn do
+        _req_id, _subtype = fake_cli.wait_for_control_request
+        while keep_sending
+          sleep 35.milliseconds
+          break unless keep_sending
+          begin
+            fake_cli.push_message(ClaudeAgent::UnknownMessage.new("keep_alive", {
+              "type"         => JSON::Any.new("keep_alive"),
+              "startup_mark" => JSON::Any.new("Setup"),
+            }))
+          rescue Channel::ClosedError
+            break
+          end
+        end
+      end
+
+      begin
+        expect_raises(ClaudeAgent::TimeoutError, "Control request timeout: initialize") do
+          client.start
+        end
+      ensure
+        keep_sending = false
+        client.stop
+      end
+    end
+  end
+
+  describe "hook input/output wiring, permissions, and elicitation forwarding" do
+    it "extracts prompt_id, effort, mcp_server, duration_ms, last_assistant_message, background_tasks, and session_crons" do
+      captured_inputs = [] of ClaudeAgent::HookInput
+      cb = ->(input : ClaudeAgent::HookInput, _id : String, _ctx : ClaudeAgent::HookContext) {
+        captured_inputs << input
+        ClaudeAgent::HookResult.new(
+          hook_specific_output: ClaudeAgent::HookSpecificOutput.new(
+            hook_event_name: input.hook_event_name || "PostToolUse",
+            classifier_context: "safe output",
+            suppress_original_prompt: true,
+            session_title: "My Title",
+            initial_user_message: "Init prompt",
+            watch_paths: ["/tmp/watch"],
+            reload_skills: true,
+            retry: true,
+            worktree_path: "/tmp/wt",
+          ),
+        )
+      }
+
+      options = ClaudeAgent::AgentOptions.new(
+        hooks: ClaudeAgent::HookConfig.new(
+          post_tool_use: [ClaudeAgent::HookMatcher.new(matcher: ".*", hooks: [cb])],
+          stop: [cb],
+        ),
+      )
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+        init_hooks = fake_cli.sent_messages.first["request"].as_h["hooks"].as_h
+        post_cb_id = init_hooks["PostToolUse"].as_a.first.as_h["hookCallbackIds"].as_a.first.as_s
+        stop_cb_id = init_hooks["Stop"].as_a.first.as_h["hookCallbackIds"].as_a.first.as_s
+
+        post_req = ClaudeAgent::ControlRequest.from_json({
+          "type"       => "control_request",
+          "request_id" => "hk-post-1",
+          "request"    => {
+            "subtype"     => "hook_callback",
+            "callback_id" => post_cb_id,
+            "tool_use_id" => "tu-1",
+            "input"       => {
+              "hook_event_name" => "PostToolUse",
+              "session_id"      => "sess-1",
+              "prompt_id"       => "prompt-99",
+              "effort"          => {"level" => "xhigh"},
+              "tool_name"       => "mcp__docs__get",
+              "tool_use_id"     => "tu-1",
+              "duration_ms"     => 250,
+              "mcp_server"      => {"name" => "docs", "source" => "sdk"},
+            },
+          },
+        }.to_json)
+        client.test_handle_control_request(post_req)
+
+        post_out = fake_cli.sent_control_responses.last["response"].as_h["response"].as_h["hookSpecificOutput"].as_h
+        post_out["classifierContext"].as_s.should eq("safe output")
+        post_out["suppressOriginalPrompt"].as_bool.should be_true
+        post_out["sessionTitle"].as_s.should eq("My Title")
+        post_out["initialUserMessage"].as_s.should eq("Init prompt")
+        post_out["watchPaths"].as_a.map(&.as_s).should eq(["/tmp/watch"])
+        post_out["reloadSkills"].as_bool.should be_true
+        post_out["retry"].as_bool.should be_true
+        post_out["worktreePath"].as_s.should eq("/tmp/wt")
+
+        stop_req = ClaudeAgent::ControlRequest.from_json({
+          "type"       => "control_request",
+          "request_id" => "hk-stop-1",
+          "request"    => {
+            "subtype"     => "hook_callback",
+            "callback_id" => stop_cb_id,
+            "input"       => {
+              "hook_event_name"        => "Stop",
+              "session_id"             => "sess-1",
+              "stop_hook_active"       => true,
+              "last_assistant_message" => "Done!",
+              "background_tasks"       => [
+                {"id" => "t1", "type" => "subagent", "status" => "running", "description" => "Reviewing", "agent_type" => "reviewer"},
+              ],
+              "session_crons" => [
+                {"id" => "c1", "schedule" => "*/5 * * * *", "recurring" => false, "prompt" => "Ping"},
+              ],
+            },
+          },
+        }.to_json)
+        client.test_handle_control_request(stop_req)
+
+        post_input = captured_inputs[0]
+        post_input.prompt_id.should eq("prompt-99")
+        post_input.effort.try(&.level).should eq("xhigh")
+        post_input.duration_ms.should eq(250_i64)
+        post_input.mcp_server.try(&.name).should eq("docs")
+        post_input.mcp_server.try(&.source).should eq("sdk")
+
+        stop_input = captured_inputs[1]
+        stop_input.stop_hook_active.should be_true
+        stop_input.last_assistant_message.should eq("Done!")
+        stop_input.background_tasks.try(&.first.agent_type).should eq("reviewer")
+        stop_input.session_crons.try(&.first.recurring?).should be_false
+      ensure
+        client.stop
+      end
+    end
+
+    it "forwards all new ControlPermissionRequest and ControlElicitationRequest fields" do
+      seen_perm = nil.as(ClaudeAgent::PermissionContext?)
+      seen_elicit = nil.as(ClaudeAgent::ElicitationRequest?)
+
+      options = ClaudeAgent::AgentOptions.new(
+        can_use_tool: ->(ctx : ClaudeAgent::PermissionContext) {
+          seen_perm = ctx
+          ClaudeAgent::PermissionResult.allow
+        },
+        on_elicitation: ->(req : ClaudeAgent::ElicitationRequest) {
+          seen_elicit = req
+          ClaudeAgent::ElicitationResponse.decline
+        },
+      )
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      perm_req = ClaudeAgent::ControlRequest.from_json({
+        "type"       => "control_request",
+        "request_id" => "perm-ext-1",
+        "request"    => {
+          "subtype"                    => "can_use_tool",
+          "tool_name"                  => "mcp__srv__run",
+          "input"                      => {"q" => "x"},
+          "mcp_server"                 => {"name" => "srv", "source" => "plugin"},
+          "decision_reason_type"       => "classifier",
+          "decision_reason_code"       => "needs_confirm",
+          "server_policy_ask_only"     => true,
+          "classifier_approvable"      => true,
+          "suppress_always_allow_rule" => true,
+          "default_to_no"              => false,
+          "matched_ask_rule"           => {"source" => "project", "toolName" => "mcp__srv__run", "ruleContent" => "all"},
+          "requires_user_interaction"  => true,
+          "server_prompt"              => "Run query?",
+        },
+      }.to_json)
+      client.test_handle_control_request(perm_req)
+
+      if ctx = seen_perm
+        ctx.mcp_server.try(&.source).should eq("plugin")
+        ctx.decision_reason_type.should eq("classifier")
+        ctx.decision_reason_code.should eq("needs_confirm")
+        ctx.server_policy_ask_only?.should be_true
+        ctx.classifier_approvable?.should be_true
+        ctx.suppress_always_allow_rule?.should be_true
+        ctx.default_to_no?.should be_false
+        ctx.matched_ask_rule.try(&.tool_name).should eq("mcp__srv__run")
+        ctx.matched_ask_rule.try(&.rule_content).should eq("all")
+        ctx.requires_user_interaction?.should be_true
+        ctx.server_prompt.should eq("Run query?")
+      else
+        fail("Expected permission callback to receive PermissionContext")
+      end
+
+      elicit_req = ClaudeAgent::ControlRequest.from_json({
+        "type"       => "control_request",
+        "request_id" => "elicit-ext-1",
+        "request"    => {
+          "subtype"         => "elicitation",
+          "mcp_server_name" => "srv",
+          "message"         => "Login",
+          "property_order"  => ["token", "env"],
+          "title"           => "Login Title",
+          "display_name"    => "Login Display",
+          "description"     => "Login Description",
+        },
+      }.to_json)
+      client.test_handle_control_request(elicit_req)
+
+      if elicit = seen_elicit
+        elicit.property_order.should eq(["token", "env"])
+        elicit.title.should eq("Login Title")
+        elicit.display_name.should eq("Login Display")
+        elicit.description.should eq("Login Description")
+      else
+        fail("Expected elicitation callback to receive ElicitationRequest")
+      end
+    end
+  end
+
+  describe "session_state_changed idle tracking and sdk_host_only filtering" do
+    it "keeps each_response open past ResultMessage until session_state_changed idle and drops sdk_host_only frames" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+      received_types = [] of String
+      finished = false
+      done = Channel(Nil).new(1)
+
+      begin
+        client.start
+
+        spawn do
+          client.each_response do |msg|
+            received_types << msg.type
+          end
+          finished = true
+          done.send(nil)
+        end
+
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"running","sdk_host_only":true})
+        ))
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json(
+          %({"type":"result","uuid":"r-1","session_id":"s1","subtype":"success"})
+        ))
+        sleep 20.milliseconds
+        # Must still be waiting for follow-up turn while state is "running".
+        finished.should be_false
+
+        fake_cli.push_message(ClaudeAgent::Message.parse({
+          "type"       => "assistant",
+          "uuid"       => "a-2",
+          "session_id" => "s1",
+          "message"    => {"content" => [{"type" => "text", "text" => "follow-up"}], "model" => "claude"},
+        }.to_json))
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json(
+          %({"type":"result","uuid":"r-2","session_id":"s1","subtype":"success"})
+        ))
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"idle","sdk_host_only":true})
+        ))
+
+        done.receive
+        received_types.should eq(["result", "assistant", "result"])
+      ensure
+        client.stop
+      end
+    end
+
+    it "bounds post-result wait with CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS and resets on requires_action" do
+      options = ClaudeAgent::AgentOptions.new(
+        env: {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" => "60"},
+      )
+      fake_cli = FakeCLIClient.new(options: options)
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+      finished = false
+      done = Channel(Nil).new(1)
+      received = [] of ClaudeAgent::Message
+
+      begin
+        client.start
+
+        spawn do
+          client.each_response { |msg| received << msg }
+          finished = true
+          done.send(nil)
+        end
+
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"running","sdk_host_only":true})
+        ))
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json(
+          %({"type":"result","uuid":"r-1","session_id":"s1","subtype":"success"})
+        ))
+
+        # requires_action cancels the 60ms ceiling while host answers a prompt.
+        sleep 20.milliseconds
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"requires_action","sdk_host_only":true})
+        ))
+        sleep 80.milliseconds
+        finished.should be_false
+
+        # Transition back to running re-arms the 60ms ceiling, which then expires.
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"running","sdk_host_only":true})
+        ))
+        done.receive
+        received.size.should eq(1)
+        received.first.should be_a(ClaudeAgent::ResultMessage)
+      ensure
+        client.stop
+      end
+    end
+
+    it "keeps @last_error_result across trailing session_state_changed frames" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"running","sdk_host_only":true})
+        ))
+        fake_cli.push_message(ClaudeAgent::ResultMessage.from_json(
+          %({"type":"result","uuid":"r-err","session_id":"s1","subtype":"error_during_execution","is_error":true,"errors":["boom"]})
+        ))
+        fake_cli.push_message(ClaudeAgent::Message.parse(
+          %({"type":"system","subtype":"session_state_changed","session_id":"s1","state":"idle","sdk_host_only":true})
+        ))
+
+        received = [] of ClaudeAgent::Message
+        client.each_response { |msg| received << msg }
+        received.size.should eq(1)
+
+        err = client.test_connection_closed_error
+        err.should be_a(ClaudeAgent::ResultError)
+        (err.message || "").should contain("boom")
+      ensure
+        client.stop
+      end
+    end
+  end
+
+  describe "new and updated AgentClient control methods" do
+    it "supports set_mcp_servers with typed MCPServerConfig and reserved name validation" do
+      sdk_v1 = ClaudeAgent::SDKMCPServer.new("tools", version: "1.0.0")
+      sdk_v2 = ClaudeAgent::SDKMCPServer.new(
+        "tools",
+        version: "2.0.0",
+        timeout: 9_000,
+        tool_policies: [ClaudeAgent::MCPServerToolPolicy.new("ping", permission_policy: "always_deny")],
+      )
+      ext = ClaudeAgent::ExternalMCPServerConfig.http("https://example.com/mcp", always_load: true)
+
+      options = ClaudeAgent::AgentOptions.new(
+        mcp_servers: {"tools" => sdk_v1} of String => ClaudeAgent::MCPServerConfig,
+      )
+      fake_cli = FakeCLIClient.new(options: options)
+      client = ClaudeAgent::AgentClient.new(options, fake_cli)
+
+      begin
+        client.start
+        fake_cli.get_sdk_server("tools").try(&.version).should eq("1.0.0")
+
+        expect_raises(ClaudeAgent::ConfigurationError, /reserved/) do
+          client.set_mcp_servers({"__proto__" => ext} of String => ClaudeAgent::MCPServerConfig)
+        end
+
+        client.set_mcp_servers({
+          "tools"  => sdk_v2,
+          "remote" => ext,
+        } of String => ClaudeAgent::MCPServerConfig)
+
+        fake_cli.get_sdk_server("tools").try(&.version).should eq("2.0.0")
+
+        req = fake_cli.sent_messages.last["request"].as_h
+        req["subtype"].as_s.should eq("mcp_set_servers")
+        servers = req["servers"].as_h
+        servers["tools"].as_h["timeout"].as_i.should eq(9_000)
+        servers["tools"].as_h["tools"].as_a.first["permission_policy"].as_s.should eq("always_deny")
+        servers["remote"].as_h["alwaysLoad"].as_bool.should be_true
+      ensure
+        client.stop
+      end
+    end
+
+    it "distinguishes omitted vs explicit nil max_thinking_tokens and forwards thinking_display" do
+      fake_cli = FakeCLIClient.new
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+
+        client.set_max_thinking_tokens(thinking_display: "summarized")
+        omitted_req = fake_cli.sent_messages.last["request"].as_h
+        omitted_req["subtype"].as_s.should eq("set_max_thinking_tokens")
+        omitted_req.has_key?("max_thinking_tokens").should be_false
+        omitted_req["thinking_display"].as_s.should eq("summarized")
+
+        client.set_max_thinking_tokens(nil, thinking_display: "omitted")
+        reset_req = fake_cli.sent_messages.last["request"].as_h
+        reset_req.has_key?("max_thinking_tokens").should be_true
+        reset_req["max_thinking_tokens"].raw.should be_nil
+        reset_req["thinking_display"].as_s.should eq("omitted")
+
+        client.set_max_thinking_tokens(16_384)
+        budget_req = fake_cli.sent_messages.last["request"].as_h
+        budget_req["max_thinking_tokens"].as_i.should eq(16_384)
+        budget_req.has_key?("thinking_display").should be_false
+      ensure
+        client.stop
+      end
+    end
+
+    it "forwards options on reload_plugins, get_mcp_status, get_context_usage, and rename_session" do
+      fake_cli = FakeCLIClient.new(
+        control_responses: {
+          "reload_plugins" => {
+            "held"         => JSON::Any.new(true),
+            "cache_impact" => JSON::Any.new({"mcp_servers_added" => JSON::Any.new([] of JSON::Any)}),
+          },
+          "mcp_status" => {
+            "mcpServers" => JSON::Any.new([
+              JSON::Any.new({
+                "name"   => JSON::Any.new("docs"),
+                "status" => JSON::Any.new("connected"),
+                "source" => JSON::Any.new("sdk"),
+                "tools"  => JSON::Any.new([
+                  JSON::Any.new({
+                    "name"  => JSON::Any.new("find"),
+                    "_meta" => JSON::Any.new({
+                      "ui" => JSON::Any.new({"visibility" => JSON::Any.new([JSON::Any.new("model")])}),
+                    }),
+                  }),
+                ]),
+              }),
+            ]),
+          },
+          "get_context_usage" => {
+            "categories" => JSON::Any.new([
+              JSON::Any.new({"id" => JSON::Any.new("system_prompt"), "kind" => JSON::Any.new("used"), "name" => JSON::Any.new("System"), "tokens" => JSON::Any.new(100_i64)}),
+            ]),
+            "totalTokens"          => JSON::Any.new(100_i64),
+            "maxTokens"            => JSON::Any.new(200_000_i64),
+            "rawMaxTokens"         => JSON::Any.new(200_000_i64),
+            "percentage"           => JSON::Any.new(0.05),
+            "model"                => JSON::Any.new("claude-opus-5-5"),
+            "isAutoCompactEnabled" => JSON::Any.new(true),
+            "memoryFiles"          => JSON::Any.new([] of JSON::Any),
+            "mcpTools"             => JSON::Any.new([] of JSON::Any),
+            "mcpInstructions"      => JSON::Any.new([JSON::Any.new({"serverName" => JSON::Any.new("docs"), "tokens" => JSON::Any.new(42_i64)})]),
+            "agents"               => JSON::Any.new([] of JSON::Any),
+          },
+          "rename_session" => {
+            "title" => JSON::Any.new("Renamed Session"),
+          },
+        },
+      )
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+
+        reload_res = client.reload_plugins(
+          hold_on_cache_impact: true,
+          add_plugins: [ClaudeAgent::PluginConfig.new("/abs/plugin", skip_mcp_discovery: true)],
+          refuse_if_busy: true,
+        )
+        reload_res["held"].as_bool.should be_true
+        reload_req = fake_cli.sent_messages.last["request"].as_h
+        reload_req["hold_on_cache_impact"].as_bool.should be_true
+        reload_req["refuse_if_busy"].as_bool.should be_true
+        reload_req["add_plugins"].as_a.first["path"].as_s.should eq("/abs/plugin")
+        reload_req["add_plugins"].as_a.first["skipMcpDiscovery"].as_bool.should be_true
+
+        status = client.get_mcp_status(live_reply: true)
+        status_req = fake_cli.sent_messages.last["request"].as_h
+        status_req["liveReply"].as_bool.should be_true
+        status.mcp_servers.first.source.should eq("sdk")
+        status.mcp_servers.first.tools.try(&.first.meta).should_not be_nil
+
+        usage = client.get_context_usage(detail: "full")
+        usage_req = fake_cli.sent_messages.last["request"].as_h
+        usage_req["detail"].as_s.should eq("full")
+        usage.categories.first.id.should eq("system_prompt")
+        usage.categories.first.kind.should eq("used")
+        usage.mcp_instructions.try(&.first.as_h["tokens"].as_i64).should eq(42_i64)
+
+        rename_res = client.rename_session("Renamed Session", source: "remote", session_id: "sess-xyz")
+        rename_res["title"].as_s.should eq("Renamed Session")
+        rename_req = fake_cli.sent_messages.last["request"].as_h
+        rename_req["subtype"].as_s.should eq("rename_session")
+        rename_req["title"].as_s.should eq("Renamed Session")
+        rename_req["source"].as_s.should eq("remote")
+        rename_req["session_id"].as_s.should eq("sess-xyz")
+      ensure
+        client.stop
+      end
+    end
+
+    it "surfaces error_code on ControlError when control response returns one" do
+      fake_cli = FakeCLIClient.new(
+        control_errors: {"reload_plugins" => "Session is busy"},
+        control_error_codes: {"reload_plugins" => "reload_plugins_busy"},
+      )
+      client = ClaudeAgent::AgentClient.new(nil, fake_cli)
+
+      begin
+        client.start
+        ex = expect_raises(ClaudeAgent::ControlError, "Session is busy") do
+          client.reload_plugins(refuse_if_busy: true)
+        end
+        ex.error_code.should eq("reload_plugins_busy")
       ensure
         client.stop
       end

@@ -214,3 +214,196 @@ describe ClaudeAgent::ControlSeedReadStateRequest do
     end
   end
 end
+
+describe "v0.11.0 Control and Permission parity" do
+  it "parses and serializes MCPServerProvenance" do
+    prov = ClaudeAgent::MCPServerProvenance.new("github", "plugin")
+    restored = ClaudeAgent::MCPServerProvenance.from_json(prov.to_json)
+    restored.name.should eq("github")
+    restored.source.should eq("plugin")
+  end
+
+  it "parses MatchedAskRule in both snake_case and camelCase and serializes as snake_case" do
+    snake = ClaudeAgent::MatchedAskRule.from_json(%({"source":"userSettings","tool_name":"Bash","rule_content":"git *"}))
+    snake.source.should eq("userSettings")
+    snake.tool_name.should eq("Bash")
+    snake.rule_content.should eq("git *")
+
+    camel = ClaudeAgent::MatchedAskRule.from_json(
+      %({"source":"projectSettings","toolName":"Write","ruleContent":"/etc/*"})
+    )
+    camel.source.should eq("projectSettings")
+    camel.tool_name.should eq("Write")
+    camel.rule_content.should eq("/etc/*")
+
+    serialized = JSON.parse(camel.to_json).as_h
+    serialized["tool_name"].as_s.should eq("Write")
+    serialized["rule_content"].as_s.should eq("/etc/*")
+  end
+
+  it "parses extended fields on ControlPermissionRequest and carries them on PermissionContext" do
+    json = {
+      "subtype"                    => "can_use_tool",
+      "tool_name"                  => "mcp__docs__fetch",
+      "input"                      => {"url" => "https://example.com"},
+      "mcp_server"                 => {"name" => "docs", "source" => "sdk"},
+      "decision_reason_type"       => "rule",
+      "decision_reason_code"       => "ask_rule",
+      "server_policy_ask_only"     => true,
+      "classifier_approvable"      => false,
+      "suppress_always_allow_rule" => true,
+      "default_to_no"              => true,
+      "matched_ask_rule"           => {"source" => "session", "tool_name" => "mcp__docs__fetch", "rule_content" => "*"},
+      "requires_user_interaction"  => true,
+      "server_prompt"              => "Fetch external docs?",
+    }.to_json
+
+    req = ClaudeAgent::ControlPermissionRequest.from_json(json)
+    req.mcp_server.try(&.name).should eq("docs")
+    req.decision_reason_type.should eq("rule")
+    req.decision_reason_code.should eq("ask_rule")
+    req.server_policy_ask_only?.should be_true
+    req.classifier_approvable?.should be_false
+    req.suppress_always_allow_rule?.should be_true
+    req.default_to_no?.should be_true
+    req.matched_ask_rule.try(&.tool_name).should eq("mcp__docs__fetch")
+    req.requires_user_interaction?.should be_true
+    req.server_prompt.should eq("Fetch external docs?")
+
+    ctx = ClaudeAgent::PermissionContext.new(
+      tool_name: req.tool_name,
+      tool_input: req.input,
+      session_id: "sess-1",
+      mcp_server: req.mcp_server,
+      decision_reason_type: req.decision_reason_type,
+      decision_reason_code: req.decision_reason_code,
+      server_policy_ask_only: req.server_policy_ask_only,
+      classifier_approvable: req.classifier_approvable,
+      suppress_always_allow_rule: req.suppress_always_allow_rule,
+      default_to_no: req.default_to_no,
+      matched_ask_rule: req.matched_ask_rule,
+      requires_user_interaction: req.requires_user_interaction,
+      server_prompt: req.server_prompt,
+    )
+    ctx.mcp_server.try(&.source).should eq("sdk")
+    ctx.decision_reason_type.should eq("rule")
+    ctx.decision_reason_code.should eq("ask_rule")
+    ctx.server_policy_ask_only?.should be_true
+    ctx.classifier_approvable?.should be_false
+    ctx.suppress_always_allow_rule?.should be_true
+    ctx.default_to_no?.should be_true
+    ctx.matched_ask_rule.try(&.rule_content).should eq("*")
+    ctx.requires_user_interaction?.should be_true
+    ctx.server_prompt.should eq("Fetch external docs?")
+  end
+
+  it "parses extended ControlRequest subtypes and response payloads" do
+    init_req = ClaudeAgent::ControlInitializeRequest.from_json({
+      "subtype"                => "initialize",
+      "systemPromptSnapshot"   => false,
+      "sdkMcpServerConfigs"    => {"srv" => {"timeout" => 5000}},
+      "sdkMcpServerManifests"  => {"srv" => {"initializeResult" => {"protocolVersion" => "2025-03-26"}}},
+      "excludeDynamicSections" => true,
+      "forwardSubagentText"    => true,
+      "title"                  => "My Session",
+      "skills"                 => ["commit"],
+    }.to_json)
+    init_req.system_prompt_snapshot.should be_false
+    init_req.sdk_mcp_server_configs.try(&.["srv"].as_h["timeout"].as_i).should eq(5000)
+    init_req.sdk_mcp_server_manifests.should_not be_nil
+    init_req.exclude_dynamic_sections.should be_true
+    init_req.forward_subagent_text.should be_true
+    init_req.title.should eq("My Session")
+    init_req.skills.should eq(["commit"])
+
+    elicit_req = ClaudeAgent::ControlElicitationRequest.from_json({
+      "subtype"         => "elicitation",
+      "mcp_server_name" => "auth",
+      "message"         => "Sign in",
+      "property_order"  => ["user", "pass"],
+      "title"           => "Auth",
+      "display_name"    => "Auth Server",
+      "description"     => "Credentials",
+    }.to_json)
+    elicit_req.property_order.should eq(["user", "pass"])
+    elicit_req.title.should eq("Auth")
+    elicit_req.display_name.should eq("Auth Server")
+    elicit_req.description.should eq("Credentials")
+
+    think_req = ClaudeAgent::ControlSetMaxThinkingTokensRequest.from_json(
+      %({"subtype":"set_max_thinking_tokens","max_thinking_tokens":null,"thinking_display":"summarized"})
+    )
+    think_req.max_thinking_tokens.should be_nil
+    think_req.thinking_display.should eq("summarized")
+
+    reload_req = ClaudeAgent::ControlReloadPluginsRequest.from_json({
+      "subtype"              => "reload_plugins",
+      "hold_on_cache_impact" => true,
+      "add_plugins"          => [{"type" => "local", "path" => "/p"}],
+      "refuse_if_busy"       => true,
+    }.to_json)
+    reload_req.hold_on_cache_impact?.should be_true
+    reload_req.add_plugins.try(&.size).should eq(1)
+    reload_req.refuse_if_busy?.should be_true
+
+    ctx_req = ClaudeAgent::ControlGetContextUsageRequest.from_json(
+      %({"subtype":"get_context_usage","detail":"full"})
+    )
+    ctx_req.detail.should eq("full")
+
+    mcp_status_req = ClaudeAgent::ControlMCPStatusRequest.from_json(
+      %({"subtype":"mcp_status","liveReply":true})
+    )
+    mcp_status_req.live_reply?.should be_true
+
+    set_servers_req = ClaudeAgent::ControlSetMcpServersRequest.from_json(
+      %({"subtype":"mcp_set_servers","servers":{"docs":{"type":"http","url":"https://example.com"}}})
+    )
+    set_servers_req.servers["docs"].as_h["type"].as_s.should eq("http")
+    set_servers_req.mcp_servers["docs"].as_h["type"].as_s.should eq("http")
+
+    rename_inner = ClaudeAgent::ControlRequestInnerConverter.from_json(
+      JSON::PullParser.new(%({"subtype":"rename_session","title":"New Name","source":"remote","session_id":"s-1"}))
+    )
+    rename_inner.should be_a(ClaudeAgent::ControlRenameSessionRequest)
+    rename = rename_inner.as(ClaudeAgent::ControlRenameSessionRequest)
+    rename.title.should eq("New Name")
+    rename.source.should eq("remote")
+    rename.session_id.should eq("s-1")
+  end
+
+  it "parses new fields on MCPServerStatus, MCPToolInfo, ContextUsageCategory, and ContextUsageResponse" do
+    status = ClaudeAgent::MCPServerStatus.from_json({
+      "name"   => "docs",
+      "status" => "connected",
+      "source" => "sdk",
+      "tools"  => [
+        {
+          "name"  => "search",
+          "_meta" => {"ui" => {"visibility" => ["model"]}},
+        },
+      ],
+    }.to_json)
+    status.source.should eq("sdk")
+    status.tools.try(&.first.meta.try(&.["ui"].as_h["visibility"].as_a.first.as_s)).should eq("model")
+
+    usage = ClaudeAgent::ContextUsageResponse.from_json({
+      "categories" => [
+        {"id" => "mcp_instructions", "kind" => "used", "name" => "MCP Instructions", "tokens" => 500},
+      ],
+      "totalTokens"          => 500,
+      "maxTokens"            => 200_000,
+      "rawMaxTokens"         => 200_000,
+      "percentage"           => 0.25,
+      "model"                => "claude-opus-5-5",
+      "isAutoCompactEnabled" => true,
+      "memoryFiles"          => [] of String,
+      "mcpTools"             => [] of String,
+      "mcpInstructions"      => [{"serverName" => "docs", "tokens" => 500}],
+      "agents"               => [] of String,
+    }.to_json)
+    usage.categories.first.id.should eq("mcp_instructions")
+    usage.categories.first.kind.should eq("used")
+    usage.mcp_instructions.try(&.first.as_h["serverName"].as_s).should eq("docs")
+  end
+end

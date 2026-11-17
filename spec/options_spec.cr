@@ -3,7 +3,10 @@ require "./spec_helper"
 describe ClaudeAgent::AgentOptions do
   it "initializes with defaults" do
     options = ClaudeAgent::AgentOptions.new
-    options.permission_mode.should eq(ClaudeAgent::PermissionMode::Default)
+    options.permission_mode.should be_nil
+    options.verbatim_prompts?.should be_false
+    options.client_app.should be_nil
+    options.project_config_root.should be_nil
     options.include_partial_messages?.should be_false
     options.continue_conversation?.should be_false
     options.resume.should be_nil
@@ -564,5 +567,180 @@ describe "AgentOptions#can_use_tool_shadowed_warning" do
     external = {} of String => ClaudeAgent::MCPServerConfig
     external["ext"] = ClaudeAgent::ExternalMCPServerConfig.stdio("python", ["server.py"])
     ClaudeAgent::AgentOptions.new(mcp_servers: external).needs_control_protocol?.should be_false
+
+    hooks = ClaudeAgent::HookConfig.new(
+      pre_tool_use: [ClaudeAgent::HookMatcher.new(matcher: "Bash")],
+    )
+    ClaudeAgent::AgentOptions.new(hooks: hooks).needs_control_protocol?.should be_true
+
+    elicit = ->(_req : ClaudeAgent::ElicitationRequest) { ClaudeAgent::ElicitationResponse.decline }
+    ClaudeAgent::AgentOptions.new(on_elicitation: elicit).needs_control_protocol?.should be_true
+
+    ClaudeAgent::AgentOptions.new(
+      system_prompt: ClaudeAgent::SystemPromptPreset.claude_code,
+    ).needs_control_protocol?.should be_false
+
+    ClaudeAgent::AgentOptions.new(
+      system_prompt: ClaudeAgent::SystemPromptPreset.claude_code(exclude_dynamic_sections: true),
+    ).needs_control_protocol?.should be_true
+
+    ClaudeAgent::AgentOptions.new(
+      system_prompt: ClaudeAgent::SystemPromptPreset.claude_code(snapshot: false),
+    ).needs_control_protocol?.should be_true
+
+    ClaudeAgent::AgentOptions.new(
+      system_prompt: ClaudeAgent::SystemPromptCustom.new("You are a custom agent."),
+    ).needs_control_protocol?.should be_false
+
+    ClaudeAgent::AgentOptions.new(
+      system_prompt: ClaudeAgent::SystemPromptCustom.new("You are a custom agent.", snapshot: false),
+    ).needs_control_protocol?.should be_true
+  end
+end
+
+describe "v0.11.0 options parity" do
+  it "supports snapshot on SystemPromptPreset and SystemPromptCustom" do
+    preset = ClaudeAgent::SystemPromptPreset.claude_code("Extra", exclude_dynamic_sections: true, snapshot: false)
+    preset.snapshot.should be_false
+    restored_preset = ClaudeAgent::SystemPromptPreset.from_json(preset.to_json)
+    restored_preset.snapshot.should be_false
+
+    custom = ClaudeAgent::SystemPromptCustom.new("Custom prompt", snapshot: true)
+    custom.type.should eq("custom")
+    custom.prompt.should eq("Custom prompt")
+    custom.snapshot.should be_true
+    restored_custom = ClaudeAgent::SystemPromptCustom.from_json(custom.to_json)
+    restored_custom.type.should eq("custom")
+    restored_custom.prompt.should eq("Custom prompt")
+    restored_custom.snapshot.should be_true
+  end
+
+  it "accepts verbatim_prompts, client_app, and project_config_root on AgentOptions" do
+    options = ClaudeAgent::AgentOptions.new(
+      verbatim_prompts: true,
+      client_app: "my-app/2.0.0",
+      project_config_root: "/repo/root",
+    )
+    options.verbatim_prompts?.should be_true
+    options.client_app.should eq("my-app/2.0.0")
+    options.project_config_root.should eq("/repo/root")
+  end
+
+  it "supports auto_compact_window and omit_claude_md on AgentDefinition" do
+    defn = ClaudeAgent::AgentDefinition.new(
+      description: "Focused worker",
+      prompt: "Do focused work",
+      auto_compact_window: 50_000,
+      omit_claude_md: true,
+    )
+    parsed = JSON.parse(defn.to_json).as_h
+    parsed["autoCompactWindow"].as_i.should eq(50_000)
+    parsed["omitClaudeMd"].as_bool.should be_true
+
+    restored = ClaudeAgent::AgentDefinition.from_json(defn.to_json)
+    restored.auto_compact_window.should eq(50_000)
+    restored.omit_claude_md.should be_true
+  end
+
+  it "supports timeout, always_load, and tools on ExternalMCPServerConfig factories" do
+    policies = [
+      ClaudeAgent::MCPServerToolPolicy.new("query", permission_policy: "always_ask", org_max_permission: "ask"),
+    ]
+    stdio = ClaudeAgent::ExternalMCPServerConfig.stdio(
+      "node",
+      ["srv.js"],
+      timeout: 5_000,
+      always_load: false,
+      tools: policies,
+    )
+    stdio.timeout.should eq(5_000)
+    stdio.always_load.should be_false
+    stdio.tools.should eq(policies)
+
+    http = ClaudeAgent::ExternalMCPServerConfig.http(
+      "https://mcp.example.com",
+      timeout: 10_000,
+      always_load: true,
+      tools: policies,
+    )
+    parsed_http = JSON.parse(http.to_json).as_h
+    parsed_http["timeout"].as_i.should eq(10_000)
+    parsed_http["alwaysLoad"].as_bool.should be_true
+    parsed_http["tools"].as_a.first["permission_policy"].as_s.should eq("always_ask")
+
+    sse = ClaudeAgent::ExternalMCPServerConfig.sse(
+      "https://sse.example.com",
+      timeout: 8_000,
+      always_load: false,
+    )
+    sse.timeout.should eq(8_000)
+    sse.always_load.should be_false
+  end
+
+  it "supports property_order, title, display_name, and description on ElicitationRequest" do
+    req = ClaudeAgent::ElicitationRequest.new(
+      server_name: "auth",
+      message: "Sign in",
+      mode: "form",
+      property_order: ["username", "token"],
+      title: "Auth prompt",
+      display_name: "Auth",
+      description: "Provide credentials",
+    )
+    req.property_order.should eq(["username", "token"])
+    req.title.should eq("Auth prompt")
+    req.display_name.should eq("Auth")
+    req.description.should eq("Provide credentials")
+  end
+
+  it "supports SandboxFilesystemSettings, tlsTerminate, awsPairs, new SandboxSettings fields, and ignoreViolations" do
+    fs = ClaudeAgent::SandboxFilesystemSettings.new(
+      allow_write: ["/tmp/work"],
+      deny_write: ["/etc"],
+      deny_read: ["~/.ssh"],
+      allow_read: ["/opt/data"],
+      allow_managed_read_paths_only: true,
+      disabled: false,
+    )
+    fs_json = JSON.parse(fs.to_json).as_h
+    fs_json["allowWrite"].as_a.map(&.as_s).should eq(["/tmp/work"])
+    fs_json["denyWrite"].as_a.map(&.as_s).should eq(["/etc"])
+    fs_json["denyRead"].as_a.map(&.as_s).should eq(["~/.ssh"])
+    fs_json["allowRead"].as_a.map(&.as_s).should eq(["/opt/data"])
+    fs_json["allowManagedReadPathsOnly"].as_bool.should be_true
+    fs_json["disabled"].as_bool.should be_false
+
+    net = ClaudeAgent::SandboxNetworkSettings.new(
+      tls_terminate: {"caCertPath" => JSON::Any.new("/etc/ca.pem")},
+    )
+    JSON.parse(net.to_json)["tlsTerminate"]["caCertPath"].as_s.should eq("/etc/ca.pem")
+
+    creds = ClaudeAgent::SandboxCredentialsSettings.new(
+      aws_pairs: [JSON::Any.new({"accessKeyIdVar" => JSON::Any.new("AWS_KEY"), "secretAccessKeyVar" => JSON::Any.new("AWS_SECRET")})],
+    )
+    JSON.parse(creds.to_json)["awsPairs"].as_a.size.should eq(1)
+
+    sandbox = ClaudeAgent::SandboxSettings.new(
+      enabled: true,
+      ignore_violations: {"*" => ["/etc/hosts"], "npm test" => ["registry.npmjs.org"]},
+      allow_nested_user_namespaces: true,
+      enable_weaker_network_isolation: false,
+      allow_apple_events: true,
+      filesystem: fs,
+      ripgrep: {"command" => JSON::Any.new("/usr/local/bin/rg")},
+    )
+    restored = ClaudeAgent::SandboxSettings.from_json(sandbox.to_json)
+    restored.allow_nested_user_namespaces.should be_true
+    restored.enable_weaker_network_isolation.should be_false
+    restored.allow_apple_events.should be_true
+    restored.filesystem.try(&.allow_write).should eq(["/tmp/work"])
+    restored.ripgrep.try(&.["command"].as_s).should eq("/usr/local/bin/rg")
+    restored.ignore_violations.should eq({"*" => ["/etc/hosts"], "npm test" => ["registry.npmjs.org"]})
+
+    legacy = ClaudeAgent::SandboxSettings.new(
+      ignore_violations: ClaudeAgent::SandboxIgnoreViolations.new(file: ["/tmp/*"], network: ["*.example.com"]),
+    )
+    restored_legacy = ClaudeAgent::SandboxSettings.from_json(legacy.to_json)
+    restored_legacy.ignore_violations.should be_a(ClaudeAgent::SandboxIgnoreViolations)
   end
 end
